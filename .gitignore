@@ -2,3 +2,6 @@
 data/
 target/
 speed-demon-2026/
+board.json
+parse_board.py
+search_repos.py
