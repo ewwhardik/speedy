@@ -290,7 +290,7 @@ struct Index {
 // as it has been read, so the memory really goes back; malloc would keep it.
 class BlockList {
 public:
-    static constexpr size_t BLOCK = 1 << 14;          // entries per block
+    static constexpr size_t BLOCK = 1 << 12;          // entries per block
     static constexpr size_t BYTES = 3 * BLOCK + 1;    // a 4-byte store at the last entry spills one byte
     ~BlockList() { for (uint8_t* b : blocks_) munmap(b, BYTES); }
 
@@ -383,7 +383,7 @@ Index build_index(const File& f, TermTable& terms, std::vector<u32>& query_terms
         u32 ndense = 0;
         for (u32 rank = 0; rank < nterms; ++rank) {
             new_id[order[rank]] = rank;
-            if (df[order[rank]] * 32 > docs) ix.dense[rank] = ndense++;
+            if (df[order[rank]] * 18 > docs) ix.dense[rank] = ndense++;
         }
         terms.renumber(new_id);
         for (u32& id : query_terms) id = new_id[id];

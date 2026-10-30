@@ -200,7 +200,7 @@ private:
     std::atomic<u16>* tags_ = zeroed<std::atomic<u16>>(SLOTS);  // 0 = free
     Slot* slots_ = zeroed<Slot>(SLOTS);
     u32* overflow_ = zeroed<u32>(SLOTS);  // arena offset of a long name's tail
-    char* arena_ = zeroed<char>(64 << 20);
+    char* arena_ = zeroed<char>(16 << 20);
     std::atomic<u32> used_{0}, next_id_{0};
 };
 
@@ -322,9 +322,8 @@ void put_money(std::string& out, i64 cents) {
 }
 
 int main() {
-    // With transparent huge pages, a block written only in part can be backed
-    // by a whole 2 MB page; plain pages keep memory to what is written.
     prctl(PR_SET_THP_DISABLE, 1, 0, 0, 0);
+    mallopt(M_MMAP_THRESHOLD, 1 << 16);
     const int nthreads = std::clamp<int>(std::thread::hardware_concurrency(), 1, 12);
     size_t rsize, size;
     const char* regions = map_file("/data/regions.csv", rsize);

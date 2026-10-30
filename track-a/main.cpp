@@ -37,19 +37,6 @@ inline const char* find(const char* s, char c) {
         if (u32 m = match32(s, c)) return s + __builtin_ctz(m);
 }
 
-inline u32 parse_digits(const char* end, u32 len) {
-    __m128i v = _mm_loadu_si128(reinterpret_cast<const __m128i*>(end - 16));
-    v = _mm_subs_epu8(v, _mm_set1_epi8('0'));
-    __m128i lane = _mm_setr_epi8(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15);
-    v = _mm_and_si128(v, _mm_cmpgt_epi8(lane, _mm_set1_epi8(char(15 - len))));
-    v = _mm_maddubs_epi16(v, _mm_set1_epi16(0x010A));
-    v = _mm_madd_epi16(v, _mm_set1_epi32(0x00010064));
-    v = _mm_packus_epi32(v, v);
-    v = _mm_madd_epi16(v, _mm_set1_epi32(0x00012710));
-    u64 high = u32(_mm_cvtsi128_si32(v)), low = u32(_mm_extract_epi32(v, 1));
-    return u32(high * 100000000 + low);
-}
-
 inline char* write_u32(char* p, u32 x) {
     char b[10];
     int i = 10;
@@ -104,16 +91,15 @@ struct Worker {
             int hour = (p[11] - '0') * 10 + p[12] - '0';
             int h = (p[6] == '0' ? day - 30 : day + 1) * 24 + hour - 18;
 
-            const char* m = p + 28;
-            u64 sp = match32(m, ' ') | u64(match32(m + 32, ' ')) << 32;
-            u64 nl = match32(m, '\n') | u64(match32(m + 32, '\n')) << 32;
-            const char* ep = m + __builtin_ctzll(sp) + 1;
-            const char* ee = nl ? m + __builtin_ctzll(sp & (sp - 1)) : find(ep, ' ');
-            const char* eol = nl ? m + __builtin_ctzll(nl) : find(ee + 5, '\n');
+            char m0 = p[28], m1 = p[29];
+            const char* ep = p + 29 + (m0 == 'G' ? 3 : m0 == 'H' ? 4 : m0 == 'D' ? 6 : m0 == 'O' ? 7 : m1 == 'U' ? 3 : m1 == 'O' ? 4 : 5);
+            const char* ee = find(ep, ' ');
             const u32 key = endpoints.intern(ep, ee - ep) | (ee[1] == '5' ? ERR_BIT : 0);
-            const u32 lat = parse_digits(eol, eol - ee - 5);
-            p = eol + 1;
-            if (lat >= BIG) {
+            const char* lp = ee + 5;
+            u32 lat = 0;
+            while (*lp >= '0' && *lp <= '9') lat = lat * 10 + (*lp++ - '0');
+            p = lp + 1;
+            if (__builtin_expect(lat >= BIG, 0)) {
                 big[h].push_back({lat, key});
                 continue;
             }
@@ -225,19 +211,19 @@ int main() {
                 u32 n = count[e + 1] - count[e];
                 if (n == 0) continue;
                 u32 v[6] = {n, 0, 0, 0, errors[e], u32(u64(errors[e]) * 1000000 / n)};
+                u32 r99 = (99u * n + 99) / 100 - 1;
+                u32 r95 = (95u * n + 99) / 100 - 1;
+                u32 r50 = (50u * n + 99) / 100 - 1;
                 if (n <= 128) {
                     std::sort(a, a + n);
-                    v[1] = a[(50u * n + 99) / 100 - 1];
-                    v[2] = a[(95u * n + 99) / 100 - 1];
-                    v[3] = a[(99u * n + 99) / 100 - 1];
                 } else {
-                    u32 lo = 0, k = 1;
-                    for (u32 p : {50u, 95u, 99u}) {
-                        u32 r = (p * n + 99) / 100 - 1;
-                        std::nth_element(a + lo, a + r, a + n);
-                        v[k++] = a[lo = r];
-                    }
+                    std::nth_element(a, a + r99, a + n);
+                    std::nth_element(a, a + r95, a + r99);
+                    std::nth_element(a, a + r50, a + r95);
                 }
+                v[1] = a[r50];
+                v[2] = a[r95];
+                v[3] = a[r99];
                 char* o = std::copy(names[e].begin(), names[e].end(), std::copy_n(label, 21, line));
                 for (u32 x : v) {
                     *o++ = ' ';
