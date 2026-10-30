@@ -13,6 +13,7 @@
 #define _GNU_SOURCE
 #include <fcntl.h>
 #include <immintrin.h>
+#include <malloc.h>
 #include <pthread.h>
 #include <sched.h>
 #include <stdint.h>
@@ -463,24 +464,39 @@ static void *answer(void *arg) {
         for (uint32_t i = 1; i < q->n; i++)
           r = apply(t, r, q->op[i], term_set(q->t[i]));
         summarize(r, out);
-      } else if (q->heavy >= 0) {
-        summarize((Set){NULL, hres + (size_t)q->heavy * W, 0}, out);
-      } else { // candidates: the rarest term's documents that hold every term
+      } else {
         uint32_t f = rarest(q);
         Set c = term_set(q->t[f]);
-        uint32_t *cand = t->la, nc = 0;
-        if (c.b)
-          for (uint32_t w = 0; w < W; w++)
-            for (uint64_t x = c.b[w]; x; x &= x - 1)
-              cand[nc++] = w * 64 + __builtin_ctzll(x);
-        else
-          cand = (uint32_t *)c.l, nc = c.n;
-        for (uint32_t j = 0; j < nc; j++) {
-          uint32_t i = 0;
-          while (i < q->n && (i == f || has(term_set(q->t[i]), cand[j])))
-            i++;
-          if (i == q->n && phrase_in(t, q, cand[j]))
-            add(out, cand[j]);
+        if (c.b) {
+          for (uint32_t w = 0; w < W; w++) {
+            uint64_t m = c.b[w];
+            if (!m)
+              continue;
+            for (uint32_t i = 0; i < q->n; i++)
+              if (i != f && bm[q->t[i]]) {
+                m &= bm[q->t[i]][w];
+                if (!m)
+                  break;
+              }
+            while (m) {
+              uint32_t d = w * 64 + __builtin_ctzll(m);
+              m &= m - 1;
+              uint32_t i = 0;
+              while (i < q->n && (i == f || bm[q->t[i]] || has(term_set(q->t[i]), d)))
+                i++;
+              if (i == q->n && phrase_in(t, q, d))
+                add(out, d);
+            }
+          }
+        } else {
+          for (uint32_t j = 0; j < c.n; j++) {
+            uint32_t d = c.l[j];
+            uint32_t i = 0;
+            while (i < q->n && (i == f || has(term_set(q->t[i]), d)))
+              i++;
+            if (i == q->n && phrase_in(t, q, d))
+              add(out, d);
+          }
         }
       }
     }
@@ -651,24 +667,7 @@ int main(void) {
     th[i].bits = malloc(W * 8ull + 8);
   }
 
-  // Phrases whose rarest term is still frequent are matched in one shared scan.
-  hq = malloc((nq + 1) * 4ull);
-  for (uint32_t i = 0; i < nq; i++)
-    if (qs[i].phrase && df[qs[i].t[rarest(&qs[i])]] > N / 64)
-      hq[qs[i].heavy = nheavy++] = i;
-  if (nheavy) {
-    head = malloc(nterms * 4ull);
-    hnext = malloc(nheavy * 4ull);
-    memset(head, 0xff, nterms * 4ull);
-    for (uint32_t h = 0; h < nheavy; h++) {
-      uint32_t t0 = qs[hq[h]].t[0];
-      hnext[h] = head[t0];
-      head[t0] = h;
-    }
-    hres = calloc((size_t)nheavy * W + 1, 8);
-    heavy_pass = 1;
-    run_threads(scan);
-  }
+  malloc_trim(0);
   run_threads(answer);
 
   int out = open("/out/results.txt", O_WRONLY | O_CREAT | O_TRUNC, 0644);

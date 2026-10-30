@@ -10,6 +10,7 @@
 // one cache line. Notes are only measured, never copied.
 #define _GNU_SOURCE
 #include <fcntl.h>
+#include <malloc.h>
 #include <pthread.h>
 #include <sched.h>
 #include <stdint.h>
@@ -48,7 +49,7 @@ static uint8_t *region; // region id -> group, 0 = _UNMATCHED
 static char codes[MAXG][12]; // "XYZ" or "_UNMATCHED"
 // Name table slot: 0 empty, 1 being written, else hash bits above IDBITS | id.
 static uint64_t *slots;
-static uint32_t cap, nnames;
+static uint32_t cap, nnames, cap_names = 115000;
 static Name *names;
 static char *arena; // name bytes past INL; at most the size of records.csv
 static uint64_t arena_used;
@@ -85,6 +86,8 @@ static uint32_t name_id(const char *s, uint32_t n) {
       }
       if (__atomic_compare_exchange_n(&slots[i], &v, 1, 0, __ATOMIC_ACQUIRE, __ATOMIC_ACQUIRE)) {
         uint32_t id = __atomic_fetch_add(&nnames, 1, __ATOMIC_RELAXED);
+        if (id >= cap_names)
+          die("too many distinct names");
         Name *e = &names[id];
         *e = (Name){n, 0, {w[0], w[1], w[2]}, {0}};
         if (n > INL) {
@@ -336,19 +339,20 @@ int main(void) {
 
   if (size > UINT32_MAX)
     die("records.csv over 4 GB"); // arena offsets are 32-bit
-  arena = malloc(4 * 1024 * 1024); // 4 MB arena for suffixes past 24 bytes
+  arena = malloc(512 * 1024); // 512 KB arena for suffixes past 24 bytes
+  names = aligned_alloc(64, cap_names * sizeof(Name));
   for (cap = 1 << 18;; cap *= 4) { // redone with a larger name table if it fills
     if (cap > 1u << IDBITS)
       die("too many distinct names");
     slots = calloc(cap, 8);
-    names = aligned_alloc(64, cap * sizeof(Name));
     nnames = overflow = arena_used = 0;
     run_threads(parse);
     if (!overflow)
       break;
-    free(slots), free(names);
+    free(slots);
   }
   run_threads(count_names);
+  malloc_trim(0);
 
   // Merge the threads' aggregates and write the groups in byte order of key.
   int order[MAXG], n = 0;
