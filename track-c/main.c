@@ -208,6 +208,7 @@ static void *parse(void *arg) {
     if (want > 0) {
       ssize_t n = pread(fd, t->buf + have, want, off);
       if (n <= 0) die("read failed");
+      posix_fadvise(fd, off, n, POSIX_FADV_DONTNEED);
       off += n;
       have += n;
     }
@@ -318,6 +319,7 @@ int main(void) {
     if (!overflow) break;
     free(slots); free(names);
   }
+  posix_fadvise(fd, 0, 0, POSIX_FADV_DONTNEED);
   close(fd);
   free(region);
   run_threads(count_names);
