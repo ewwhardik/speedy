@@ -170,14 +170,18 @@ int main() {
     prctl(PR_SET_THP_DISABLE, 1, 0, 0, 0);
     mallopt(M_MMAP_THRESHOLD, 1 << 16);
     Graph graph("/data/graph.txt");
-    MappedFile qfile("/data/queries.txt");
     std::vector<std::pair<u32, u32>> queries;
-    const char* p = qfile.data;
-    const char* end = qfile.end();
-    while (p < end) {
-        u32 s = integer(p, end);
-        u32 t = integer(p, end);
-        queries.emplace_back(s, t);
+    {
+        MappedFile qfile("/data/queries.txt");
+        const char* p = qfile.data;
+        const char* end = qfile.end();
+        while (p < end) {
+            while (p < end && (*p < '0' || *p > '9')) ++p;
+            if (p >= end) break;
+            u32 s = integer(p, end);
+            u32 t = integer(p, end);
+            queries.emplace_back(s, t);
+        }
     }
     std::vector<int64_t> answers(queries.size());
     std::atomic<size_t> next{0};
