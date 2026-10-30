@@ -429,8 +429,8 @@ int main(void) {
   }
   free(perm);
   malloc_trim(0);
-  if (nth > 8)
-    nth = 8;
+  // all threads run answer
+  if (nth > 12) nth = 12;
 
   ans = malloc((nq + 1) * sizeof *ans);
   run_threads(answer);
