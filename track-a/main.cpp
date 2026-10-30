@@ -8,6 +8,7 @@
 #include <cstring>
 #include <fcntl.h>
 #include <immintrin.h>
+#include <string>
 #include <string_view>
 #include <sys/mman.h>
 #include <sys/prctl.h>
@@ -97,37 +98,12 @@ struct Worker {
             int hour = (p[11] - '0') * 10 + (p[12] - '0');
             int h = day_idx * 24 + hour - 18;
 
-            const char* ep;
-            switch (p[28]) {
-                case 'G': ep = p + 32; break;
-                case 'P': ep = p + (p[29] == 'O' ? 33 : (p[29] == 'U' ? 32 : 34)); break;
-                case 'H': ep = p + 33; break;
-                case 'D': ep = p + 35; break;
-                case 'O': ep = p + 36; break;
-                default: {
-                    ep = p + 28;
-                    while (*ep != ' ') ++ep;
-                    ++ep;
-                    break;
-                }
-            }
-
-            u32 sp_mask = match32(ep, ' ');
-            const char* ee;
-            const char* eol;
-            if (__builtin_expect(sp_mask != 0, 1)) {
-                ee = ep + __builtin_ctz(sp_mask);
-                u32 nl_mask = match32(ee + 5, '\n');
-                if (__builtin_expect(nl_mask != 0, 1)) {
-                    eol = ee + 5 + __builtin_ctz(nl_mask);
-                } else {
-                    eol = find(ee + 5, '\n');
-                }
-            } else {
-                ee = find(ep + 32, ' ');
-                eol = find(ee + 5, '\n');
-            }
-
+            const char* m = p + 28;
+            u64 sp = match32(m, ' ') | u64(match32(m + 32, ' ')) << 32;
+            u64 nl = match32(m, '\n') | u64(match32(m + 32, '\n')) << 32;
+            const char* ep = m + __builtin_ctzll(sp) + 1;
+            const char* ee = nl ? m + __builtin_ctzll(sp & (sp - 1)) : find(ep, ' ');
+            const char* eol = nl ? m + __builtin_ctzll(nl) : find(ee + 5, '\n');
             const u32 key = endpoints.intern(ep, ee - ep) | (ee[1] == '5' ? ERR_BIT : 0);
             const u32 lat = parse_digits(eol, eol - ee - 5);
             p = eol + 1;
@@ -145,11 +121,6 @@ struct Worker {
             b->rec[b->n++] = lat << KEY_BITS | key;
         }
     }
-};
-
-struct HourSlice {
-    char* ptr = nullptr;
-    size_t len = 0;
 };
 
 int main() {
@@ -196,7 +167,12 @@ int main() {
         ne = names.size();
     });
 
-    HourSlice slices[HOURS];
+    std::vector<std::string> text(HOURS);
+    std::vector<std::atomic<bool>> done(HOURS);
+    for (int h = 0; h < HOURS; ++h) {
+        text[h].reserve(65536);
+        done[h].store(false, std::memory_order_relaxed);
+    }
     std::atomic<int> next_hour{0};
 
     std::vector<std::thread> pool;
@@ -205,78 +181,80 @@ int main() {
             workers[t].parse(data + cut[t], data + cut[t + 1]);
             sync.arrive_and_wait();
 
-            std::vector<u32> count, errors, cursor, lat;
-            for (int h; (h = next_hour.fetch_add(1, std::memory_order_relaxed)) < HOURS;) {
-                count.assign(ne + 1, 0);
-                errors.assign(ne, 0);
-                for (int wt = 0; wt < nthreads; ++wt) {
-                    auto tally = [&](u32 key) {
-                        u32 e = rank[wt][key & ID_MASK];
-                        ++count[e + 1];
-                        errors[e] += (key & ERR_BIT) != 0;
-                    };
-                    for (Block* b = workers[wt].head[h]; b; b = b->next)
-                        for (u32 i = 0; i < b->n; ++i) tally(b->rec[i]);
-                    for (auto [l, key] : workers[wt].big[h]) tally(key);
+            if (t == 0) {
+                for (int h = 0; h < HOURS; ++h) {
+                    done[h].wait(false);
+                    fwrite(text[h].data(), 1, text[h].size(), out);
+                    std::string().swap(text[h]);
                 }
-                for (u32 e = 0; e < ne; ++e) count[e + 1] += count[e];
-                cursor.assign(count.begin(), count.end() - 1);
-                lat.resize(count[ne]);
-                for (int wt = 0; wt < nthreads; ++wt) {
-                    for (Block* b = workers[wt].head[h]; b; b = b->next)
-                        for (u32 i = 0; i < b->n; ++i)
-                            lat[cursor[rank[wt][b->rec[i] & ID_MASK]]++] = b->rec[i] >> KEY_BITS;
-                    for (auto [l, key] : workers[wt].big[h])
-                        lat[cursor[rank[wt][key & ID_MASK]]++] = l;
-                }
+            } else {
+                std::vector<u32> count, errors, cursor, lat;
+                for (int h; (h = next_hour.fetch_add(1, std::memory_order_relaxed)) < HOURS;) {
+                    count.assign(ne + 1, 0);
+                    errors.assign(ne, 0);
+                    for (int wt = 0; wt < nthreads; ++wt) {
+                        auto tally = [&](u32 key) {
+                            u32 e = rank[wt][key & ID_MASK];
+                            ++count[e + 1];
+                            errors[e] += (key & ERR_BIT) != 0;
+                        };
+                        for (Block* b = workers[wt].head[h]; b; b = b->next)
+                            for (u32 i = 0; i < b->n; ++i) tally(b->rec[i]);
+                        for (auto [l, key] : workers[wt].big[h]) tally(key);
+                    }
+                    for (u32 e = 0; e < ne; ++e) count[e + 1] += count[e];
+                    cursor.assign(count.begin(), count.end() - 1);
+                    lat.resize(count[ne]);
+                    for (int wt = 0; wt < nthreads; ++wt) {
+                        for (Block* b = workers[wt].head[h]; b; b = b->next)
+                            for (u32 i = 0; i < b->n; ++i)
+                                lat[cursor[rank[wt][b->rec[i] & ID_MASK]]++] = b->rec[i] >> KEY_BITS;
+                        for (auto [l, key] : workers[wt].big[h])
+                            lat[cursor[rank[wt][key & ID_MASK]]++] = l;
+                    }
 
-                size_t cap = count[ne] ? count[ne] * 90 + 4096 : 4096;
-                char* hbuf = static_cast<char*>(malloc(cap));
-                char* op = hbuf;
-                const char* label = labels[h];
-                for (u32 e = 0; e < ne; ++e) {
-                    u32* a = lat.data() + count[e];
-                    u32 n = count[e + 1] - count[e];
-                    if (n == 0) continue;
-                    u32 v[6] = {n, 0, 0, 0, errors[e], u32(u64(errors[e]) * 1000000 / n)};
-                    if (n == 1) {
-                        v[1] = v[2] = v[3] = a[0];
-                    } else if (n == 2) {
-                        if (a[0] > a[1]) std::swap(a[0], a[1]);
-                        v[1] = a[0];
-                        v[2] = v[3] = a[1];
-                    } else if (n <= 256) {
-                        std::sort(a, a + n);
-                        v[1] = a[(50u * n + 99) / 100 - 1];
-                        v[2] = a[(95u * n + 99) / 100 - 1];
-                        v[3] = a[(99u * n + 99) / 100 - 1];
-                    } else {
-                        u32 lo = 0, k = 1;
-                        for (u32 p : {50u, 95u, 99u}) {
-                            u32 r = (p * n + 99) / 100 - 1;
-                            std::nth_element(a + lo, a + r, a + n);
-                            v[k++] = a[lo = r];
+                    char line[256];
+                    const char* label = labels[h];
+                    std::string& th_out = text[h];
+                    for (u32 e = 0; e < ne; ++e) {
+                        u32* a = lat.data() + count[e];
+                        u32 n = count[e + 1] - count[e];
+                        if (n == 0) continue;
+                        u32 v[6] = {n, 0, 0, 0, errors[e], u32(u64(errors[e]) * 1000000 / n)};
+                        if (n == 1) {
+                            v[1] = v[2] = v[3] = a[0];
+                        } else if (n == 2) {
+                            if (a[0] > a[1]) std::swap(a[0], a[1]);
+                            v[1] = a[0];
+                            v[2] = v[3] = a[1];
+                        } else if (n <= 128) {
+                            std::sort(a, a + n);
+                            v[1] = a[(50u * n + 99) / 100 - 1];
+                            v[2] = a[(95u * n + 99) / 100 - 1];
+                            v[3] = a[(99u * n + 99) / 100 - 1];
+                        } else {
+                            u32 lo = 0, k = 1;
+                            for (u32 p : {50u, 95u, 99u}) {
+                                u32 r = (p * n + 99) / 100 - 1;
+                                std::nth_element(a + lo, a + r, a + n);
+                                v[k++] = a[lo = r];
+                            }
                         }
+                        char* op = std::copy(names[e].begin(), names[e].end(), std::copy_n(label, 21, line));
+                        for (u32 x : v) {
+                            *op++ = ' ';
+                            op = std::to_chars(op, op + 10, x).ptr;
+                        }
+                        *op++ = '\n';
+                        th_out.append(line, op);
                     }
-                    op = std::copy(names[e].begin(), names[e].end(), std::copy_n(label, 21, op));
-                    for (u32 x : v) {
-                        *op++ = ' ';
-                        op = std::to_chars(op, op + 10, x).ptr;
-                    }
-                    *op++ = '\n';
+                    done[h].store(true, std::memory_order_release);
+                    done[h].notify_one();
                 }
-                slices[h] = {hbuf, static_cast<size_t>(op - hbuf)};
             }
         });
     }
     for (auto& th : pool) th.join();
-
-    for (int h = 0; h < HOURS; ++h) {
-        if (slices[h].len) {
-            fwrite(slices[h].ptr, 1, slices[h].len, out);
-            free(slices[h].ptr);
-        }
-    }
     fclose(out);
     _exit(0);
 }

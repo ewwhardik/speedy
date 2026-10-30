@@ -279,9 +279,12 @@ Index build_index(const File& f, TermTable& terms, std::vector<u32>& query_terms
     }
 
     std::vector<std::vector<u32>> count(nthreads);
-    std::vector<std::vector<u32>> thread_start(nthreads);
-    std::barrier sync(nthreads, [&]() noexcept {
-        u64 total_docs = ix.docs;
+    std::vector<u32> sampled(nthreads);
+    std::vector<std::vector<u32>> thread_buf(nthreads);
+
+    std::barrier sync1(nthreads, [&]() noexcept {
+        u64 docs = 0;
+        for (u32 s : sampled) docs += s;
         std::vector<u64> df(nterms);
         std::vector<u32> order(nterms), new_id(nterms);
         for (u32 id = 0; id < nterms; ++id) {
@@ -292,22 +295,24 @@ Index build_index(const File& f, TermTable& terms, std::vector<u32>& query_terms
         u32 ndense = 0;
         for (u32 rank = 0; rank < nterms; ++rank) {
             new_id[order[rank]] = rank;
-            if (df[order[rank]] * 32 > total_docs) ix.dense[rank] = ndense++;
+            if (df[order[rank]] * 32 > docs) ix.dense[rank] = ndense++;
         }
         terms.renumber(new_id);
         for (u32& id : query_terms) id = new_id[id];
         ix.bits.assign(ndense * ix.words, 0);
+    });
 
+    std::vector<std::vector<u32>> thread_offset(nthreads);
+    std::barrier sync2(nthreads, [&]() noexcept {
         ix.start.resize(nterms + 1);
         u32 total = 0;
-        for (int t = 0; t < nthreads; ++t) thread_start[t].resize(nterms);
-        for (u32 rank = 0; rank < nterms; ++rank) {
-            ix.start[rank] = total;
-            u32 old_id = order[rank];
-            if (ix.dense[rank] == NONE) {
+        for (int t = 0; t < nthreads; ++t) thread_offset[t].resize(nterms);
+        for (u32 id = 0; id < nterms; ++id) {
+            ix.start[id] = total;
+            if (ix.dense[id] == NONE) {
                 for (int t = 0; t < nthreads; ++t) {
-                    thread_start[t][rank] = total;
-                    total += count[t][old_id];
+                    thread_offset[t][id] = total;
+                    total += count[t][id];
                 }
             }
         }
@@ -325,47 +330,56 @@ Index build_index(const File& f, TermTable& terms, std::vector<u32>& query_terms
             cnt.assign(nterms, 0);
             std::vector<u32> last_doc(nterms, NONE);
 
-            u32 doc = first;
-            for (const uint8_t* p = begin; p < end; ++doc) {
-                const uint8_t* nl = static_cast<const uint8_t*>(memchr(p, '\n', end - p));
-                const uint8_t* tx = static_cast<const uint8_t*>(memchr(p, '\t', nl - p)) + 1;
-                ix.text[2 * size_t(doc)] = tx - base;
-                ix.text[2 * size_t(doc) + 1] = nl - base;
-                for_each_token(tx, nl, terms, [&](u32 id) {
-                    if (id != NONE && last_doc[id] != doc) {
-                        last_doc[id] = doc;
-                        ++cnt[id];
-                    }
-                });
-                p = nl + 1;
-            }
-
-            sync.arrive_and_wait();
-
-            std::fill(last_doc.begin(), last_doc.end(), NONE);
-            auto& offsets = thread_start[t];
-            doc = first;
-            for (const uint8_t* p = begin; p < end; ++doc) {
-                const uint8_t* tx = base + ix.text[2 * size_t(doc)];
-                const uint8_t* nl = base + ix.text[2 * size_t(doc) + 1];
-                for_each_token(tx, nl, terms, [&](u32 id) {
-                    if (id != NONE && last_doc[id] != doc) {
-                        last_doc[id] = doc;
-                        if (u32 d = ix.dense[id]; d != NONE) {
-                            std::atomic_ref<u64>(ix.bits[d * ix.words + doc / 64])
-                                .fetch_or(1ull << (doc % 64), std::memory_order_relaxed);
-                        } else {
-                            ix.post[offsets[id]++] = doc - first;
+            auto walk = [&](const uint8_t* stop, auto&& term) {
+                u32 doc = first;
+                for (const uint8_t* p = begin; p < stop; ++doc) {
+                    const uint8_t* nl = static_cast<const uint8_t*>(memchr(p, '\n', end - p));
+                    const uint8_t* tx = static_cast<const uint8_t*>(memchr(p, '\t', nl - p)) + 1;
+                    ix.text[2 * size_t(doc)] = tx - base;
+                    ix.text[2 * size_t(doc) + 1] = nl - base;
+                    for_each_token(tx, nl, terms, [&](u32 id) {
+                        if (id != NONE && last_doc[id] != doc) {
+                            last_doc[id] = doc;
+                            term(id, doc);
                         }
-                    }
-                });
-                p = nl + 1;
+                    });
+                    p = nl + 1;
+                }
+                return doc - first;
+            };
+
+            sampled[t] = walk(begin + (end - begin) / 32, [&](u32 id, u32) { ++cnt[id]; });
+            sync1.arrive_and_wait();
+
+            std::fill(cnt.begin(), cnt.end(), 0);
+            std::fill(last_doc.begin(), last_doc.end(), NONE);
+            auto& buf = thread_buf[t];
+            buf.reserve(500000);
+
+            walk(end, [&](u32 id, u32 doc) {
+                if (u32 d = ix.dense[id]; d != NONE) {
+                    std::atomic_ref<u64>(ix.bits[d * ix.words + doc / 64])
+                        .fetch_or(1ull << (doc % 64), std::memory_order_relaxed);
+                } else {
+                    buf.push_back((id << 15) | (doc - first));
+                    ++cnt[id];
+                }
+            });
+
+            sync2.arrive_and_wait();
+
+            auto& offsets = thread_offset[t];
+            for (u32 item : buf) {
+                u32 id = item >> 15;
+                u32 doc_off = item & 0x7FFF;
+                ix.post[offsets[id]++] = doc_off;
             }
+            std::vector<u32>().swap(buf);
         });
     }
     for (auto& th : pool) th.join();
 
-    ix.seg_end = std::move(thread_start);
+    ix.seg_end = std::move(thread_offset);
     ix.df.resize(nterms);
     for (u32 id = 0; id < nterms; ++id) {
         ix.df[id] = ix.start[id + 1] - ix.start[id];
