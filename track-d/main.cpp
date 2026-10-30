@@ -8,39 +8,86 @@
 #include <cstring>
 #include <fcntl.h>
 #include <malloc.h>
+#include <numeric>
 #include <string>
 #include <sys/mman.h>
 #include <sys/prctl.h>
+#include <sys/stat.h>
 #include <thread>
 #include <unistd.h>
-#include <utility>
 #include <vector>
 
 using u32 = uint32_t;
 using u64 = uint64_t;
-constexpr u64 INF = ~u64(0);
 
-const char* map_file(const char* path, size_t& size) {
-    int fd = open(path, O_RDONLY);
-    if (fd < 0) { perror(path); _exit(1); }
-    size = lseek(fd, 0, SEEK_END);
-    auto* p = static_cast<char*>(mmap(nullptr, size + 4096, PROT_READ, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0));
-    if (size && mmap(p, size, PROT_READ, MAP_PRIVATE | MAP_FIXED, fd, 0) == MAP_FAILED) {
-        perror("mmap");
-        _exit(1);
+struct Edge { u32 node, weight; };
+
+struct MappedFile {
+    const char* data = nullptr;
+    size_t size = 0;
+    explicit MappedFile(const char* path) {
+        int fd = open(path, O_RDONLY);
+        if (fd < 0) { perror(path); _exit(1); }
+        struct stat st {};
+        if (fstat(fd, &st) != 0) { close(fd); _exit(1); }
+        size = static_cast<size_t>(st.st_size);
+        if (size) {
+            void* p = mmap(nullptr, size + 4096, PROT_READ, MAP_PRIVATE, fd, 0);
+            if (p == MAP_FAILED) { perror("mmap"); _exit(1); }
+            data = static_cast<const char*>(p);
+        }
+        close(fd);
     }
-    close(fd);
-    return p;
-}
+    ~MappedFile() {
+        if (size && data) munmap(const_cast<char*>(data), size + 4096);
+    }
+    const char* end() const { return data + size; }
+};
 
-inline u32 number(const char*& p) {
-    u32 v = 0;
-    while (*p >= '0' && *p <= '9') v = v * 10 + (*p++ - '0');
+inline u64 integer(const char*& p, const char* end) {
+    while (p < end && (*p < '0' || *p > '9')) ++p;
+    u64 v = 0;
+    while (p < end && *p >= '0' && *p <= '9') v = v * 10 + (*p++ - '0');
     return v;
 }
 
-struct Edge {
-    u32 v, w;
+struct Graph {
+    std::vector<u32> offset[2];
+    std::vector<Edge> edges[2];
+    u32 n = 0;
+    explicit Graph(const char* path) {
+        MappedFile file(path);
+        const char* p = file.data;
+        const char* end = file.end();
+        n = integer(p, end);
+        u32 m = integer(p, end);
+        const char* start = p;
+        for (auto& off : offset) off.resize(size_t(n) + 1);
+        for (u32 i = 0; i < m; ++i) {
+            u32 u = integer(p, end);
+            u32 v = integer(p, end);
+            integer(p, end);
+            if (u != v && u < n && v < n) {
+                ++offset[0][u + 1];
+                ++offset[1][v + 1];
+            }
+        }
+        for (int dir = 0; dir < 2; ++dir) {
+            std::partial_sum(offset[dir].begin(), offset[dir].end(), offset[dir].begin());
+            edges[dir].resize(offset[dir][n]);
+        }
+        auto cur_f = offset[0], cur_b = offset[1];
+        p = start;
+        for (u32 i = 0; i < m; ++i) {
+            u32 u = integer(p, end);
+            u32 v = integer(p, end);
+            u32 w = integer(p, end);
+            if (u != v && u < n && v < n) {
+                edges[0][cur_f[u]++] = {v, w};
+                edges[1][cur_b[v]++] = {u, w};
+            }
+        }
+    }
 };
 
 struct RadixHeap {
@@ -48,12 +95,7 @@ struct RadixHeap {
     std::array<std::vector<Item>, 65> buckets;
     u64 last = 0;
     size_t size = 0;
-
-    void clear() {
-        for (auto& b : buckets) b.clear();
-        last = 0;
-        size = 0;
-    }
+    void clear() { for (auto& b : buckets) b.clear(); last = 0; size = 0; }
     bool empty() const { return size == 0; }
     void push(u64 key, u32 node) {
         buckets[std::bit_width(key ^ last)].emplace_back(key, node);
@@ -63,7 +105,7 @@ struct RadixHeap {
         if (buckets[0].empty()) {
             unsigned i = 1;
             while (buckets[i].empty()) ++i;
-            last = INF;
+            last = UINT64_MAX;
             for (auto [key, node] : buckets[i]) last = std::min(last, key);
             for (auto item : buckets[i]) buckets[std::bit_width(item.first ^ last)].push_back(item);
             buckets[i].clear();
@@ -78,221 +120,76 @@ struct RadixHeap {
     }
 };
 
-class PagedDist {
-public:
-    static constexpr u32 PAGE = 512;
-    explicit PagedDist(u32 n) : table_((n + PAGE - 1) / PAGE, nullptr) {}
-    ~PagedDist() { for (auto* p : owned_) delete[] p; }
-
-    inline u64 get(u32 v) const {
-        u64* p = table_[v / PAGE];
-        return p ? p[v % PAGE] : INF;
-    }
-
-    inline void set(u32 v, u64 d) {
-        u64*& p = table_[v / PAGE];
-        if (!p) {
-            if (spare_.empty()) owned_.push_back(new u64[PAGE]), spare_.push_back(owned_.back());
-            p = spare_.back();
-            spare_.pop_back();
-            std::fill(p, p + PAGE, INF);
-            used_.push_back(v / PAGE);
+struct Search {
+    std::vector<u64> distance[2];
+    std::vector<u32> stamp[2];
+    RadixHeap heap[2];
+    static constexpr u64 INF = UINT64_MAX / 2;
+    explicit Search(u32 n) {
+        for (int d = 0; d < 2; ++d) {
+            distance[d].resize(n);
+            stamp[d].resize(n);
         }
-        p[v % PAGE] = d;
     }
-
-    void reset() {
-        for (u32 i : used_) {
-            spare_.push_back(table_[i]);
-            table_[i] = nullptr;
+    int64_t run(const Graph& graph, u32 s, u32 t, u32 epoch) {
+        if (s == t) return 0;
+        if (s >= graph.n || t >= graph.n ||
+            graph.offset[0][s] == graph.offset[0][s + 1] ||
+            graph.offset[1][t] == graph.offset[1][t + 1])
+            return -1;
+        heap[0].clear(); heap[1].clear();
+        distance[0][s] = distance[1][t] = 0;
+        stamp[0][s] = stamp[1][t] = epoch;
+        heap[0].push(0, s); heap[1].push(0, t);
+        u64 best = INF;
+        for (;;) {
+            for (int d = 0; d < 2; ++d)
+                while (!heap[d].empty() && heap[d].top().first != distance[d][heap[d].top().second])
+                    heap[d].pop();
+            if (heap[0].empty() || heap[1].empty()) break;
+            if (heap[0].top().first + heap[1].top().first >= best) break;
+            int dir = heap[0].top().first <= heap[1].top().first ? 0 : 1;
+            auto [du, u] = heap[dir].pop();
+            if (stamp[1 - dir][u] == epoch) best = std::min(best, du + distance[1 - dir][u]);
+            for (u32 i = graph.offset[dir][u]; i < graph.offset[dir][u + 1]; ++i) {
+                auto [v, w] = graph.edges[dir][i];
+                u64 nd = du + w;
+                if (stamp[dir][v] != epoch || nd < distance[dir][v]) {
+                    stamp[dir][v] = epoch;
+                    distance[dir][v] = nd;
+                    heap[dir].push(nd, v);
+                    if (stamp[1 - dir][v] == epoch) best = std::min(best, nd + distance[1 - dir][v]);
+                }
+            }
         }
-        used_.clear();
+        return best == INF ? -1 : static_cast<int64_t>(best);
     }
-
-private:
-    std::vector<u64*> table_, spare_, owned_;
-    std::vector<u32> used_;
 };
-
-template <class F>
-void run_threads(int n, F&& body) {
-    std::vector<std::thread> pool;
-    for (int t = 0; t < n; ++t) pool.emplace_back(body, t);
-    for (auto& th : pool) th.join();
-}
 
 int main() {
     prctl(PR_SET_THP_DISABLE, 1, 0, 0, 0);
     mallopt(M_MMAP_THRESHOLD, 1 << 16);
-    const int nthreads = std::clamp<int>(std::thread::hardware_concurrency(), 1, 12);
-    size_t gsize, qsize;
-    const char* graph_data = map_file("/data/graph.txt", gsize);
-    const char* qdata = map_file("/data/queries.txt", qsize);
-
+    Graph graph("/data/graph.txt");
+    MappedFile qfile("/data/queries.txt");
     std::vector<std::pair<u32, u32>> queries;
-    for (const char* p = qdata; p < qdata + qsize;) {
-        u32 s = number(p); ++p;
-        u32 t = number(p);
-        while (p < qdata + qsize && *p != '\n') ++p;
-        if (p < qdata + qsize) ++p;
+    const char* p = qfile.data;
+    const char* end = qfile.end();
+    while (p < end) {
+        u32 s = integer(p, end);
+        u32 t = integer(p, end);
         queries.emplace_back(s, t);
     }
-    munmap(const_cast<char*>(qdata), qsize + 4096);
-
-    const char* p = graph_data;
-    const u32 n = number(p); ++p;
-    number(p); // m
-    while (p < graph_data + gsize && *p != '\n') ++p;
-    if (p < graph_data + gsize) ++p;
-
-    const char* edge_start = p;
-    size_t edge_len = gsize - (edge_start - graph_data);
-
-    std::vector<size_t> cut(nthreads + 1, edge_len);
-    cut[0] = 0;
-    for (int t = 1; t < nthreads; ++t) {
-        size_t c = edge_len * t / nthreads;
-        while (c < edge_len && edge_start[c - 1] != '\n') ++c;
-        cut[t] = c;
-    }
-
-    std::vector<std::vector<u32>> f_count(nthreads), b_count(nthreads);
-    for (int t = 0; t < nthreads; ++t) {
-        f_count[t].assign(n, 0);
-        b_count[t].assign(n, 0);
-    }
-
-    run_threads(nthreads, [&](int t) {
-        const char* q = edge_start + cut[t];
-        const char* q_end = edge_start + cut[t + 1];
-        auto& fc = f_count[t];
-        auto& bc = b_count[t];
-        while (q < q_end) {
-            u32 u = number(q); ++q;
-            u32 v = number(q); ++q;
-            number(q); // w
-            while (q < q_end && *q != '\n') ++q;
-            if (q < q_end) ++q;
-            if (u != v && u < n && v < n) {
-                ++fc[u];
-                ++bc[v];
-            }
-        }
-    });
-
-    std::vector<u32> fwd_head(n + 1), bwd_head(n + 1);
-    std::vector<std::vector<u32>> f_cur(nthreads), b_cur(nthreads);
-    for (int t = 0; t < nthreads; ++t) {
-        f_cur[t].resize(n);
-        b_cur[t].resize(n);
-    }
-
-    u32 f_total = 0, b_total = 0;
-    for (u32 u = 0; u < n; ++u) {
-        fwd_head[u] = f_total;
-        bwd_head[u] = b_total;
-        for (int t = 0; t < nthreads; ++t) {
-            f_cur[t][u] = f_total;
-            f_total += f_count[t][u];
-            b_cur[t][u] = b_total;
-            b_total += b_count[t][u];
-        }
-    }
-    fwd_head[n] = f_total;
-    bwd_head[n] = b_total;
-
-    std::vector<Edge> fwd_edges(f_total), bwd_edges(b_total);
-
-    run_threads(nthreads, [&](int t) {
-        const char* q = edge_start + cut[t];
-        const char* q_end = edge_start + cut[t + 1];
-        auto& fc = f_cur[t];
-        auto& bc = b_cur[t];
-        while (q < q_end) {
-            u32 u = number(q); ++q;
-            u32 v = number(q); ++q;
-            u32 w = number(q);
-            while (q < q_end && *q != '\n') ++q;
-            if (q < q_end) ++q;
-            if (u != v && u < n && v < n) {
-                fwd_edges[fc[u]++] = {v, w};
-                bwd_edges[bc[v]++] = {u, w};
-            }
-        }
-    });
-
-    munmap(const_cast<char*>(graph_data), gsize + 4096);
-    std::vector<std::vector<u32>>().swap(f_count);
-    std::vector<std::vector<u32>>().swap(b_count);
-    std::vector<std::vector<u32>>().swap(f_cur);
-    std::vector<std::vector<u32>>().swap(b_cur);
-    std::vector<size_t>().swap(cut);
-
     std::vector<int64_t> answers(queries.size());
-    std::atomic<size_t> next_q{0};
-
-    run_threads(nthreads, [&](int) {
-        RadixHeap heap_f, heap_b;
-        PagedDist dist_f(n), dist_b(n);
-
-        for (size_t q; (q = next_q.fetch_add(1, std::memory_order_relaxed)) < queries.size();) {
-            auto [s, t] = queries[q];
-            if (s == t) { answers[q] = 0; continue; }
-            if (s >= n || t >= n || fwd_head[s] == fwd_head[s + 1] || bwd_head[t] == bwd_head[t + 1]) {
-                answers[q] = -1;
-                continue;
-            }
-
-            heap_f.clear(); heap_b.clear();
-            dist_f.reset(); dist_b.reset();
-
-            dist_f.set(s, 0); heap_f.push(0, s);
-            dist_b.set(t, 0); heap_b.push(0, t);
-            u64 best = INF;
-
-            while (!heap_f.empty() && !heap_b.empty()) {
-                while (!heap_f.empty() && heap_f.top().first != dist_f.get(heap_f.top().second)) heap_f.pop();
-                while (!heap_b.empty() && heap_b.top().first != dist_b.get(heap_b.top().second)) heap_b.pop();
-                if (heap_f.empty() || heap_b.empty()) break;
-
-                if (heap_f.top().first + heap_b.top().first >= best) break;
-
-                int dir = heap_f.top().first <= heap_b.top().first ? 0 : 1;
-                if (dir == 0) {
-                    auto [du, u] = heap_f.pop();
-                    u64 db_u = dist_b.get(u);
-                    if (db_u != INF) best = std::min(best, du + db_u);
-
-                    for (u32 e = fwd_head[u]; e < fwd_head[u + 1]; ++e) {
-                        u32 v = fwd_edges[e].v;
-                        u64 nd = du + fwd_edges[e].w;
-                        if (nd < dist_f.get(v)) {
-                            dist_f.set(v, nd);
-                            heap_f.push(nd, v);
-                            u64 db_v = dist_b.get(v);
-                            if (db_v != INF) best = std::min(best, nd + db_v);
-                        }
-                    }
-                } else {
-                    auto [du, u] = heap_b.pop();
-                    u64 df_u = dist_f.get(u);
-                    if (df_u != INF) best = std::min(best, du + df_u);
-
-                    for (u32 e = bwd_head[u]; e < bwd_head[u + 1]; ++e) {
-                        u32 v = bwd_edges[e].v;
-                        u64 nd = du + bwd_edges[e].w;
-                        if (nd < dist_b.get(v)) {
-                            dist_b.set(v, nd);
-                            heap_b.push(nd, v);
-                            u64 df_v = dist_f.get(v);
-                            if (df_v != INF) best = std::min(best, nd + df_v);
-                        }
-                    }
-                }
-            }
-            answers[q] = best == INF ? -1 : static_cast<int64_t>(best);
+    std::atomic<size_t> next{0};
+    const unsigned workers = std::clamp<unsigned>(std::thread::hardware_concurrency(), 1, 6);
+    std::vector<std::thread> pool;
+    for (unsigned i = 0; i < workers; ++i) pool.emplace_back([&] {
+        Search search(graph.n);
+        for (size_t q; (q = next.fetch_add(1, std::memory_order_relaxed)) < queries.size();) {
+            answers[q] = search.run(graph, queries[q].first, queries[q].second, static_cast<u32>(q + 1));
         }
     });
+    for (auto& th : pool) th.join();
 
     std::string out;
     out.reserve(queries.size() * 12);
@@ -301,14 +198,13 @@ int main() {
         if (a < 0) {
             out += "-1\n";
         } else {
-            char* p = buf + 31;
-            *p = '\n';
-            uint64_t x = static_cast<uint64_t>(a);
-            do { *--p = '0' + (x % 10); x /= 10; } while (x);
-            out.append(p, (buf + 32) - p);
+            char* b = buf + 31;
+            *b = '\n';
+            u64 x = static_cast<u64>(a);
+            do { *--b = '0' + (x % 10); x /= 10; } while (x);
+            out.append(b, (buf + 32) - b);
         }
     }
-
     FILE* f = fopen("/out/distances.txt", "wb");
     if (!f) { perror("/out/distances.txt"); return 1; }
     fwrite(out.data(), 1, out.size(), f);
