@@ -137,7 +137,7 @@ static void parse(Th *t, const char *p, const char *hi) {
     p++;
     Bucket *b = &t->b[hr];
     if (b->n == b->cap) {
-      b->cap = b->cap ? b->cap * 2 : 1024;
+      b->cap = b->cap ? b->cap * 2 : 2048;
       b->lat = realloc(b->lat, b->cap * 4ull);
       b->tag = realloc(b->tag, b->cap * 2ull);
     }
@@ -306,12 +306,9 @@ int main(void) {
   if (fd < 0 || fstat(fd, &st))
     die("cannot open /data/requests.log");
   size = st.st_size;
-  // Map the file over a zeroed region one page longer, so that reads a little
-  // past the last line (next_space, hash_bytes) stay inside mapped memory.
-  char *m = mmap(NULL, size + 4096, PROT_READ, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-  if (m == MAP_FAILED || (size && mmap(m, size, PROT_READ, MAP_PRIVATE | MAP_FIXED, fd, 0) == MAP_FAILED))
+  data = mmap(NULL, size, PROT_READ, MAP_SHARED, fd, 0);
+  if (data == MAP_FAILED)
     die("mmap failed");
-  data = m;
   nchunks = (size + CHUNK - 1) / CHUNK;
   cpu_set_t cpus; // the CPUs this container may use, not the host's count
   nth = sched_getaffinity(0, sizeof cpus, &cpus) ? 1 : CPU_COUNT(&cpus);
@@ -319,6 +316,9 @@ int main(void) {
   nth = nth < 1 ? 1 : nth;
   th = calloc(nth, sizeof(Th));
   run_threads(scan);
+  munmap((void *)data, size);
+  close(fd);
+  malloc_trim(0);
 
   for (uint32_t i = 0; i < E; i++) // rank the endpoints bytewise
     ord[i] = i;

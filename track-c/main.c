@@ -356,6 +356,8 @@ int main(void) {
       break;
     free(slots);
   }
+  posix_fadvise(fd, 0, 0, POSIX_FADV_DONTNEED);
+  close(fd);
   run_threads(count_names);
   malloc_trim(0);
 

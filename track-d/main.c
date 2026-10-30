@@ -124,7 +124,7 @@ static Item pop(Th *t, size_t *hn) {
 // -2 when 32-bit distances would overflow (wide = 0 only).
 static int64_t search(Th *t, uint32_t s, uint32_t tg, int wide) {
   size_t hn = 0, nt = 0;
-  uint64_t tg_bound = wide ? UINT64_MAX : INF32;
+  int64_t res = -1;
 #define DIST(x) (wide ? t->d64[x] : t->d32[x])
 #define SET(x, val) (wide ? (void)(t->d64[x] = (val)) : (void)(t->d32[x] = (uint32_t)(val)))
   SET(s, 0);
@@ -134,16 +134,15 @@ static int64_t search(Th *t, uint32_t s, uint32_t tg, int wide) {
     Item it = pop(t, &hn);
     if (it.d > DIST(it.u))
       continue; // stale: u was settled at a shorter distance
-    if (it.u == tg || it.d >= tg_bound)
+    if (it.u == tg) {
+      res = it.d;
       break;
+    }
     for (uint32_t e = off[it.u]; e < off[it.u + 1]; e++) {
       uint32_t v = edges[e].v;
-      uint64_t nd = it.d + edges[e].w;
-      if (nd >= tg_bound)
-        continue;
-      uint64_t dv = DIST(v);
+      uint64_t nd = it.d + edges[e].w, dv = DIST(v);
       if (!wide && nd >= INF32) {
-        tg_bound = (uint64_t)-2;
+        res = -2;
         hn = 0;
         break;
       }
@@ -154,17 +153,13 @@ static int64_t search(Th *t, uint32_t s, uint32_t tg, int wide) {
           t->touched[nt++] = v;
         }
         SET(v, nd);
-        if (v == tg)
-          tg_bound = nd;
         push(t, &hn, nd, v);
       }
     }
   }
   for (size_t i = 0; i < nt; i++) // reset only what this search touched
     SET(t->touched[i], wide ? UINT64_MAX : INF32);
-  if (tg_bound == (uint64_t)-2)
-    return -2;
-  return tg_bound == (wide ? UINT64_MAX : INF32) ? -1 : (int64_t)tg_bound;
+  return res;
 }
 
 static void *answer(void *arg) {
@@ -270,6 +265,8 @@ int main(void) {
   pass = 2;
   run_threads(scan);
   free(cur);
+  posix_fadvise(fd, 0, 0, POSIX_FADV_DONTNEED);
+  close(fd);
   for (int i = 0; i < nth; i++)
     free(th[i].buf);
 

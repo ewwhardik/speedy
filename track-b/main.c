@@ -505,9 +505,13 @@ static void *answer(void *arg) {
 
 static void run_threads(void *(*f)(void *)) {
   pthread_t id[64];
+  pthread_attr_t attr;
+  pthread_attr_init(&attr);
+  pthread_attr_setstacksize(&attr, 64 * 1024);
   for (int i = 0; i < nth; i++)
-    if (pthread_create(&id[i], NULL, f, &th[i]))
+    if (pthread_create(&id[i], &attr, f, &th[i]))
       die("pthread_create failed");
+  pthread_attr_destroy(&attr);
   for (int i = 0; i < nth; i++)
     pthread_join(id[i], NULL);
 }
@@ -541,6 +545,7 @@ static char *slurp(const char *path, long *size) {
 }
 
 int main(void) {
+  mallopt(M_ARENA_MAX, 1);
   // Queries: BOOL t1 op t2 ... or PHRASE "t1 t2 ...".
   long qsize;
   char *qb = slurp("/data/queries.txt", &qsize);
@@ -633,6 +638,7 @@ int main(void) {
     th[i].tc = calloc(nterms + 1, sizeof(Tc));
   }
   run_threads(scan);
+  posix_fadvise(fd, 0, 0, POSIX_FADV_DONTNEED);
 
   // Posting slices for the list terms, each thread's cursor after earlier threads'.
   df = calloc(nterms + 1, 4);
@@ -692,5 +698,6 @@ int main(void) {
   }
   if (write(out, ob, o - ob) != o - ob || close(out))
     die("write failed");
+  close(fd);
   return 0;
 }
