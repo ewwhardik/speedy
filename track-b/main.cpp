@@ -42,9 +42,9 @@ struct File {
 };
 
 File map_file(const std::string& path) {
-    File f;
     int fd = open(path.c_str(), O_RDONLY);
     if (fd < 0) { perror(path.c_str()); _exit(1); }
+    File f;
     struct stat st;
     fstat(fd, &st);
     f.size = st.st_size;
@@ -55,94 +55,119 @@ File map_file(const std::string& path) {
     return f;
 }
 
-struct alignas(32) Key {
-    u64 w[4];
-};
-
-inline u64 hash_key(const Key& k) {
-    u64 h = (k.w[0] + k.w[2] * 0x94D049BB133111EBull) * 0x9E3779B97F4A7C15ull ^
-            (k.w[1] + k.w[3] * 0xD6E8FEB86659FD93ull) * 0xBF58476D1CE4E5B9ull;
-    return h ^ h >> 29;
+inline u64 token_bytes(const uint8_t* p) {
+    __m256i v0 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(p));
+    __m256i v1 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(p + 32));
+    __m256i c0 = _mm256_set1_epi8('0'), c9 = _mm256_set1_epi8('9');
+    __m256i ca = _mm256_set1_epi8('a'), cz = _mm256_set1_epi8('z');
+    __m256i cA = _mm256_set1_epi8('A'), cZ = _mm256_set1_epi8('Z');
+    auto is_tok = [&](__m256i v) {
+        __m256i d = _mm256_and_si256(_mm256_cmpgt_epi8(v, _mm256_sub_epi8(c0, _mm256_set1_epi8(1))),
+                                     _mm256_cmpgt_epi8(_mm256_add_epi8(c9, _mm256_set1_epi8(1)), v));
+        __m256i l = _mm256_and_si256(_mm256_cmpgt_epi8(v, _mm256_sub_epi8(ca, _mm256_set1_epi8(1))),
+                                     _mm256_cmpgt_epi8(_mm256_add_epi8(cz, _mm256_set1_epi8(1)), v));
+        __m256i u = _mm256_and_si256(_mm256_cmpgt_epi8(v, _mm256_sub_epi8(cA, _mm256_set1_epi8(1))),
+                                     _mm256_cmpgt_epi8(_mm256_add_epi8(cZ, _mm256_set1_epi8(1)), v));
+        return _mm256_or_si256(d, _mm256_or_si256(l, u));
+    };
+    u32 m0 = _mm256_movemask_epi8(is_tok(v0));
+    u32 m1 = _mm256_movemask_epi8(is_tok(v1));
+    return u64(m0) | (u64(m1) << 32);
 }
 
-inline bool same(const Key& a, const Key& b) {
-    return ((a.w[0] ^ b.w[0]) | (a.w[1] ^ b.w[1]) | (a.w[2] ^ b.w[2]) | (a.w[3] ^ b.w[3])) == 0;
+struct Key {
+    uint8_t len = 0;
+    char text[MAX_TERM] = {};
+    bool operator==(const Key& o) const {
+        return len == o.len && memcmp(text, o.text, len) == 0;
+    }
+};
+
+inline Key make_key(const uint8_t* p, size_t len) {
+    Key k;
+    k.len = static_cast<uint8_t>(len);
+    for (size_t i = 0; i < len; ++i) k.text[i] = static_cast<char>(LOWER.t[p[i]]);
+    return k;
+}
+
+inline u64 hash_key(const Key& k) {
+    u64 h = 0x100;
+    for (size_t i = 0; i < k.len; ++i) h = (h ^ static_cast<uint8_t>(k.text[i])) * 0x100000001b3ull;
+    return h;
 }
 
 class TermTable {
 public:
-    TermTable() { rehash(1 << 16); }
-    u32 size() const { return keys_.size(); }
-    const uint8_t* bytes(u32 id) const { return reinterpret_cast<const uint8_t*>(keys_[id].w); }
-    size_t length(u32 id) const { return lens_[id]; }
-
     u32 insert(const Key& k) {
-        if ((keys_.size() + 1) * 2 > slots_.size()) rehash(slots_.size() * 2);
-        u64 h = hash_key(k);
-        for (size_t i = h & mask_;; i = (i + 1) & mask_) {
-            u64 s = slots_[i];
-            if (s == 0) {
-                keys_.push_back(k);
-                lens_.push_back(strnlen(reinterpret_cast<const char*>(k.w), MAX_TERM));
-                slots_[i] = (h & 0xFFFFFFFF00000000ull) | keys_.size();
-                return keys_.size() - 1;
-            }
-            if ((s >> 32) == (h >> 32) && same(keys_[(u32)s - 1], k)) return (u32)s - 1;
+        if (keys_.size() * 2 >= cap_) grow();
+        const u64 h = hash_key(k);
+        size_t b = h & (cap_ - 1);
+        while (table_[b] != NONE) {
+            if (keys_[table_[b]] == k) return table_[b];
+            b = (b + 1) & (cap_ - 1);
         }
+        const u32 id = static_cast<u32>(keys_.size());
+        keys_.push_back(k);
+        hashes_.push_back(h);
+        table_[b] = id;
+        return id;
+    }
+
+    u32 find(const Key& k, u64 h) const {
+        if (cap_ == 0) return NONE;
+        size_t b = h & (cap_ - 1);
+        while (table_[b] != NONE) {
+            if (keys_[table_[b]] == k) return table_[b];
+            b = (b + 1) & (cap_ - 1);
+        }
+        return NONE;
+    }
+
+    void prefetch(u64 h) const {
+        _mm_prefetch(reinterpret_cast<const char*>(&table_[h & (cap_ - 1)]), _MM_HINT_T0);
     }
 
     void renumber(const std::vector<u32>& new_id) {
-        std::vector<Key> keys(keys_.size());
-        std::vector<uint8_t> lens(lens_.size());
-        for (u32 i = 0; i < keys_.size(); ++i) keys[new_id[i]] = keys_[i], lens[new_id[i]] = lens_[i];
-        keys_.swap(keys);
-        lens_.swap(lens);
-        rehash(slots_.size());
-    }
-
-    void prefetch(u64 h) const { _mm_prefetch(reinterpret_cast<const char*>(&slots_[h & mask_]), _MM_HINT_T0); }
-
-    u32 find(const Key& k, u64 h) const {
-        for (size_t i = h & mask_;; i = (i + 1) & mask_) {
-            u64 s = slots_[i];
-            if (s == 0) return NONE;
-            if ((s >> 32) == (h >> 32) && same(keys_[(u32)s - 1], k)) return (u32)s - 1;
+        std::vector<Key> nk(keys_.size());
+        std::vector<u64> nh(keys_.size());
+        for (size_t i = 0; i < keys_.size(); ++i) {
+            nk[new_id[i]] = keys_[i];
+            nh[new_id[i]] = hashes_[i];
+        }
+        keys_ = std::move(nk);
+        hashes_ = std::move(nh);
+        std::fill(table_.begin(), table_.end(), NONE);
+        for (size_t i = 0; i < keys_.size(); ++i) {
+            size_t b = hashes_[i] & (cap_ - 1);
+            while (table_[b] != NONE) b = (b + 1) & (cap_ - 1);
+            table_[b] = static_cast<u32>(i);
         }
     }
+
+    size_t size() const { return keys_.size(); }
+    const Key& key(u32 id) const { return keys_[id]; }
 
 private:
-    void rehash(size_t cap) {
-        slots_.assign(cap, 0);
-        mask_ = cap - 1;
-        for (u32 id = 0; id < keys_.size(); ++id) {
-            u64 h = hash_key(keys_[id]);
-            size_t i = h & mask_;
-            while (slots_[i]) i = (i + 1) & mask_;
-            slots_[i] = (h & 0xFFFFFFFF00000000ull) | (id + 1);
+    void grow() {
+        const size_t ncap = cap_ ? cap_ * 2 : 1024;
+        std::vector<u32> nt(ncap, NONE);
+        for (size_t i = 0; i < keys_.size(); ++i) {
+            size_t b = hashes_[i] & (ncap - 1);
+            while (nt[b] != NONE) b = (b + 1) & (ncap - 1);
+            nt[b] = static_cast<u32>(i);
         }
+        table_ = std::move(nt);
+        cap_ = ncap;
     }
 
-    std::vector<u64> slots_;
     std::vector<Key> keys_;
-    std::vector<uint8_t> lens_;
-    size_t mask_ = 0;
+    std::vector<u64> hashes_;
+    std::vector<u32> table_;
+    size_t cap_ = 0;
 };
 
-inline u64 token_bytes(const uint8_t* p) {
-    auto half = [](const uint8_t* q) {
-        __m256i v = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(q));
-        __m256i letter = _mm256_sub_epi8(_mm256_or_si256(v, _mm256_set1_epi8(0x20)), _mm256_set1_epi8('a'));
-        __m256i digit = _mm256_sub_epi8(v, _mm256_set1_epi8('0'));
-        __m256i zero = _mm256_setzero_si256();
-        __m256i in = _mm256_or_si256(_mm256_cmpeq_epi8(_mm256_subs_epu8(letter, _mm256_set1_epi8(25)), zero),
-                                     _mm256_cmpeq_epi8(_mm256_subs_epu8(digit, _mm256_set1_epi8(9)), zero));
-        return u32(_mm256_movemask_epi8(in));
-    };
-    return half(p) | u64(half(p + 32)) << 32;
-}
-
 template <class F>
-inline void for_each_token(const uint8_t* q, const uint8_t* e, const TermTable& terms, F&& emit) {
+inline void for_each_token(const uint8_t* q, const uint8_t* e, const TermTable& terms, F&& f) {
     constexpr size_t LAG = 8;
     Key keys[LAG];
     u64 hashes[LAG];
@@ -151,7 +176,6 @@ inline void for_each_token(const uint8_t* q, const uint8_t* e, const TermTable& 
     for (bool fresh = true; q < e;) {
         if (fresh) {
             m = token_bytes(q);
-            if (e - q < 64) m &= (1ull << (e - q)) - 1;
             fresh = false;
         }
         if (m == 0) { q += 64; fresh = true; continue; }
@@ -163,22 +187,16 @@ inline void for_each_token(const uint8_t* q, const uint8_t* e, const TermTable& 
         m &= after ? ~0ull << __builtin_ctzll(after) : 0;
         if (t > q + 64) { q = t; fresh = true; }
         const size_t len = t - s;
-        if (len > MAX_TERM) continue;
-        Key k;
-        for (size_t i = 0; i < 4; ++i) {
-            size_t b = len > 8 * i ? std::min<size_t>(len - 8 * i, 8) : 0;
-            u64 w;
-            memcpy(&w, s + 8 * i, 8);
-            k.w[i] = (w | 0x2020202020202020ull) & (b == 8 ? ~0ull : (1ull << (8 * b)) - 1);
+        if (len <= MAX_TERM) {
+            keys[n % LAG] = make_key(s, len);
+            hashes[n % LAG] = hash_key(keys[n % LAG]);
+            terms.prefetch(hashes[n % LAG]);
+            if (n >= LAG) f(terms.find(keys[(n - LAG) % LAG], hashes[(n - LAG) % LAG]));
+            ++n;
         }
-        const u64 h = hash_key(k);
-        terms.prefetch(h);
-        const size_t slot = n++ % LAG;
-        if (n > LAG) emit(terms.find(keys[slot], hashes[slot]));
-        keys[slot] = k;
-        hashes[slot] = h;
     }
-    for (size_t i = n > LAG ? n - LAG : 0; i < n; ++i) emit(terms.find(keys[i % LAG], hashes[i % LAG]));
+    for (size_t i = n >= LAG ? n - LAG : 0; i < n; ++i)
+        f(terms.find(keys[i % LAG], hashes[i % LAG]));
 }
 
 struct Query {
@@ -188,28 +206,25 @@ struct Query {
 };
 
 struct Queries {
-    std::vector<u32> terms, first{0};
+    std::vector<u32> terms;
     std::vector<char> ops;
-    std::vector<bool> phrase;
+    std::vector<uint32_t> first;
+    std::vector<uint8_t> phrase;
 
     size_t size() const { return phrase.size(); }
     Query operator[](size_t i) const {
-        size_t b = first[i], n = first[i + 1] - b;
-        return {phrase[i], {terms.data() + b, n}, {ops.data() + b, n - 1}};
+        const u32 b = first[i], e = first[i + 1];
+        return Query{phrase[i] != 0, std::span<const u32>(&terms[b], e - b),
+                     std::span<const char>(&ops[b], e - b)};
     }
 };
-
-Key make_key(const uint8_t* p, size_t len) {
-    Key k{{0, 0, 0, 0}};
-    memcpy(k.w, p, std::min<size_t>(len, MAX_TERM));
-    return k;
-}
 
 Queries parse_queries(const File& f, TermTable& terms) {
     Queries qs;
     const uint8_t* p = f.data;
     const uint8_t* end = f.data + f.size;
     while (p < end) {
+        qs.first.push_back(static_cast<u32>(qs.terms.size()));
         const uint8_t* nl = static_cast<const uint8_t*>(memchr(p, '\n', end - p));
         if (!nl) nl = end;
         const bool phrase = p[0] == 'P';
@@ -224,12 +239,12 @@ Queries parse_queries(const File& f, TermTable& terms) {
                 qs.terms.push_back(terms.insert(make_key(s, sp - s)));
                 qs.ops.push_back(0);
             }
-            s = sp + 1;
+            s = sp < e ? sp + 1 : e;
         }
-        qs.phrase.push_back(phrase);
-        qs.first.push_back(qs.terms.size());
+        qs.phrase.push_back(phrase ? 1 : 0);
         p = nl + 1;
     }
+    qs.first.push_back(static_cast<u32>(qs.terms.size()));
     return qs;
 }
 
@@ -246,76 +261,6 @@ struct Index {
     std::unique_ptr<uint16_t[]> post;
     std::vector<u32> text;
 };
-
-class BlockList {
-public:
-    struct Block {
-        Block* next;
-        size_t cap;
-        size_t n;
-        uint8_t data[];
-    };
-
-    BlockList() = default;
-    BlockList(const BlockList&) = delete;
-    BlockList& operator=(const BlockList&) = delete;
-    BlockList(BlockList&& o) noexcept : head_(o.head_), tail_(o.tail_), cur_(o.cur_) {
-        o.head_ = o.tail_ = o.cur_ = nullptr;
-    }
-    BlockList& operator=(BlockList&& o) noexcept {
-        if (this != &o) {
-            this->~BlockList();
-            head_ = o.head_; tail_ = o.tail_; cur_ = o.cur_;
-            o.head_ = o.tail_ = o.cur_ = nullptr;
-        }
-        return *this;
-    }
-    ~BlockList() {
-        for (Block* b = head_; b;) {
-            Block* next = b->next;
-            munmap(b, sizeof(Block) + 3 * b->cap + 1);
-            b = next;
-        }
-    }
-
-    void push(u32 x) {
-        if (!cur_ || cur_->n == cur_->cap) {
-            size_t next_cap = cur_ ? std::min<size_t>(cur_->cap * 4, 8192) : 256;
-            size_t bytes = sizeof(Block) + 3 * next_cap + 1;
-            auto* b = static_cast<Block*>(mmap(nullptr, bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0));
-            b->next = nullptr;
-            b->cap = next_cap;
-            b->n = 0;
-            if (!head_) head_ = b;
-            else tail_->next = b;
-            tail_ = b;
-            cur_ = b;
-        }
-        memcpy(cur_->data + 3 * cur_->n++, &x, 4);
-    }
-
-    template <class F>
-    void drain(F&& f) {
-        for (Block* b = head_; b;) {
-            for (size_t i = 0; i < b->n; ++i) {
-                u32 x;
-                memcpy(&x, b->data + 3 * i, 4);
-                f(x & 0xFFFFFF);
-            }
-            Block* next = b->next;
-            munmap(b, sizeof(Block) + 3 * b->cap + 1);
-            b = next;
-        }
-        head_ = tail_ = cur_ = nullptr;
-    }
-
-private:
-    Block* head_ = nullptr;
-    Block* tail_ = nullptr;
-    Block* cur_ = nullptr;
-};
-
-constexpr u32 BUCKET_BITS = 9, DOC_BITS = 15;
 
 u32 parse_id(const uint8_t* p) {
     u32 v = 0;
@@ -338,7 +283,6 @@ Index build_index(const File& f, TermTable& terms, std::vector<u32>& query_terms
     ix.text.resize(2 * size_t(ix.docs));
     ix.words = (ix.docs + 63) / 64;
     ix.dense.assign(nterms, NONE);
-    const u32 nbuckets = (nterms >> BUCKET_BITS) + 1;
 
     std::vector<size_t> cut(nthreads + 1);
     for (int t = 0; t <= nthreads; ++t) {
@@ -346,28 +290,50 @@ Index build_index(const File& f, TermTable& terms, std::vector<u32>& query_terms
         while (c > 0 && c < size && base[c - 1] != '\n') ++c;
         cut[t] = c;
     }
-    std::vector<std::vector<BlockList>> seen(nthreads);
+
     std::vector<std::vector<u32>> count(nthreads);
-    std::vector<u32> sampled(nthreads);
     std::barrier sync(nthreads, [&]() noexcept {
-        u64 docs = 0;
-        for (u32 s : sampled) docs += s;
-        std::vector<u64> df(nterms);
+        std::vector<u64> total_df(nterms);
         std::vector<u32> order(nterms), new_id(nterms);
         for (u32 id = 0; id < nterms; ++id) {
-            for (int t = 0; t < nthreads; ++t) df[id] += count[t][id];
+            for (int t = 0; t < nthreads; ++t) total_df[id] += count[t][id];
             order[id] = id;
         }
-        std::stable_sort(order.begin(), order.end(), [&](u32 a, u32 b) { return df[a] > df[b]; });
+        std::stable_sort(order.begin(), order.end(), [&](u32 a, u32 b) { return total_df[a] > total_df[b]; });
         u32 ndense = 0;
         for (u32 rank = 0; rank < nterms; ++rank) {
             new_id[order[rank]] = rank;
-            if (df[order[rank]] * 16 > docs) ix.dense[rank] = ndense++;
+            if (total_df[order[rank]] * 16 > ix.docs) ix.dense[rank] = ndense++;
         }
         terms.renumber(new_id);
         for (u32& id : query_terms) id = new_id[id];
         ix.bits.assign(ndense * ix.words, 0);
+
+        for (int t = 0; t < nthreads; ++t) {
+            std::vector<u32> remapped(nterms);
+            for (u32 old_id = 0; old_id < nterms; ++old_id)
+                remapped[new_id[old_id]] = count[t][old_id];
+            count[t] = std::move(remapped);
+        }
+
+        ix.start.resize(nterms + 1);
+        u32 total_sparse = 0;
+        for (u32 rank = 0; rank < nterms; ++rank) {
+            ix.start[rank] = total_sparse;
+            if (ix.dense[rank] == NONE) {
+                for (int t = 0; t < nthreads; ++t) {
+                    u32 c = count[t][rank];
+                    count[t][rank] = total_sparse;
+                    total_sparse += c;
+                }
+            } else {
+                for (int t = 0; t < nthreads; ++t) count[t][rank] = 0;
+            }
+        }
+        ix.start[nterms] = total_sparse;
+        ix.post.reset(new uint16_t[total_sparse]);
     });
+
     std::vector<std::thread> pool;
     for (int t = 0; t < nthreads; ++t) {
         pool.emplace_back([&, t] {
@@ -378,67 +344,44 @@ Index build_index(const File& f, TermTable& terms, std::vector<u32>& query_terms
             cnt.assign(nterms, 0);
             std::vector<u32> last_doc(nterms, NONE);
 
-            auto walk = [&](const uint8_t* stop, auto&& term, auto&& done) {
-                u32 doc = first;
-                for (const uint8_t* p = begin; p < stop; ++doc) {
-                    const uint8_t* nl = static_cast<const uint8_t*>(memchr(p, '\n', end - p));
-                    const uint8_t* tx = static_cast<const uint8_t*>(memchr(p, '\t', nl - p)) + 1;
-                    ix.text[2 * size_t(doc)] = tx - base;
-                    ix.text[2 * size_t(doc) + 1] = nl - base;
-                    for_each_token(tx, nl, terms, [&](u32 id) {
-                        if (id != NONE && last_doc[id] != doc) last_doc[id] = doc, term(id, doc);
-                    });
-                    done();
-                    p = nl + 1;
-                }
-                return doc - first;
-            };
-
-            sampled[t] = walk(begin + (end - begin) / 32, [&](u32 id, u32) { ++cnt[id]; }, [] {});
-            sync.arrive_and_wait();
-            std::fill(cnt.begin(), cnt.end(), 0);
-            std::fill(last_doc.begin(), last_doc.end(), NONE);
-            auto& out = seen[t];
-            out.resize(nbuckets);
-            const u32 docs = walk(end, [&](u32 id, u32 doc) {
-                if (u32 d = ix.dense[id]; d != NONE) {
-                    std::atomic_ref<u64>(ix.bits[d * ix.words + doc / 64])
-                        .fetch_or(1ull << (doc % 64), std::memory_order_relaxed);
-                } else {
-                    out[id >> BUCKET_BITS].push((id & ((1u << BUCKET_BITS) - 1)) << DOC_BITS | (doc - first));
-                    ++cnt[id];
-                }
-            }, [] {});
-            if (docs >> DOC_BITS) { fputs("too many documents per thread\n", stderr); _exit(1); }
-        });
-    }
-    for (auto& th : pool) th.join();
-    pool.clear();
-
-    ix.start.resize(nterms + 1);
-    u32 total = 0;
-    for (u32 id = 0; id < nterms; ++id) {
-        ix.start[id] = total;
-        for (int t = 0; t < nthreads; ++t) {
-            u32 c = count[t][id];
-            count[t][id] = total;
-            total += c;
-        }
-    }
-    ix.start[nterms] = total;
-    ix.post.reset(new uint16_t[total]);
-    for (int t = 0; t < nthreads; ++t) {
-        pool.emplace_back([&, t] {
-            for (u32 b = 0; b < nbuckets; ++b)
-                seen[t][b].drain([&](u32 x) {
-                    u32 id = b << BUCKET_BITS | x >> DOC_BITS;
-                    ix.post[count[t][id]++] = x & ((1u << DOC_BITS) - 1);
+            u32 doc = first;
+            for (const uint8_t* p = begin; p < end; ++doc) {
+                const uint8_t* nl = static_cast<const uint8_t*>(memchr(p, '\n', end - p));
+                if (!nl) nl = end;
+                const uint8_t* tx = static_cast<const uint8_t*>(memchr(p, '\t', nl - p));
+                if (!tx) tx = p; else ++tx;
+                ix.text[2 * size_t(doc)] = tx - base;
+                ix.text[2 * size_t(doc) + 1] = nl - base;
+                for_each_token(tx, nl, terms, [&](u32 id) {
+                    if (id != NONE && last_doc[id] != doc) last_doc[id] = doc, ++cnt[id];
                 });
+                p = nl + 1;
+            }
+
+            sync.arrive_and_wait();
+
+            std::fill(last_doc.begin(), last_doc.end(), NONE);
+            doc = first;
+            for (const uint8_t* p = begin; p < end; ++doc) {
+                const uint8_t* nl = base + ix.text[2 * size_t(doc) + 1];
+                const uint8_t* tx = base + ix.text[2 * size_t(doc)];
+                for_each_token(tx, nl, terms, [&](u32 id) {
+                    if (id != NONE && last_doc[id] != doc) {
+                        last_doc[id] = doc;
+                        if (u32 d = ix.dense[id]; d != NONE) {
+                            std::atomic_ref<u64>(ix.bits[d * ix.words + doc / 64])
+                                .fetch_or(1ull << (doc % 64), std::memory_order_relaxed);
+                        } else {
+                            ix.post[cnt[id]++] = static_cast<uint16_t>(doc - first);
+                        }
+                    }
+                });
+                p = nl + 1;
+            }
         });
     }
     for (auto& th : pool) th.join();
-    seen.clear();
-    seen.shrink_to_fit();
+
     madvise(const_cast<uint8_t*>(base), size, MADV_DONTNEED);
     malloc_trim(0);
     ix.seg_end = std::move(count);
@@ -468,69 +411,66 @@ void for_each_bit(const u64* bits, size_t words, F&& f) {
         for (u64 m = bits[w]; m; m &= m - 1) f(u32(w * 64 + __builtin_ctzll(m)));
 }
 
-void assign(std::vector<u32>& out, Postings b) {
-    out.clear();
-    if (b.bits) for_each_bit(b.bits, b.words, [&](u32 x) { out.push_back(x); });
-    else out.assign(b.p, b.p + b.n);
-}
-
-inline size_t gallop(const u32* a, size_t lo, size_t n, u32 x) {
-    size_t step = 1, hi = lo;
-    while (hi < n && a[hi] < x) lo = hi + 1, hi += step, step <<= 1;
-    return std::lower_bound(a + lo, a + std::min(hi, n), x) - a;
-}
-
-void op_and(const std::vector<u32>& a, Postings b, std::vector<u32>& out) {
-    out.clear();
-    if (b.bits) {
-        for (u32 x : a)
-            if (has(b.bits, x)) out.push_back(x);
-    } else if (a.size() * 16 < b.n) {
-        size_t j = 0;
-        for (u32 x : a) {
-            j = gallop(b.p, j, b.n, x);
-            if (j == b.n) break;
-            if (b.p[j] == x) out.push_back(x);
-        }
-    } else if (b.n * 16 < a.size()) {
-        size_t i = 0;
-        for (size_t k = 0; k < b.n; ++k) {
-            i = gallop(a.data(), i, a.size(), b.p[k]);
-            if (i == a.size()) break;
-            if (a[i] == b.p[k]) out.push_back(b.p[k]);
-        }
-    } else {
-        std::set_intersection(a.begin(), a.end(), b.p, b.p + b.n, std::back_inserter(out));
-    }
-}
-
-void op_not(const std::vector<u32>& a, Postings b, std::vector<u32>& out) {
-    out.clear();
-    if (b.bits) {
-        for (u32 x : a)
-            if (!has(b.bits, x)) out.push_back(x);
-    } else if (a.size() * 16 < b.n) {
-        size_t j = 0;
-        for (u32 x : a) {
-            j = gallop(b.p, j, b.n, x);
-            if (j == b.n || b.p[j] != x) out.push_back(x);
-        }
-    } else {
-        std::set_difference(a.begin(), a.end(), b.p, b.p + b.n, std::back_inserter(out));
-    }
-}
-
-void op_or(const std::vector<u32>& a, Postings b, std::vector<u32>& out) {
-    out.clear();
-    std::set_union(a.begin(), a.end(), b.p, b.p + b.n, std::back_inserter(out));
-}
-
 inline u64 position_sum(u64 m) {
-    static constexpr u64 SEL[6] = {0xAAAAAAAAAAAAAAAAull, 0xCCCCCCCCCCCCCCCCull, 0xF0F0F0F0F0F0F0F0ull,
-                                   0xFF00FF00FF00FF00ull, 0xFFFF0000FFFF0000ull, 0xFFFFFFFF00000000ull};
     u64 s = 0;
-    for (int k = 0; k < 6; ++k) s += u64(__builtin_popcountll(m & SEL[k])) << k;
+    while (m) { s += __builtin_ctzll(m); m &= m - 1; }
     return s;
+}
+
+void op_and(const std::vector<u32>& a, const Postings& b, std::vector<u32>& out) {
+    out.clear();
+    if (b.bits) {
+        for (u32 x : a) if (has(b.bits, x)) out.push_back(x);
+        return;
+    }
+    size_t ia = 0, ib = 0;
+    while (ia < a.size() && ib < b.n) {
+        u32 va = a[ia], vb = b.p[ib];
+        if (va == vb) { out.push_back(va); ++ia; ++ib; }
+        else if (va < vb) ++ia;
+        else ++ib;
+    }
+}
+
+void op_or(const std::vector<u32>& a, const Postings& b, std::vector<u32>& out) {
+    out.clear();
+    if (b.bits) {
+        out.reserve(a.size() + b.n);
+        auto it = a.begin();
+        for_each_bit(b.bits, b.words, [&](u32 doc) {
+            while (it != a.end() && *it < doc) out.push_back(*it++);
+            if (it != a.end() && *it == doc) ++it;
+            out.push_back(doc);
+        });
+        out.insert(out.end(), it, a.end());
+        return;
+    }
+    size_t ia = 0, ib = 0;
+    out.reserve(a.size() + b.n);
+    while (ia < a.size() && ib < b.n) {
+        u32 va = a[ia], vb = b.p[ib];
+        if (va == vb) { out.push_back(va); ++ia; ++ib; }
+        else if (va < vb) { out.push_back(va); ++ia; }
+        else { out.push_back(vb); ++ib; }
+    }
+    out.insert(out.end(), a.begin() + ia, a.end());
+    out.insert(out.end(), b.p + ib, b.p + b.n);
+}
+
+void op_not(const std::vector<u32>& a, const Postings& b, std::vector<u32>& out) {
+    out.clear();
+    if (b.bits) {
+        for (u32 x : a) if (!has(b.bits, x)) out.push_back(x);
+        return;
+    }
+    size_t ia = 0, ib = 0;
+    while (ia < a.size() && ib < b.n) {
+        u32 va = a[ia], vb = b.p[ib];
+        if (va == vb) { ++ia; ++ib; }
+        else if (va < vb) { out.push_back(va); ++ia; }
+        else ++ib;
+    }
+    out.insert(out.end(), a.begin() + ia, a.end());
 }
 
 class Solver {
@@ -577,52 +517,68 @@ private:
         }
     }
 
-    void apply_dense(char op, Postings b) {
+    void apply_dense(char op, const Postings& b) {
         if (b.bits) {
             for (size_t w = 0; w < ix_.words; ++w) {
-                u64 y = b.bits[w];
                 switch (op) {
-                    case 'A': bm_[w] &= y; break;
-                    case 'O': bm_[w] |= y; break;
-                    default: bm_[w] &= ~y; break;
+                    case 'A': bm_[w] &= b.bits[w]; break;
+                    case 'O': bm_[w] |= b.bits[w]; break;
+                    default: bm_[w] &= ~b.bits[w]; break;
                 }
             }
+            return;
+        }
+        if (op == 'A') {
+            dense_ = false;
+            cur_.clear();
+            cur_.reserve(b.n);
+            for (size_t i = 0; i < b.n; ++i) if (has(bm_.data(), b.p[i])) cur_.push_back(b.p[i]);
         } else if (op == 'O') {
             for (size_t i = 0; i < b.n; ++i) bm_[b.p[i] / 64] |= 1ull << (b.p[i] % 64);
         } else {
-            cur_.clear();
-            for_each_bit(bm_.data(), ix_.words, [&](u32 x) { cur_.push_back(x); });
-            dense_ = false;
-            if (op == 'A') op_and(cur_, b, tmp_);
-            else op_not(cur_, b, tmp_);
-            cur_.swap(tmp_);
+            for (size_t i = 0; i < b.n; ++i) bm_[b.p[i] / 64] &= ~(1ull << (b.p[i] % 64));
         }
     }
 
     void phrase(const Query& q) {
-        cur_.clear();
+        dense_ = false;
+        if (q.terms.empty()) { cur_.clear(); return; }
         u32 rarest = 0;
         for (size_t i = 1; i < q.terms.size(); ++i)
-            if (ix_.df[q.terms[i]] < ix_.df[q.terms[rarest]]) rarest = i;
-        assign(cur_, postings(q.terms[rarest]));
+            if (ix_.df[q.terms[i]] < ix_.df[q.terms[rarest]]) rarest = static_cast<u32>(i);
+        Postings first = postings(q.terms[rarest]);
+        if (first.bits) {
+            cur_.clear();
+            for_each_bit(first.bits, first.words, [&](u32 doc) { cur_.push_back(doc); });
+        } else {
+            cur_.assign(first.p, first.p + first.n);
+        }
         for (size_t i = 0; i < q.terms.size(); ++i) {
-            if (i == rarest) continue;
+            if (i == rarest || cur_.empty()) continue;
             op_and(cur_, postings(q.terms[i]), tmp_);
             cur_.swap(tmp_);
-            if (cur_.empty()) return;
         }
+        if (cur_.empty()) return;
         size_t n = 0;
         for (u32 doc : cur_) {
-            const uint8_t* b = docs_.data + ix_.text[2 * size_t(doc)];
-            const uint8_t* e = docs_.data + ix_.text[2 * size_t(doc) + 1];
-            size_t k = 0;
-            for_each_token(b, e, terms_, [&](u32 id) {
-                if (k == q.terms.size()) return;
-                k = (id == q.terms[k]) ? k + 1 : (id == q.terms[0] ? 1 : 0);
+            const uint8_t* p = docs_.data + ix_.text[2 * size_t(doc)];
+            const uint8_t* end = docs_.data + ix_.text[2 * size_t(doc) + 1];
+            size_t match = 0;
+            for_each_token(p, end, terms_, [&](u32 id) {
+                if (match == q.terms.size()) return;
+                match = (id == q.terms[match]) ? match + 1 : (id == q.terms[0] ? 1 : 0);
             });
-            if (k == q.terms.size()) cur_[n++] = doc;
+            if (match == q.terms.size()) cur_[n++] = doc;
         }
         cur_.resize(n);
+    }
+
+    static inline char* put_u64(char* p, u64 v) {
+        char tmp[24];
+        int n = 0;
+        do { tmp[n++] = '0' + (v % 10); v /= 10; } while (v);
+        while (n) *p++ = tmp[--n];
+        return p;
     }
 
     int format(char* out) {
@@ -649,10 +605,15 @@ private:
             for (u32 doc : cur_) observe(doc);
         }
         char* p = out;
-        p += sprintf(p, "%lu %lu", count, sum);
-        for (int i = 0; i < nfirst; ++i) p += sprintf(p, " %u", first10[i]);
+        p = put_u64(p, count);
+        *p++ = ' ';
+        p = put_u64(p, sum);
+        for (int i = 0; i < nfirst; ++i) {
+            *p++ = ' ';
+            p = put_u64(p, first10[i]);
+        }
         *p++ = '\n';
-        return p - out;
+        return static_cast<int>(p - out);
     }
 
     const Index& ix_;
@@ -685,21 +646,20 @@ int main() {
         }
     }
 
+    const size_t nq = queries.size();
     std::vector<std::string> chunks(nthreads);
-    std::atomic<size_t> next_query{0};
     std::vector<std::thread> pool;
     for (int t = 0; t < nthreads; ++t) {
         pool.emplace_back([&, t] {
             Solver solver(ix, terms, docs_file);
             std::string& out = chunks[t];
-            out.reserve(queries.size() / nthreads * 48);
+            const size_t q_start = t * nq / nthreads;
+            const size_t q_end = (t + 1) * nq / nthreads;
+            out.reserve((q_end - q_start) * 48);
             char line[256];
-            for (size_t i; (i = next_query.fetch_add(64, std::memory_order_relaxed)) < queries.size();) {
-                size_t end = std::min(i + 64, queries.size());
-                for (size_t k = i; k < end; ++k) {
-                    int len = solver.answer(queries[k], line);
-                    out.append(line, len);
-                }
+            for (size_t k = q_start; k < q_end; ++k) {
+                int len = solver.answer(queries[k], line);
+                out.append(line, len);
             }
         });
     }

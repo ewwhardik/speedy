@@ -45,8 +45,8 @@ inline u32 parse_digits(const char* end, u32 len) {
         for (const char* p = end - len; p < end; ++p) v = v * 10 + (*p - '0');
         return v;
     }
-    u64 mask = (len == 8) ? ~0ull : (~0ull << (8 * (8 - len)));
-    u64 v = load8(end - 8) & 0x0F0F0F0F0F0F0F0F & mask;
+    u64 mask = ~0ull << (64 - (len << 3));
+    u64 v = (load8(end - 8) & 0x0F0F0F0F0F0F0F0F) & mask;
     v = (v * 10 + (v >> 8)) & 0x00FF00FF00FF00FF;
     v = (v * 100 + (v >> 16)) & 0x0000FFFF0000FFFF;
     return (v * 10000 + (v >> 32)) & 0xFFFFFFFF;
@@ -98,14 +98,14 @@ struct Worker {
             int hour = (p[11] - '0') * 10 + (p[12] - '0');
             int h = day_idx * 24 + hour - 18;
 
-            const char* m = p + 28;
-            u64 sp = match32(m, ' ') | u64(match32(m + 32, ' ')) << 32;
-            u64 nl = match32(m, '\n') | u64(match32(m + 32, '\n')) << 32;
-            const char* ep = m + __builtin_ctzll(sp) + 1;
-            const char* ee = nl ? m + __builtin_ctzll(sp & (sp - 1)) : find(ep, ' ');
-            const char* eol = nl ? m + __builtin_ctzll(nl) : find(ee + 5, '\n');
+            const char* ep = p + (p[31] == ' ' ? 32 : (p[32] == ' ' ? 33 : (p[34] == ' ' ? 35 : (p[35] == ' ' ? 36 : 34))));
+            __m256i v = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(ep));
+            u32 m = _mm256_movemask_epi8(_mm256_cmpeq_epi8(v, _mm256_set1_epi8(' ')));
+            const char* ee = m ? ep + __builtin_ctz(m) : find(ep + 32, ' ');
+            __m128i v16 = _mm_loadu_si128(reinterpret_cast<const __m128i*>(ee + 5));
+            const char* eol = ee + 5 + __builtin_ctz(_mm_movemask_epi8(_mm_cmpeq_epi8(v16, _mm_set1_epi8('\n'))));
             const u32 key = endpoints.intern(ep, ee - ep) | (ee[1] == '5' ? ERR_BIT : 0);
-            const u32 lat = parse_digits(eol, eol - ee - 5);
+            const u32 lat = parse_digits(eol, eol - (ee + 5));
             p = eol + 1;
             if (lat >= BIG) {
                 big[h].push_back({lat, key});
@@ -148,6 +148,7 @@ int main() {
         while (cut[t] < size && data[cut[t] - 1] != '\n') ++cut[t];
     }
     std::vector<Worker> workers(nthreads);
+
     EndpointTable global;
     std::vector<std::vector<u32>> rank(nthreads);
     std::vector<std::string_view> names;
@@ -206,7 +207,7 @@ int main() {
                     cursor.assign(count.begin(), count.end() - 1);
                     lat.resize(count[ne]);
                     for (int wt = 0; wt < nthreads; ++wt) {
-                        for (Block* b = workers[wt].head[h]; b; b = b->next)
+                        for (Block* b = workers[wt].head[h]; b; madvise(std::exchange(b, b->next), sizeof(Block), MADV_DONTNEED))
                             for (u32 i = 0; i < b->n; ++i)
                                 lat[cursor[rank[wt][b->rec[i] & ID_MASK]]++] = b->rec[i] >> KEY_BITS;
                         for (auto [l, key] : workers[wt].big[h])
