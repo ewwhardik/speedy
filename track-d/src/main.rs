@@ -159,102 +159,54 @@ impl MinHeap {
     }
 }
 
-struct DistMap {
-    entries: Vec<(u32, u64)>, // (node_id, dist)
-    mask: usize,
-    touched: Vec<usize>,
+#[cfg(target_os = "linux")]
+unsafe fn alloc_anon_u64(n: usize) -> *mut u64 {
+    let len = n * std::mem::size_of::<u64>();
+    let mut addr: *mut u8;
+    core::arch::asm!(
+        "syscall",
+        in("rax") 9usize, // SYS_mmap
+        in("rdi") 0usize,
+        in("rsi") len,
+        in("rdx") 3usize, // PROT_READ | PROT_WRITE
+        in("r10") 34usize, // MAP_PRIVATE | MAP_ANONYMOUS (0x2 | 0x20)
+        in("r8") -1isize as usize,
+        in("r9") 0usize,
+        lateout("rax") addr,
+        lateout("rcx") _,
+        lateout("r11") _,
+    );
+    addr as *mut u64
 }
 
-impl DistMap {
-    fn with_capacity(cap: usize) -> Self {
-        let size = cap.next_power_of_two();
-        Self {
-            entries: vec![(u32::MAX, 0); size],
-            mask: size - 1,
-            touched: Vec::with_capacity(size / 2),
-        }
-    }
-
-    #[inline(always)]
-    fn get(&self, node: u32) -> Option<u64> {
-        let mut idx = (node as usize).wrapping_mul(0x9e3779b9) & self.mask;
-        loop {
-            let (k, d) = self.entries[idx];
-            if k == u32::MAX {
-                return None;
-            }
-            if k == node {
-                return Some(d);
-            }
-            idx = (idx + 1) & self.mask;
-        }
-    }
-
-    #[inline(always)]
-    fn insert_or_update(&mut self, node: u32, dist: u64) -> bool {
-        if self.touched.len() * 2 >= self.entries.len() {
-            self.grow();
-        }
-        let mut idx = (node as usize).wrapping_mul(0x9e3779b9) & self.mask;
-        loop {
-            let (k, d) = self.entries[idx];
-            if k == u32::MAX {
-                self.entries[idx] = (node, dist);
-                self.touched.push(idx);
-                return true;
-            }
-            if k == node {
-                if dist < d {
-                    self.entries[idx].1 = dist;
-                    return true;
-                }
-                return false;
-            }
-            idx = (idx + 1) & self.mask;
-        }
-    }
-
-    fn grow(&mut self) {
-        let old_entries = std::mem::take(&mut self.entries);
-        let new_size = old_entries.len() * 2;
-        self.entries = vec![(u32::MAX, 0); new_size];
-        self.mask = new_size - 1;
-        self.touched.clear();
-        for (k, d) in old_entries {
-            if k != u32::MAX {
-                let mut idx = (k as usize).wrapping_mul(0x9e3779b9) & self.mask;
-                while self.entries[idx].0 != u32::MAX {
-                    idx = (idx + 1) & self.mask;
-                }
-                self.entries[idx] = (k, d);
-                self.touched.push(idx);
-            }
-        }
-    }
-
-    #[inline(always)]
-    fn clear(&mut self) {
-        for &idx in &self.touched {
-            self.entries[idx] = (u32::MAX, 0);
-        }
-        self.touched.clear();
-    }
+#[cfg(not(target_os = "linux"))]
+unsafe fn alloc_anon_u64(n: usize) -> *mut u64 {
+    let mut v = vec![0u64; n];
+    let ptr = v.as_mut_ptr();
+    std::mem::forget(v);
+    ptr
 }
 
 struct WorkerContext {
-    dist_f: DistMap,
-    dist_b: DistMap,
+    dist_f: *mut u64,
+    dist_b: *mut u64,
+    touched_f: Vec<u32>,
+    touched_b: Vec<u32>,
     heap_f: MinHeap,
     heap_b: MinHeap,
 }
 
 impl WorkerContext {
-    fn new(_n: usize) -> Self {
-        Self {
-            dist_f: DistMap::with_capacity(4096),
-            dist_b: DistMap::with_capacity(4096),
-            heap_f: MinHeap::with_capacity(4096),
-            heap_b: MinHeap::with_capacity(4096),
+    fn new(n: usize) -> Self {
+        unsafe {
+            Self {
+                dist_f: alloc_anon_u64(n),
+                dist_b: alloc_anon_u64(n),
+                touched_f: Vec::with_capacity(4096),
+                touched_b: Vec::with_capacity(4096),
+                heap_f: MinHeap::with_capacity(4096),
+                heap_b: MinHeap::with_capacity(4096),
+            }
         }
     }
 
@@ -264,7 +216,6 @@ impl WorkerContext {
             return 0;
         }
 
-        // Quick degree check
         let s_idx = s as usize;
         let t_idx = t as usize;
         if graph.fwd_offsets[s_idx] == graph.fwd_offsets[s_idx + 1] {
@@ -274,36 +225,35 @@ impl WorkerContext {
             return -1;
         }
 
-        self.dist_f.clear();
-        self.dist_b.clear();
         self.heap_f.clear();
         self.heap_b.clear();
 
-        self.dist_f.insert_or_update(s, 0);
-        self.heap_f.push(0, s);
+        unsafe {
+            *self.dist_f.add(s_idx) = 1;
+            self.touched_f.push(s);
+            self.heap_f.push(0, s);
 
-        self.dist_b.insert_or_update(t, 0);
-        self.heap_b.push(0, t);
+            *self.dist_b.add(t_idx) = 1;
+            self.touched_b.push(t);
+            self.heap_b.push(0, t);
+        }
 
         let mut best_dist = u64::MAX;
 
         while !self.heap_f.is_empty() && !self.heap_b.is_empty() {
-            // Strip stale entries
             while let Some(top) = self.heap_f.peek() {
-                if let Some(cur_d) = self.dist_f.get(top.1) {
-                    if top.0 > cur_d {
-                        self.heap_f.pop();
-                        continue;
-                    }
+                let cur = unsafe { *self.dist_f.add(top.1 as usize) };
+                if cur != 0 && top.0 > cur - 1 {
+                    self.heap_f.pop();
+                    continue;
                 }
                 break;
             }
             while let Some(top) = self.heap_b.peek() {
-                if let Some(cur_d) = self.dist_b.get(top.1) {
-                    if top.0 > cur_d {
-                        self.heap_b.pop();
-                        continue;
-                    }
+                let cur = unsafe { *self.dist_b.add(top.1 as usize) };
+                if cur != 0 && top.0 > cur - 1 {
+                    self.heap_b.pop();
+                    continue;
                 }
                 break;
             }
@@ -324,8 +274,9 @@ impl WorkerContext {
                     continue;
                 }
                 let u_idx = u as usize;
-                if let Some(d_b) = self.dist_b.get(u) {
-                    let cand = d_u.saturating_add(d_b);
+                let cur_b = unsafe { *self.dist_b.add(u_idx) };
+                if cur_b != 0 {
+                    let cand = d_u.saturating_add(cur_b - 1);
                     if cand < best_dist {
                         best_dist = cand;
                     }
@@ -336,16 +287,25 @@ impl WorkerContext {
                 for i in start..end {
                     let edge = unsafe { *graph.fwd_edges.get_unchecked(i) };
                     let v = edge.target;
+                    let v_idx = v as usize;
                     let nd = d_u + edge.weight as u64;
 
-                    if let Some(d_b) = self.dist_b.get(v) {
-                        let cand = nd.saturating_add(d_b);
+                    let cur_b = unsafe { *self.dist_b.add(v_idx) };
+                    if cur_b != 0 {
+                        let cand = nd.saturating_add(cur_b - 1);
                         if cand < best_dist {
                             best_dist = cand;
                         }
                     }
 
-                    if self.dist_f.insert_or_update(v, nd) {
+                    let cur_f = unsafe { *self.dist_f.add(v_idx) };
+                    if cur_f == 0 || nd < cur_f - 1 {
+                        if cur_f == 0 {
+                            self.touched_f.push(v);
+                        }
+                        unsafe {
+                            *self.dist_f.add(v_idx) = nd + 1;
+                        }
                         self.heap_f.push(nd, v);
                     }
                 }
@@ -355,8 +315,9 @@ impl WorkerContext {
                     continue;
                 }
                 let v_idx = v as usize;
-                if let Some(d_f) = self.dist_f.get(v) {
-                    let cand = d_v.saturating_add(d_f);
+                let cur_f = unsafe { *self.dist_f.add(v_idx) };
+                if cur_f != 0 {
+                    let cand = d_v.saturating_add(cur_f - 1);
                     if cand < best_dist {
                         best_dist = cand;
                     }
@@ -367,21 +328,45 @@ impl WorkerContext {
                 for i in start..end {
                     let edge = unsafe { *graph.bwd_edges.get_unchecked(i) };
                     let u = edge.target;
+                    let u_idx = u as usize;
                     let nd = d_v + edge.weight as u64;
 
-                    if let Some(d_f) = self.dist_f.get(u) {
-                        let cand = nd.saturating_add(d_f);
+                    let cur_f = unsafe { *self.dist_f.add(u_idx) };
+                    if cur_f != 0 {
+                        let cand = nd.saturating_add(cur_f - 1);
                         if cand < best_dist {
                             best_dist = cand;
                         }
                     }
 
-                    if self.dist_b.insert_or_update(u, nd) {
+                    let cur_b = unsafe { *self.dist_b.add(u_idx) };
+                    if cur_b == 0 || nd < cur_b - 1 {
+                        if cur_b == 0 {
+                            self.touched_b.push(u);
+                        }
+                        unsafe {
+                            *self.dist_b.add(u_idx) = nd + 1;
+                        }
                         self.heap_b.push(nd, u);
                     }
                 }
             }
         }
+
+        // Clean up only touched nodes
+        for &u in &self.touched_f {
+            unsafe {
+                *self.dist_f.add(u as usize) = 0;
+            }
+        }
+        self.touched_f.clear();
+
+        for &v in &self.touched_b {
+            unsafe {
+                *self.dist_b.add(v as usize) = 0;
+            }
+        }
+        self.touched_b.clear();
 
         if best_dist == u64::MAX {
             -1
