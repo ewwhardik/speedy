@@ -72,6 +72,33 @@ impl TermMap {
     }
 
     #[inline(always)]
+    fn get_with_hash(&self, raw_slice: &[u8], h: u64) -> Option<u32> {
+        let mut idx = (h as usize) & self.mask;
+        loop {
+            let (entry_h, id) = self.slots[idx];
+            if id == u32::MAX {
+                return None;
+            }
+            if entry_h == h {
+                let key = &self.keys[id as usize];
+                if key.len() == raw_slice.len() {
+                    let mut matches = true;
+                    for i in 0..key.len() {
+                        if key[i] != to_lower_ascii(raw_slice[i]) {
+                            matches = false;
+                            break;
+                        }
+                    }
+                    if matches {
+                        return Some(id);
+                    }
+                }
+            }
+            idx = (idx + 1) & self.mask;
+        }
+    }
+
+    #[inline(always)]
     fn get(&self, key: &[u8]) -> Option<u32> {
         let h = Self::hash(key);
         let mut idx = (h as usize) & self.mask;
@@ -239,7 +266,7 @@ fn map_file(path: &std::path::Path) -> Result<MmapBuf, std::io::Error> {
             in("rdi") 0usize,
             in("rsi") len,
             in("rdx") 1usize,
-            in("r10") 2usize,
+            in("r10") 1usize, // MAP_SHARED
             in("r8") fd as usize,
             in("r9") 0usize,
             lateout("rax") addr,
@@ -405,7 +432,6 @@ fn main() {
                 let mut records = Vec::with_capacity(ranges.len() * 20);
                 let mut counts = vec![0u32; num_query_terms];
                 let mut seen_stamp = vec![0u32; num_query_terms];
-                let mut token_buf = [0u8; 32];
 
                 for (idx, &(t_start, t_end)) in ranges.iter().enumerate() {
                     let doc_id = (d_start + idx) as u32;
@@ -419,22 +445,23 @@ fn main() {
                         while pos < slen && !is_token_byte(slice[pos]) {
                             pos += 1;
                         }
-                        let mut tok_len = 0;
+                        if pos >= slen {
+                            break;
+                        }
+                        let start_tok = pos;
+                        let mut h: u64 = 0xcbf29ce484222325;
                         while pos < slen && is_token_byte(slice[pos]) {
-                            if tok_len < 32 {
-                                token_buf[tok_len] = to_lower_ascii(slice[pos]);
-                                tok_len += 1;
-                            }
+                            let b = to_lower_ascii(slice[pos]);
+                            h = (h ^ (b as u64)).wrapping_mul(0x100000001b3);
                             pos += 1;
                         }
-                        if tok_len > 0 {
-                            if let Some(tid) = tm.get(&token_buf[..tok_len]) {
-                                let tid_idx = tid as usize;
-                                if seen_stamp[tid_idx] != current_stamp {
-                                    seen_stamp[tid_idx] = current_stamp;
-                                    records.push((tid, doc_id));
-                                    counts[tid_idx] += 1;
-                                }
+                        let tok_slice = &slice[start_tok..pos];
+                        if let Some(tid) = tm.get_with_hash(tok_slice, h) {
+                            let tid_idx = tid as usize;
+                            if seen_stamp[tid_idx] != current_stamp {
+                                seen_stamp[tid_idx] = current_stamp;
+                                records.push((tid, doc_id));
+                                counts[tid_idx] += 1;
                             }
                         }
                     }

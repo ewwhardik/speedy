@@ -258,7 +258,7 @@ fn map_file(path: &Path) -> Result<MmapBuf, std::io::Error> {
             in("rdi") 0usize, // addr = NULL
             in("rsi") len,
             in("rdx") 1usize, // PROT_READ
-            in("r10") 2usize, // MAP_PRIVATE
+            in("r10") 1usize, // MAP_SHARED
             in("r8") fd as usize,
             in("r9") 0usize,
             lateout("rax") addr,
