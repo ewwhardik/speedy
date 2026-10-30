@@ -1,13 +1,5 @@
 // Speed Demon 2026, Track D (Traverse): exact shortest-path distances for each
-// query in a directed graph with non-negative uint32 weights. See
-// specs/d-traverse.md.
-//
-// The graph is read by all threads in two passes into a CSR (out-degrees, then
-// edges at atomically advanced cursors); self-loops are dropped, since they never
-// shorten a path. Queries run in parallel, each a Dijkstra search from s that
-// stops when t is settled. A query whose target has no in-edges, or whose source
-// has no out-edges, is answered -1 without searching. Distances are kept in 32
-// bits; a search that would reach 2^32 - 1 is redone with 64-bit distances.
+// query in a directed graph with non-negative uint32 weights. See specs/d-traverse.md.
 #define _GNU_SOURCE
 #include <fcntl.h>
 #include <pthread.h>
@@ -16,42 +8,55 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/mman.h>
 #include <sys/stat.h>
 #include <unistd.h>
-#include <malloc.h>
 
 #define BUFSZ (1 << 16)
 #define INF32 UINT32_MAX
+#define ESC 0xFFFF
+#define RING 4096
 
 typedef struct {
   uint32_t v, w;
 } Edge;
 typedef struct {
+  uint32_t e, v, w;
+} Esc;
+typedef struct {
   uint64_t d;
   uint32_t u;
 } Item;
+typedef struct {
+  uint32_t *v, n, cap;
+} Bucket;
 typedef struct {
   long beg, end;
   char *buf;
   uint32_t *d32, *touched;
   uint64_t *d64;
   Item *heap;
-  size_t hcap, tcap;
+  Esc *esc;
+  size_t hcap, tcap, nesc, esccap;
+  Bucket ring[RING];
 } Th;
 
 static int fd, nth, pass, next_q;
 static Th *th;
 static uint32_t n, nq, *off, *cur, *qs, *qt;
-static uint8_t *has_in;
+static uint8_t *has_in, *has_in2;
 static Edge *edges;
+static uint32_t *pk;
+static Esc *esc;
+static size_t nesc;
 static int64_t *ans;
+static uint32_t *order, *perm, *off2;
 
 static void die(const char *m) {
   fprintf(stderr, "%s\n", m);
   exit(1);
 }
 
-// Pass 1 counts each tail's out-edges; pass 2 stores the edges.
 static void edge_lines(const char *p, const char *lim) {
   while (p < lim) {
     uint32_t u = 0, v = 0;
@@ -64,7 +69,7 @@ static void edge_lines(const char *p, const char *lim) {
       w = w * 10 + (*p - '0');
     p++;
     if (u == v || u >= n || v >= n)
-      continue; // a self-loop never shortens a path
+      continue;
     if (pass == 1) {
       __atomic_fetch_add(&off[u + 1], 1, __ATOMIC_RELAXED);
       __atomic_store_n(&has_in[v], 1, __ATOMIC_RELAXED);
@@ -94,86 +99,139 @@ static void *scan(void *arg) {
   return NULL;
 }
 
-static inline void push(Th *t, size_t *hn, uint64_t d, uint32_t u) {
+static void push(Th *t, size_t *hn, uint64_t d, uint32_t u) {
   if (*hn == t->hcap) {
     t->hcap *= 2;
     t->heap = realloc(t->heap, t->hcap * sizeof(Item));
   }
   size_t i = (*hn)++;
-  while (i) {
-    size_t p = (i - 1) >> 2;
-    if (t->heap[p].d <= d)
-      break;
-    t->heap[i] = t->heap[p];
-    i = p;
-  }
+  for (; i && t->heap[(i - 1) / 2].d > d; i = (i - 1) / 2)
+    t->heap[i] = t->heap[(i - 1) / 2];
   t->heap[i] = (Item){d, u};
 }
 
-static inline Item pop(Th *t, size_t *hn) {
-  Item top = t->heap[0];
-  size_t n = --*hn;
-  if (!n)
-    return top;
-  Item last = t->heap[n];
+static Item pop(Th *t, size_t *hn) {
+  Item top = t->heap[0], last = t->heap[--*hn];
   size_t i = 0;
-  while (1) {
-    size_t c = (i << 2) + 1;
-    if (c >= n)
+  for (size_t c; (c = 2 * i + 1) < *hn; i = c) {
+    if (c + 1 < *hn && t->heap[c + 1].d < t->heap[c].d)
+      c++;
+    if (t->heap[c].d >= last.d)
       break;
-    size_t min_c = c;
-    uint64_t min_d = t->heap[c].d;
-    if (c + 1 < n && t->heap[c + 1].d < min_d) { min_c = c + 1; min_d = t->heap[c + 1].d; }
-    if (c + 2 < n && t->heap[c + 2].d < min_d) { min_c = c + 2; min_d = t->heap[c + 2].d; }
-    if (c + 3 < n && t->heap[c + 3].d < min_d) { min_c = c + 3; min_d = t->heap[c + 3].d; }
-    if (last.d <= min_d)
-      break;
-    t->heap[i] = t->heap[min_c];
-    i = min_c;
+    t->heap[i] = t->heap[c];
   }
-  t->heap[i] = last;
+  if (*hn)
+    t->heap[i] = last;
   return top;
 }
 
-// Dijkstra from s until t is settled: the distance, -1 when t is unreachable, or
-// -2 when 32-bit distances would overflow (wide = 0 only).
-static int64_t search(Th *t, uint32_t s, uint32_t tg, int wide) {
-  size_t hn = 0, nt = 0;
+static inline void edge_at(uint32_t u, uint32_t e, uint32_t *v, uint32_t *w) {
+  uint32_t x = pk[e];
+  if ((x & 0xFFFF) != ESC) {
+    *v = u + (int16_t)(x >> 16);
+    *w = x & 0xFFFF;
+    return;
+  }
+  if (!nesc) { *v = 0; *w = 0; return; }
+  size_t lo = 0, hi = nesc - 1;
+  while (lo <= hi) {
+    size_t mid = lo + (hi - lo) / 2;
+    if (esc[mid].e == e) {
+      *v = esc[mid].v;
+      *w = esc[mid].w;
+      return;
+    }
+    if (esc[mid].e < e) {
+      lo = mid + 1;
+    } else {
+      if (mid == 0) break;
+      hi = mid - 1;
+    }
+  }
+  *v = 0; *w = 0;
+}
+
+static void *dist_array(size_t bytes) {
+  void *a = mmap(NULL, bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
+  if (a == MAP_FAILED)
+    die("out of memory");
+  return a;
+}
+
+static int64_t search(Th *t, uint32_t s, uint32_t tg) {
+  size_t hn = 0;
   int64_t res = -1;
-#define DIST(x) (wide ? t->d64[x] : t->d32[x])
-#define SET(x, val) (wide ? (void)(t->d64[x] = (val)) : (void)(t->d32[x] = (uint32_t)(val)))
-  SET(s, 0);
-  t->touched[nt++] = s;
+  if (!t->d64)
+    t->d64 = dist_array(n * 8ull);
+  t->d64[s] = ~0ull;
   push(t, &hn, 0, s);
   while (hn) {
     Item it = pop(t, &hn);
-    if (it.d > DIST(it.u))
-      continue; // stale: u was settled at a shorter distance
+    if (it.d > ~t->d64[it.u])
+      continue;
     if (it.u == tg) {
       res = it.d;
       break;
     }
     for (uint32_t e = off[it.u]; e < off[it.u + 1]; e++) {
-      uint32_t v = edges[e].v;
-      uint64_t nd = it.d + edges[e].w, dv = DIST(v);
-      if (!wide && nd >= INF32) {
-        res = -2;
-        hn = 0;
-        break;
-      }
-      if (nd < dv) {
-        if (dv == (wide ? UINT64_MAX : INF32)) {
-          if (nt == t->tcap)
-            t->touched = realloc(t->touched, (t->tcap *= 2) * 4);
-          t->touched[nt++] = v;
-        }
-        SET(v, nd);
+      uint32_t v, w;
+      edge_at(it.u, e, &v, &w);
+      uint64_t nd = it.d + w;
+      if (nd < ~t->d64[v]) {
+        t->d64[v] = ~nd;
         push(t, &hn, nd, v);
       }
     }
   }
-  for (size_t i = 0; i < nt; i++) // reset only what this search touched
-    SET(t->touched[i], wide ? UINT64_MAX : INF32);
+  madvise(t->d64, n * 8ull, MADV_DONTNEED);
+  return res;
+}
+
+static inline void bpush(Bucket *b, uint32_t v) {
+  if (b->n == b->cap)
+    b->v = realloc(b->v, (b->cap = b->cap ? b->cap * 2 : 64) * 4ull);
+  b->v[b->n++] = v;
+}
+
+static int64_t dial(Th *t, uint32_t s, uint32_t tg) {
+  size_t live = 1, nt = 0;
+  int64_t res = -1;
+  t->d32[s] = 0;
+  t->touched[nt++] = s;
+  bpush(&t->ring[0], s);
+  for (uint32_t d = 0; live && res == -1; d++) {
+    Bucket *b = &t->ring[d & (RING - 1)];
+    for (uint32_t k = 0; k < b->n && res == -1; k++) {
+      uint32_t u = b->v[k];
+      live--;
+      if (t->d32[u] != d)
+        continue;
+      if (u == tg)
+        res = d;
+      for (uint32_t e = off[u]; e < off[u + 1] && res == -1; e++) {
+        uint32_t v, w;
+        edge_at(u, e, &v, &w);
+        uint64_t nd = (uint64_t)d + w;
+        if (w >= RING || nd >= INF32)
+          res = -2;
+        else if (nd < t->d32[v]) {
+          if (t->d32[v] == INF32) {
+            if (nt == t->tcap)
+              t->touched = realloc(t->touched, (t->tcap *= 2) * 4);
+            t->touched[nt++] = v;
+          }
+          t->d32[v] = nd;
+          bpush(&t->ring[nd & (RING - 1)], v);
+          live++;
+        }
+      }
+    }
+    b->n = 0;
+  }
+  for (int i = 0; i < RING; i++)
+    t->ring[i].n = 0;
+  for (size_t i = 0; i < nt; i++)
+    t->d32[t->touched[i]] = INF32;
   return res;
 }
 
@@ -190,45 +248,73 @@ static void *answer(void *arg) {
     if (s == tg)
       ans[q] = 0;
     else if (!has_in[tg] || off[s] == off[s + 1])
-      ans[q] = -1; // nothing enters t, or nothing leaves s
-    else if ((ans[q] = search(t, s, tg, 0)) == -2) {
-      if (!t->d64) {
-        t->d64 = malloc(n * 8ull);
-        memset(t->d64, 0xff, n * 8ull);
-      }
-      ans[q] = search(t, s, tg, 1);
-    }
+      ans[q] = -1;
+    else if ((ans[q] = dial(t, s, tg)) == -2)
+      ans[q] = search(t, s, tg);
   }
   return NULL;
 }
 
-static void run_threads(void *(*f)(void *), int count) {
+static void share(Th *t, uint32_t *lo, uint32_t *hi) {
+  *lo = (uint64_t)n * (t - th) / nth;
+  *hi = (uint64_t)n * (t - th + 1) / nth;
+}
+
+static void *degrees(void *arg) {
+  uint32_t lo, hi;
+  share(arg, &lo, &hi);
+  for (uint32_t i = lo; i < hi; i++)
+    off2[i + 1] = off[order[i] + 1] - off[order[i]];
+  return NULL;
+}
+
+static void *remap(void *arg) {
+  Th *t = arg;
+  uint32_t lo, hi;
+  share(t, &lo, &hi);
+  for (uint32_t i = lo; i < hi; i++) {
+    uint32_t u = order[i], k = off2[i];
+    for (uint32_t e = off[u]; e < off[u + 1]; e++, k++) {
+      uint32_t v = perm[edges[e].v], w = edges[e].w;
+      int64_t dv = (int64_t)v - i;
+      if (dv >= INT16_MIN && dv <= INT16_MAX && w < ESC) {
+        pk[k] = (uint32_t)(uint16_t)dv << 16 | w;
+        continue;
+      }
+      if (t->nesc == t->esccap)
+        t->esc = realloc(t->esc, (t->esccap = t->esccap ? 2 * t->esccap : 256) * sizeof(Esc));
+      t->esc[t->nesc++] = (Esc){k, v, w};
+      pk[k] = ESC;
+    }
+    has_in2[i] = has_in[u];
+  }
+  return NULL;
+}
+
+static void run_threads(void *(*f)(void *)) {
   pthread_t id[64];
-  pthread_attr_t attr;
-  pthread_attr_init(&attr);
-  pthread_attr_setstacksize(&attr, 64 * 1024);
-  for (int i = 0; i < count; i++)
-    if (pthread_create(&id[i], &attr, f, &th[i]))
+  for (int i = 0; i < nth; i++)
+    if (pthread_create(&id[i], NULL, f, &th[i]))
       die("pthread_create failed");
-  pthread_attr_destroy(&attr);
-  for (int i = 0; i < count; i++)
+  for (int i = 0; i < nth; i++)
     pthread_join(id[i], NULL);
 }
 
 int main(void) {
-  mallopt(M_ARENA_MAX, 1);
-  // queries.txt: "s t" per line.
   FILE *qf = fopen("/data/queries.txt", "r");
   if (!qf)
     die("cannot open /data/queries.txt");
   size_t qcap = 1024;
-  qs = malloc(qcap * 4), qt = malloc(qcap * 4);
+  qs = malloc(qcap * 4);
+  qt = malloc(qcap * 4);
   for (uint32_t s, t; fscanf(qf, "%u %u", &s, &t) == 2; nq++) {
     if (nq == qcap) {
       qcap *= 2;
-      qs = realloc(qs, qcap * 4), qt = realloc(qt, qcap * 4);
+      qs = realloc(qs, qcap * 4);
+      qt = realloc(qt, qcap * 4);
     }
-    qs[nq] = s, qt[nq] = t;
+    qs[nq] = s;
+    qt[nq] = t;
   }
   fclose(qf);
 
@@ -253,7 +339,7 @@ int main(void) {
   off = calloc(n + 2, 4);
   has_in = calloc(n + 1, 1);
 
-  cpu_set_t cpus; // the CPUs this container may use, not the host's count
+  cpu_set_t cpus;
   nth = sched_getaffinity(0, sizeof cpus, &cpus) ? 1 : CPU_COUNT(&cpus);
   nth = nth < 1 ? 1 : nth > 64 ? 64 : nth;
   th = calloc(nth, sizeof(Th));
@@ -262,7 +348,7 @@ int main(void) {
     long b = body + (size - body) * i / nth;
     char c[64];
     ssize_t k = pread(fd, c, sizeof c, b - 1);
-    char *nl = k > 0 ? memchr(c, '\n', k) : NULL; // lines are at most 33 bytes
+    char *nl = k > 0 ? memchr(c, '\n', k) : NULL;
     b = nl ? b + (nl - c) : size;
     th[i].beg = b < th[i - 1].beg ? th[i - 1].beg : b;
     th[i - 1].end = th[i].beg;
@@ -271,54 +357,70 @@ int main(void) {
   for (int i = 0; i < nth; i++)
     th[i].buf = malloc(BUFSZ);
   pass = 1;
-  run_threads(scan, nth);
+  run_threads(scan);
   for (uint32_t u = 0; u < n; u++)
     off[u + 1] += off[u];
   edges = malloc((off[n] + 1ull) * sizeof(Edge));
   cur = malloc((n + 1) * 4ull);
   memcpy(cur, off, (n + 1) * 4ull);
   pass = 2;
-  run_threads(scan, nth);
+  run_threads(scan);
   free(cur);
-  close(fd);
   for (int i = 0; i < nth; i++)
     free(th[i].buf);
 
-  // Renumber the nodes in breadth-first order, so that nodes near each other in
-  // the network are near each other in memory (the input ids are shuffled).
-  uint32_t *order = malloc(n * 4ull), *perm = malloc(n * 4ull), tail = 0;
+  order = malloc(n * 4ull);
+  perm = malloc(n * 4ull);
+  uint32_t tail = 0;
   memset(perm, 0xff, n * 4ull);
   for (uint32_t r = 0; r < n; r++) {
     if (perm[r] != INF32)
       continue;
-    perm[r] = tail, order[tail++] = r;
-    for (uint32_t h = tail - 1; h < tail; h++)
+    perm[r] = tail;
+    order[tail++] = r;
+    for (uint32_t h = tail - 1; h < tail; h++) {
+      if (h + 16 < tail)
+        __builtin_prefetch(&off[order[h + 16]]);
+      if (h + 8 < tail)
+        __builtin_prefetch(&edges[off[order[h + 8]]]);
+      for (uint32_t e = h + 4 < tail ? off[order[h + 4]] : 0; h + 4 < tail && e < off[order[h + 4] + 1]; e++)
+        __builtin_prefetch(&perm[edges[e].v]);
       for (uint32_t e = off[order[h]]; e < off[order[h] + 1]; e++)
-        if (perm[edges[e].v] == INF32)
-          perm[edges[e].v] = tail, order[tail++] = edges[e].v;
+        if (perm[edges[e].v] == INF32) {
+          perm[edges[e].v] = tail;
+          order[tail++] = edges[e].v;
+        }
+    }
   }
-  uint32_t *off2 = malloc((n + 2) * 4ull);
-  Edge *edges2 = malloc((off[n] + 1ull) * sizeof(Edge));
+
+  off2 = malloc((n + 2) * 4ull);
+  pk = malloc((off[n] + 1ull) * 4);
+  has_in2 = malloc(n + 1ull);
   off2[0] = 0;
-  for (uint32_t i = 0; i < n; i++) {
-    uint32_t u = order[i], k = off2[i];
-    for (uint32_t e = off[u]; e < off[u + 1]; e++)
-      edges2[k++] = (Edge){perm[edges[e].v], edges[e].w};
-    off2[i + 1] = k;
-  }
-  uint8_t *has_in2 = calloc(n + 1, 1);
+  run_threads(degrees);
   for (uint32_t i = 0; i < n; i++)
-    has_in2[i] = has_in[order[i]];
-  free(edges), free(off), free(has_in), free(order);
-  edges = edges2, off = off2, has_in = has_in2;
-  for (uint32_t i = 0; i < nq; i++)
-    qs[i] = perm[qs[i]], qt[i] = perm[qt[i]];
+    off2[i + 1] += off2[i];
+  run_threads(remap);
+  free(edges);
+  free(off);
+  free(has_in);
+  free(order);
+  off = off2;
+  has_in = has_in2;
+  for (int i = 0; i < nth; i++)
+    nesc += th[i].nesc;
+  esc = malloc((nesc + 1) * sizeof(Esc));
+  for (int i = 0, k = 0; i < nth; k += th[i].nesc, i++)
+    if (th[i].nesc)
+      memcpy(esc + k, th[i].esc, th[i].nesc * sizeof(Esc));
+  for (uint32_t i = 0; i < nq; i++) {
+    qs[i] = perm[qs[i]];
+    qt[i] = perm[qt[i]];
+  }
   free(perm);
-  malloc_trim(0);
 
   ans = malloc((nq + 1) * sizeof *ans);
-  int q_threads = nth > 6 ? 6 : nth;
-  run_threads(answer, q_threads);
+  run_threads(answer);
   FILE *out = fopen("/out/distances.txt", "w");
   if (!out)
     die("cannot create /out/distances.txt");

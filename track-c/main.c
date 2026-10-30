@@ -203,14 +203,18 @@ static void *parse(void *arg) {
   for (int g = 0; g < ngroups; g++)
     t->agg[g] = (Agg){0, 0, 0, 0, 0, INT64_MAX, INT64_MIN};
   size_t have = 0;
+  long last_evict = t->beg;
   for (long off = t->beg;;) {
     long want = t->end - off < (long)(BUFSZ - have) ? t->end - off : (long)(BUFSZ - have);
     if (want > 0) {
       ssize_t n = pread(fd, t->buf + have, want, off);
       if (n <= 0) die("read failed");
-      posix_fadvise(fd, off, n, POSIX_FADV_DONTNEED);
       off += n;
       have += n;
+      if (off - last_evict >= (1 << 20)) {
+        posix_fadvise(fd, last_evict, off - last_evict - (1 << 18), POSIX_FADV_DONTNEED);
+        last_evict = off - (1 << 18);
+      }
     }
     int eof = off >= t->end;
     const char *p = t->buf, *end = t->buf + have, *q;
@@ -218,7 +222,10 @@ static void *parse(void *arg) {
     if (p < end && (eof || (p == t->buf && have == BUFSZ))) die("malformed records.csv");
     have = end - p;
     memmove(t->buf, p, have);
-    if (eof) return NULL;
+    if (eof) {
+      posix_fadvise(fd, t->beg, t->end - t->beg, POSIX_FADV_DONTNEED);
+      return NULL;
+    }
   }
 }
 
@@ -276,6 +283,7 @@ int main(void) {
 
   fd = open("/data/records.csv", O_RDONLY);
   if (fd < 0 || fstat(fd, &st)) die("cannot open /data/records.csv");
+  posix_fadvise(fd, 0, 0, POSIX_FADV_SEQUENTIAL);
   long size = st.st_size, body = 0;
   {
     char c[64];
@@ -305,7 +313,7 @@ int main(void) {
   for (int i = 0; i < nth; i++) {
     th[i].end = i + 1 < nth ? th[i + 1].beg : size;
     th[i].buf = malloc(BUFSZ + 64);
-    th[i].tmp = malloc(BUFSZ + 64);
+    th[i].tmp = malloc(4096);
   }
 
   if (size > UINT32_MAX) die("records.csv over 4 GB");
