@@ -125,7 +125,6 @@ struct Worker {
 
 int main() {
     prctl(PR_SET_THP_DISABLE, 1, 0, 0, 0);
-    mallopt(M_MMAP_THRESHOLD, 1 << 16);
     const int nthreads = 12;
     int fd = open("/data/requests.log", O_RDONLY);
     FILE* out = fopen("/out/summary.txt", "wb");
@@ -170,7 +169,16 @@ int main() {
 
     std::vector<std::string> text(HOURS);
     for (int h = 0; h < HOURS; ++h) text[h].reserve(131072);
+    std::vector<std::atomic<bool>> done(HOURS);
     std::atomic<int> next_hour{0};
+
+    std::thread writer([&] {
+        for (int h = 0; h < HOURS; ++h) {
+            done[h].wait(false);
+            fwrite(text[h].data(), 1, text[h].size(), out);
+            std::string().swap(text[h]);
+        }
+    });
 
     std::vector<std::thread> pool;
     for (int t = 0; t < nthreads; ++t) {
@@ -231,13 +239,13 @@ int main() {
                     *o++ = '\n';
                     text[h].append(line, o);
                 }
+                done[h] = true;
+                done[h].notify_one();
             }
         });
     }
     for (auto& th : pool) th.join();
-
-    for (int h = 0; h < HOURS; ++h)
-        fwrite(text[h].data(), 1, text[h].size(), out);
+    writer.join();
     fclose(out);
     _exit(0);
 }

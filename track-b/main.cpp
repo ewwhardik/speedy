@@ -251,7 +251,7 @@ struct Index {
 
 class BlockList {
 public:
-    static constexpr size_t BLOCK = 2048;          // entries per block
+    static constexpr size_t BLOCK = 8192;          // entries per block
     static constexpr size_t BYTES = 3 * BLOCK + 1;    // a 4-byte store at the last entry spills one byte
     ~BlockList() { for (uint8_t* b : blocks_) munmap(b, BYTES); }
 
@@ -683,8 +683,7 @@ private:
 
 int main() {
     prctl(PR_SET_THP_DISABLE, 1, 0, 0, 0);
-    mallopt(M_MMAP_THRESHOLD, 1 << 16);
-    const int nthreads = 12;
+        const int nthreads = 12;
     File qf = map_file("/data/queries.txt");
     File df = map_file("/data/docs.txt");
 
