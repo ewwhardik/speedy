@@ -251,37 +251,70 @@ struct Index {
 
 class BlockList {
 public:
-    static constexpr size_t BLOCK = 8192;          // entries per block
-    static constexpr size_t BYTES = 3 * BLOCK + 1;    // a 4-byte store at the last entry spills one byte
-    ~BlockList() { for (uint8_t* b : blocks_) munmap(b, BYTES); }
+    struct Block {
+        Block* next;
+        size_t cap;
+        size_t n;
+        uint8_t data[];
+    };
+
+    BlockList() = default;
+    BlockList(const BlockList&) = delete;
+    BlockList& operator=(const BlockList&) = delete;
+    BlockList(BlockList&& o) noexcept : head_(o.head_), tail_(o.tail_), cur_(o.cur_) {
+        o.head_ = o.tail_ = o.cur_ = nullptr;
+    }
+    BlockList& operator=(BlockList&& o) noexcept {
+        if (this != &o) {
+            this->~BlockList();
+            head_ = o.head_; tail_ = o.tail_; cur_ = o.cur_;
+            o.head_ = o.tail_ = o.cur_ = nullptr;
+        }
+        return *this;
+    }
+    ~BlockList() {
+        for (Block* b = head_; b;) {
+            Block* next = b->next;
+            munmap(b, sizeof(Block) + 3 * b->cap + 1);
+            b = next;
+        }
+    }
 
     void push(u32 x) {
-        if (fill_ == BLOCK) {
-            cur_ = static_cast<uint8_t*>(mmap(nullptr, BYTES, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0));
-            blocks_.push_back(cur_);
-            fill_ = 0;
+        if (!cur_ || cur_->n == cur_->cap) {
+            size_t next_cap = cur_ ? std::min<size_t>(cur_->cap * 4, 16384) : 512;
+            size_t bytes = sizeof(Block) + 3 * next_cap + 1;
+            auto* b = static_cast<Block*>(mmap(nullptr, bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0));
+            b->next = nullptr;
+            b->cap = next_cap;
+            b->n = 0;
+            if (!head_) head_ = b;
+            else tail_->next = b;
+            tail_ = b;
+            cur_ = b;
         }
-        memcpy(cur_ + 3 * fill_++, &x, 4);
+        memcpy(cur_->data + 3 * cur_->n++, &x, 4);
     }
 
     template <class F>
     void drain(F&& f) {
-        for (size_t b = 0; b < blocks_.size(); ++b) {
-            size_t n = b + 1 == blocks_.size() ? fill_ : BLOCK;
-            for (size_t i = 0; i < n; ++i) {
+        for (Block* b = head_; b;) {
+            for (size_t i = 0; i < b->n; ++i) {
                 u32 x;
-                memcpy(&x, blocks_[b] + 3 * i, 4);
+                memcpy(&x, b->data + 3 * i, 4);
                 f(x & 0xFFFFFF);
             }
-            munmap(blocks_[b], BYTES);
+            Block* next = b->next;
+            munmap(b, sizeof(Block) + 3 * b->cap + 1);
+            b = next;
         }
-        blocks_.clear();
+        head_ = tail_ = cur_ = nullptr;
     }
 
 private:
-    std::vector<uint8_t*> blocks_;
-    uint8_t* cur_ = nullptr;
-    size_t fill_ = BLOCK;
+    Block* head_ = nullptr;
+    Block* tail_ = nullptr;
+    Block* cur_ = nullptr;
 };
 
 constexpr u32 BUCKET_BITS = 9, DOC_BITS = 15;
