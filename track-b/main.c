@@ -20,13 +20,13 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/mman.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
-#define BUFSZ (1 << 18) // read buffer per thread; a line is at most a few tens of KB
+#define BUFSZ (1 << 18) // line token buffer slack
 #define OUTSZ (1 << 16)
 #define MAXT 8         // terms per query
-#define DOC (1u << 31) // stream marker: the following terms belong to this doc
 #define NONE UINT32_MAX
 
 typedef struct {
@@ -52,11 +52,9 @@ typedef struct {
 } Tc;
 typedef struct {
   long beg, end;
-  char *buf, *text;
   Tc *tc;
-  uint32_t *stream, *la, *lb, *tokids, first, wlo, whi; // first doc id; its, the last's word
+  uint32_t *la, *lb, *tokids, first, wlo, whi; // first doc id; its, the last's word
   uint64_t *bits;
-  size_t sn, scap;
 } Th;
 typedef struct {
   const uint32_t *l; // sorted ids l[0..n) when b is NULL
@@ -72,7 +70,8 @@ static Result *res;
 static uint32_t nq, N, W, *df, *pstart, *post, *dlen, *hq, lcap, nheavy;
 static int32_t *head, *hnext; // shared-scan phrases by first term
 static uint64_t *doff, **bm, *hres;
-static int fd, nth, next_q, heavy_pass;
+static int fd, nth, next_q;
+static const char *docs_data;
 static Th *th;
 static pthread_mutex_t mu = PTHREAD_MUTEX_INITIALIZER;
 
@@ -196,51 +195,66 @@ static void set_bit(Th *t, uint64_t *b, uint32_t d) {
     b[w] |= 1ull << (d & 63);
 }
 
-static void push(Th *t, uint32_t v) {
-  if (t->sn == t->scap) {
-    t->scap = t->scap ? t->scap * 2 : 1 << 16;
-    t->stream = realloc(t->stream, t->scap * 4);
-  }
-  t->stream[t->sn++] = v;
-}
-
-static void promote(uint32_t id) {
-  pthread_mutex_lock(&mu);
-  if (!bm[id])
-    __atomic_store_n(&bm[id], calloc(W, 8), __ATOMIC_RELEASE);
-  pthread_mutex_unlock(&mu);
-}
-
-// Pass 1 over the lines of [p, lim), the first at file offset base.
-static void index_lines(Th *t, const char *p, const char *lim, uint64_t base) {
+// Pass 1: count term document frequencies and record doc offsets.
+static void count_lines(Th *t, const char *p, const char *lim) {
   while (p < lim) {
     uint32_t doc = 0;
     for (; *p != '\t'; p++)
       doc = doc * 10 + (*p - '0');
-    const uint8_t *s = (const uint8_t *)++p, *e = memchr(p, '\n', lim - p);
-    doff[doc] = base + (p - t->buf); // base is the file offset of t->buf[0]
-    dlen[doc] = e - s;
-    uint64_t seen = doc - t->first + 1;
-    int marked = 0;
-    for (uint32_t i = 0, n = tokenize(s, e, t->tokids); i < n; i++) {
+    const uint8_t *s = (const uint8_t *)++p;
+    const char *e = memchr(p, '\n', lim - p);
+    doff[doc] = p - docs_data;
+    dlen[doc] = (const uint8_t *)e - s;
+    uint32_t n;
+    if (doc == N - 1) {
+      char tmp[64 * 1024];
+      size_t len = (const uint8_t *)e - s;
+      memcpy(tmp, s, len);
+      memset(tmp + len, 0, 64);
+      n = tokenize((const uint8_t *)tmp, (const uint8_t *)tmp + len, t->tokids);
+    } else {
+      n = tokenize(s, (const uint8_t *)e, t->tokids);
+    }
+    for (uint32_t i = 0; i < n; i++) {
       uint32_t id = t->tokids[i];
       if (id == NONE || t->tc[id].stamp == doc + 1)
         continue;
       t->tc[id].stamp = doc + 1;
-      uint64_t *b = __atomic_load_n(&bm[id], __ATOMIC_ACQUIRE);
-      if (b) {
-        set_bit(t, b, doc);
-        continue;
-      }
-      if (++t->tc[id].cnt > 64 && t->tc[id].cnt * 32ull > seen)
-        promote(id); // frequent: from the next document on, set bits directly
-      if (!marked) {
-        push(t, DOC | doc);
-        marked = 1;
-      }
-      push(t, id);
+      t->tc[id].cnt++;
     }
-    p = (const char *)e + 1;
+    p = e + 1;
+  }
+}
+
+// Pass 2: populate bitmaps and contiguous posting array.
+static void fill_lines(Th *t, const char *p, const char *lim) {
+  while (p < lim) {
+    uint32_t doc = 0;
+    for (; *p != '\t'; p++)
+      doc = doc * 10 + (*p - '0');
+    const uint8_t *s = (const uint8_t *)++p;
+    const char *e = memchr(p, '\n', lim - p);
+    uint32_t n;
+    if (doc == N - 1) {
+      char tmp[64 * 1024];
+      size_t len = (const uint8_t *)e - s;
+      memcpy(tmp, s, len);
+      memset(tmp + len, 0, 64);
+      n = tokenize((const uint8_t *)tmp, (const uint8_t *)tmp + len, t->tokids);
+    } else {
+      n = tokenize(s, (const uint8_t *)e, t->tokids);
+    }
+    for (uint32_t i = 0; i < n; i++) {
+      uint32_t id = t->tokids[i];
+      if (id == NONE || t->tc[id].stamp == doc + 1)
+        continue;
+      t->tc[id].stamp = doc + 1;
+      if (bm[id])
+        set_bit(t, bm[id], doc);
+      else
+        post[t->tc[id].cnt++] = doc;
+    }
+    p = e + 1;
   }
 }
 
@@ -250,8 +264,19 @@ static void heavy_lines(Th *t, const char *p, const char *lim) {
     uint32_t doc = 0;
     for (; *p != '\t'; p++)
       doc = doc * 10 + (*p - '0');
-    const uint8_t *s = (const uint8_t *)++p, *e = memchr(p, '\n', lim - p);
-    for (uint32_t i = 0, n = tokenize(s, e, t->tokids); i < n; i++)
+    const uint8_t *s = (const uint8_t *)++p;
+    const char *e = memchr(p, '\n', lim - p);
+    uint32_t n;
+    if (doc == N - 1) {
+      char tmp[64 * 1024];
+      size_t len = (const uint8_t *)e - s;
+      memcpy(tmp, s, len);
+      memset(tmp + len, 0, 64);
+      n = tokenize((const uint8_t *)tmp, (const uint8_t *)tmp + len, t->tokids);
+    } else {
+      n = tokenize(s, (const uint8_t *)e, t->tokids);
+    }
+    for (uint32_t i = 0; i < n; i++)
       for (int32_t h = t->tokids[i] == NONE ? -1 : head[t->tokids[i]]; h >= 0; h = hnext[h]) {
         const Query *q = &qs[hq[h]];
         uint64_t *r = hres + (size_t)h * W;
@@ -263,50 +288,25 @@ static void heavy_lines(Th *t, const char *p, const char *lim) {
         if (k == q->n)
           set_bit(t, r, doc);
       }
-    p = (const char *)e + 1;
+    p = e + 1;
   }
 }
 
-static void *scan(void *arg) {
+static void *pass1_count(void *arg) {
   Th *t = arg;
-  size_t have = 0;
-  for (long off = t->beg; off < t->end;) {
-    long want = t->end - off;
-    if (want > (long)(BUFSZ - have))
-      want = BUFSZ - have;
-    ssize_t n = pread(fd, t->buf + have, want, off);
-    if (n <= 0)
-      die("read failed");
-    off += n;
-    have += n;
-    char *last = memrchr(t->buf, '\n', have);
-    if (!last)
-      continue;
-    if (heavy_pass)
-      heavy_lines(t, t->buf, last + 1);
-    else
-      index_lines(t, t->buf, last + 1, off - have);
-    have -= last + 1 - t->buf;
-    memmove(t->buf, last + 1, have);
-  }
+  count_lines(t, docs_data + t->beg, docs_data + t->end);
   return NULL;
 }
 
-// Scatter this thread's stream into the posting array (tc holds its cursors)
-// or, for a term promoted after some of its matches were streamed, its bitmap.
-static void *fill(void *arg) {
+static void *pass2_fill(void *arg) {
   Th *t = arg;
-  uint32_t doc = 0;
-  for (size_t i = 0; i < t->sn; i++) {
-    uint32_t v = t->stream[i];
-    if (v & DOC)
-      doc = v & ~DOC;
-    else if (bm[v])
-      set_bit(t, bm[v], doc);
-    else
-      post[t->tc[v].cnt++] = doc;
-  }
-  free(t->stream);
+  fill_lines(t, docs_data + t->beg, docs_data + t->end);
+  return NULL;
+}
+
+static void *pass_heavy(void *arg) {
+  Th *t = arg;
+  heavy_lines(t, docs_data + t->beg, docs_data + t->end);
   return NULL;
 }
 
@@ -431,10 +431,16 @@ static void summarize(Set r, Result *o) {
 
 // True when document d has the query's terms at consecutive positions.
 static int phrase_in(Th *t, const Query *q, uint32_t d) {
-  if (pread(fd, t->text, dlen[d], doff[d]) != (ssize_t)dlen[d])
-    die("read failed");
-  const uint8_t *s = (const uint8_t *)t->text;
-  uint32_t n = tokenize(s, s + dlen[d], t->tokids);
+  const uint8_t *s = (const uint8_t *)(docs_data + doff[d]);
+  uint32_t n;
+  if (d == N - 1) {
+    char tmp[64 * 1024];
+    memcpy(tmp, s, dlen[d]);
+    memset(tmp + dlen[d], 0, 64);
+    n = tokenize((const uint8_t *)tmp, (const uint8_t *)tmp + dlen[d], t->tokids);
+  } else {
+    n = tokenize(s, s + dlen[d], t->tokids);
+  }
   for (uint32_t i = 0; i + q->n <= n; i++) {
     uint32_t k = 0;
     while (k < q->n && t->tokids[i + k] == q->t[k])
@@ -582,24 +588,14 @@ int main(void) {
   if (fd < 0 || fstat(fd, &st))
     die("cannot open /data/docs.txt");
   long size = st.st_size;
-  // N is one more than the id of the last line.
+  docs_data = mmap(NULL, size, PROT_READ, MAP_SHARED, fd, 0);
+  if (docs_data == MAP_FAILED)
+    die("mmap failed");
+
   if (size > 0) {
-    char c[4096];
-    long pos = size - 1, ls = 0;
-    while (pos > 0) {
-      long from = pos > (long)sizeof c ? pos - (long)sizeof c : 0;
-      if (pread(fd, c, pos - from, from) != pos - from)
-        die("read failed");
-      char *nl = memrchr(c, '\n', pos - from);
-      if (nl) {
-        ls = from + (nl - c) + 1;
-        break;
-      }
-      pos = from;
-    }
-    if (pread(fd, c, 24, ls) <= 0)
-      die("read failed");
-    N = strtoul(c, NULL, 10) + 1;
+    const char *last_nl = memrchr(docs_data, '\n', size > 0 ? size - 1 : 0);
+    const char *last_line = last_nl ? last_nl + 1 : docs_data;
+    N = strtoul(last_line, NULL, 10) + 1;
   }
   W = (N + 63) / 64;
   doff = malloc((N + 1) * sizeof *doff);
@@ -612,63 +608,65 @@ int main(void) {
   th = calloc(nth, sizeof(Th));
   for (int i = 1; i < nth; i++) {
     long b = size * i / nth;
-    if (b > 0) {
-      char c[256];
-      ssize_t n = pread(fd, c, sizeof c, b - 1);
-      char *nl = n > 0 ? memchr(c, '\n', n) : NULL;
-      while (!nl && n > 0) { // a long document: keep looking for its end
-        b += n;
-        n = pread(fd, c, sizeof c, b - 1);
-        nl = n > 0 ? memchr(c, '\n', n) : NULL;
-      }
-      b = nl ? b + (nl - c) : size;
-    }
-    th[i].beg = b < th[i - 1].beg ? th[i - 1].beg : b;
-    th[i - 1].end = th[i].beg;
+    while (b < size && docs_data[b - 1] != '\n')
+      b++;
+    th[i].beg = b;
+    th[i - 1].end = b;
   }
+  th[0].beg = 0;
   th[nth - 1].end = size;
   for (int i = nth - 1; i >= 0; i--) { // each range's first doc id, from its first line
-    char c[24] = {0};
     uint32_t next = i + 1 < nth ? th[i + 1].first : N;
-    th[i].first = th[i].beg < size && pread(fd, c, 23, th[i].beg) > 0 ? strtoul(c, NULL, 10) : N;
+    th[i].first = th[i].beg < size ? strtoul(docs_data + th[i].beg, NULL, 10) : N;
     th[i].wlo = th[i].first >> 6;
     th[i].whi = (next ? next - 1 : 0) >> 6;
-    th[i].buf = malloc(BUFSZ + 64); // slack for tokenize's reads past the data
-    th[i].tokids = malloc((BUFSZ / 2 + 2) * 4ull); // a line has at most BUFSZ / 2 tokens
+    th[i].tokids = malloc((BUFSZ / 2 + 2) * 4ull);
     th[i].tc = calloc(nterms + 1, sizeof(Tc));
   }
-  run_threads(scan);
+  run_threads(pass1_count);
+
+  for (uint32_t t = 0; t < nterms; t++) {
+    uint32_t sum = 0;
+    for (int i = 0; i < nth; i++)
+      sum += th[i].tc[t].cnt;
+    if (sum > N / 32)
+      bm[t] = calloc(W, 8);
+  }
 
   // Posting slices for the list terms, each thread's cursor after earlier threads'.
   df = calloc(nterms + 1, 4);
   pstart = calloc(nterms + 1, 4);
-  uint32_t total = 0, maxlen = 0, maxlist = 0;
+  uint32_t total = 0, maxlist = 0;
   for (uint32_t t = 0; t < nterms; t++) {
     pstart[t] = total;
-    for (int i = 0; i < nth && !bm[t]; i++) {
-      uint32_t c = th[i].tc[t].cnt;
-      th[i].tc[t].cnt = total;
-      total += c;
+    if (!bm[t]) {
+      for (int i = 0; i < nth; i++) {
+        uint32_t c = th[i].tc[t].cnt;
+        th[i].tc[t].cnt = total;
+        total += c;
+      }
+      df[t] = total - pstart[t];
+      maxlist = df[t] > maxlist ? df[t] : maxlist;
     }
-    df[t] = total - pstart[t];
   }
   post = malloc((size_t)total * 4 + 4);
-  run_threads(fill);
+
+  // Clear stamp for Pass 2
+  for (int i = 0; i < nth; i++)
+    for (uint32_t t = 0; t < nterms; t++)
+      th[i].tc[t].stamp = 0;
+
+  run_threads(pass2_fill);
+
   for (uint32_t t = 0; t < nterms; t++) {
     if (bm[t])
       for (uint32_t w = 0; w < W; w++)
         df[t] += __builtin_popcountll(bm[t][w]);
-    else
-      maxlist = df[t] > maxlist ? df[t] : maxlist;
   }
-  for (uint32_t d = 0; d < N; d++)
-    maxlen = dlen[d] > maxlen ? dlen[d] : maxlen;
+
   lcap = (maxlist > N / 32 ? maxlist : N / 32) + 1;
   for (int i = 0; i < nth; i++) {
     free(th[i].tc);
-    free(th[i].buf);
-    th[i].buf = NULL;
-    th[i].text = malloc(maxlen + 64); // slack for tokenize's reads past the data
     th[i].la = malloc(lcap * 4ull);
     th[i].lb = malloc(lcap * 4ull);
     th[i].bits = malloc(W * 8ull + 8);
@@ -676,6 +674,8 @@ int main(void) {
 
   malloc_trim(0);
   run_threads(answer);
+  munmap((void *)docs_data, size);
+  close(fd);
 
   int out = open("/out/results.txt", O_WRONLY | O_CREAT | O_TRUNC, 0644);
   if (out < 0)

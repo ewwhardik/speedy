@@ -223,8 +223,7 @@ static void *hours(void *arg) {
   for (int hr; (hr = __atomic_fetch_add(&next_hour, 1, __ATOMIC_RELAXED)) < HOURS;) {
     while (hr > __atomic_load_n(&turn, __ATOMIC_ACQUIRE) + 2) {
       flush_ready();
-      struct timespec ts = {0, 20000};
-      nanosleep(&ts, NULL);
+      _mm_pause();
     }
     uint32_t n = 0;
     memset(t->cnt, 0, E * 4);
