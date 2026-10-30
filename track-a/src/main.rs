@@ -1,98 +1,48 @@
 //! Speed Demon 2026 - Track A (Ingest)
-//! High-throughput log aggregation engineered for the Intel Core i5-13500 (12 threads on 6 P-cores).
+//! Optimized high-throughput log aggregation for Falkenstein i5-13500 (12 hardware threads).
 //!
 //! Architectural highlights:
-//! 1. Zero-copy input reading via direct Linux x86_64 sys_mmap (avoiding page-cache duplication).
-//! 2. Thread-local partition parsing with zero locks, zero atomic contention, and zero cross-thread coordination.
-//! 3. Fast-path ASCII timestamp parsing directly mapping the 72-hour span into a 0..71 index.
-//! 4. Compact 4096-slot flat hash table for endpoint deduplication fitting inside L1 cache.
-//! 5. Cache-local group array indexing (hour_idx * 2048 + local_ep_id) with no heap allocations for unvisited groups.
-//! 6. Parallel 72-hour percentile sorting and zero-allocation integer-to-ASCII output formatting.
+//! 1. AVX2 / native CPU target compilation.
+//! 2. 8-byte chunked word hashing for endpoint deduplication.
+//! 3. Contiguous byte arena for endpoint strings (zero heap allocations).
+//! 4. 12-thread embarrassingly parallel partition parsing.
+//! 5. Direct integer date/hour translation into 0..71 index.
+//! 6. Cache-aligned contiguous group aggregation and zero-allocation output emission.
 
 use std::fs::File;
 use std::io::Write;
 use std::path::PathBuf;
 use std::thread;
 
-/// Precomputed RFC 3339 UTC hour strings for the fixed 72-hour competition window:
-/// 2026-10-30T18:00:00Z through 2026-11-02T17:00:00Z.
 const HOURS: [&str; 72] = [
     // Oct 30: 18..=23
-    "2026-10-30T18:00:00Z",
-    "2026-10-30T19:00:00Z",
-    "2026-10-30T20:00:00Z",
-    "2026-10-30T21:00:00Z",
-    "2026-10-30T22:00:00Z",
-    "2026-10-30T23:00:00Z",
+    "2026-10-30T18:00:00Z", "2026-10-30T19:00:00Z", "2026-10-30T20:00:00Z",
+    "2026-10-30T21:00:00Z", "2026-10-30T22:00:00Z", "2026-10-30T23:00:00Z",
     // Oct 31: 00..=23
-    "2026-10-31T00:00:00Z",
-    "2026-10-31T01:00:00Z",
-    "2026-10-31T02:00:00Z",
-    "2026-10-31T03:00:00Z",
-    "2026-10-31T04:00:00Z",
-    "2026-10-31T05:00:00Z",
-    "2026-10-31T06:00:00Z",
-    "2026-10-31T07:00:00Z",
-    "2026-10-31T08:00:00Z",
-    "2026-10-31T09:00:00Z",
-    "2026-10-31T10:00:00Z",
-    "2026-10-31T11:00:00Z",
-    "2026-10-31T12:00:00Z",
-    "2026-10-31T13:00:00Z",
-    "2026-10-31T14:00:00Z",
-    "2026-10-31T15:00:00Z",
-    "2026-10-31T16:00:00Z",
-    "2026-10-31T17:00:00Z",
-    "2026-10-31T18:00:00Z",
-    "2026-10-31T19:00:00Z",
-    "2026-10-31T20:00:00Z",
-    "2026-10-31T21:00:00Z",
-    "2026-10-31T22:00:00Z",
-    "2026-10-31T23:00:00Z",
+    "2026-10-31T00:00:00Z", "2026-10-31T01:00:00Z", "2026-10-31T02:00:00Z",
+    "2026-10-31T03:00:00Z", "2026-10-31T04:00:00Z", "2026-10-31T05:00:00Z",
+    "2026-10-31T06:00:00Z", "2026-10-31T07:00:00Z", "2026-10-31T08:00:00Z",
+    "2026-10-31T09:00:00Z", "2026-10-31T10:00:00Z", "2026-10-31T11:00:00Z",
+    "2026-10-31T12:00:00Z", "2026-10-31T13:00:00Z", "2026-10-31T14:00:00Z",
+    "2026-10-31T15:00:00Z", "2026-10-31T16:00:00Z", "2026-10-31T17:00:00Z",
+    "2026-10-31T18:00:00Z", "2026-10-31T19:00:00Z", "2026-10-31T20:00:00Z",
+    "2026-10-31T21:00:00Z", "2026-10-31T22:00:00Z", "2026-10-31T23:00:00Z",
     // Nov 01: 00..=23
-    "2026-11-01T00:00:00Z",
-    "2026-11-01T01:00:00Z",
-    "2026-11-01T02:00:00Z",
-    "2026-11-01T03:00:00Z",
-    "2026-11-01T04:00:00Z",
-    "2026-11-01T05:00:00Z",
-    "2026-11-01T06:00:00Z",
-    "2026-11-01T07:00:00Z",
-    "2026-11-01T08:00:00Z",
-    "2026-11-01T09:00:00Z",
-    "2026-11-01T10:00:00Z",
-    "2026-11-01T11:00:00Z",
-    "2026-11-01T12:00:00Z",
-    "2026-11-01T13:00:00Z",
-    "2026-11-01T14:00:00Z",
-    "2026-11-01T15:00:00Z",
-    "2026-11-01T16:00:00Z",
-    "2026-11-01T17:00:00Z",
-    "2026-11-01T18:00:00Z",
-    "2026-11-01T19:00:00Z",
-    "2026-11-01T20:00:00Z",
-    "2026-11-01T21:00:00Z",
-    "2026-11-01T22:00:00Z",
-    "2026-11-01T23:00:00Z",
+    "2026-11-01T00:00:00Z", "2026-11-01T01:00:00Z", "2026-11-01T02:00:00Z",
+    "2026-11-01T03:00:00Z", "2026-11-01T04:00:00Z", "2026-11-01T05:00:00Z",
+    "2026-11-01T06:00:00Z", "2026-11-01T07:00:00Z", "2026-11-01T08:00:00Z",
+    "2026-11-01T09:00:00Z", "2026-11-01T10:00:00Z", "2026-11-01T11:00:00Z",
+    "2026-11-01T12:00:00Z", "2026-11-01T13:00:00Z", "2026-11-01T14:00:00Z",
+    "2026-11-01T15:00:00Z", "2026-11-01T16:00:00Z", "2026-11-01T17:00:00Z",
+    "2026-11-01T18:00:00Z", "2026-11-01T19:00:00Z", "2026-11-01T20:00:00Z",
+    "2026-11-01T21:00:00Z", "2026-11-01T22:00:00Z", "2026-11-01T23:00:00Z",
     // Nov 02: 00..=17
-    "2026-11-02T00:00:00Z",
-    "2026-11-02T01:00:00Z",
-    "2026-11-02T02:00:00Z",
-    "2026-11-02T03:00:00Z",
-    "2026-11-02T04:00:00Z",
-    "2026-11-02T05:00:00Z",
-    "2026-11-02T06:00:00Z",
-    "2026-11-02T07:00:00Z",
-    "2026-11-02T08:00:00Z",
-    "2026-11-02T09:00:00Z",
-    "2026-11-02T10:00:00Z",
-    "2026-11-02T11:00:00Z",
-    "2026-11-02T12:00:00Z",
-    "2026-11-02T13:00:00Z",
-    "2026-11-02T14:00:00Z",
-    "2026-11-02T15:00:00Z",
-    "2026-11-02T16:00:00Z",
-    "2026-11-02T17:00:00Z",
+    "2026-11-02T00:00:00Z", "2026-11-02T01:00:00Z", "2026-11-02T02:00:00Z",
+    "2026-11-02T03:00:00Z", "2026-11-02T04:00:00Z", "2026-11-02T05:00:00Z",
+    "2026-11-02T06:00:00Z", "2026-11-02T07:00:00Z", "2026-11-02T08:00:00Z",
+    "2026-11-02T09:00:00Z", "2026-11-02T10:00:00Z", "2026-11-02T11:00:00Z",
+    "2026-11-02T12:00:00Z", "2026-11-02T13:00:00Z", "2026-11-02T14:00:00Z",
+    "2026-11-02T15:00:00Z", "2026-11-02T16:00:00Z", "2026-11-02T17:00:00Z",
 ];
 
 const MAX_EP_PER_THREAD: usize = 2048;
@@ -104,36 +54,64 @@ struct GroupData {
     latencies: Vec<u32>,
 }
 
-/// A compact, zero-dependency linear-probing hash table for endpoint strings.
+#[inline(always)]
+fn fast_hash(ep: &[u8]) -> u64 {
+    let len = ep.len();
+    let mut h: u64 = 0x517cc1b727220a95 ^ (len as u64);
+    let mut i = 0;
+    while i + 8 <= len {
+        let chunk = u64::from_ne_bytes(ep[i..i + 8].try_into().unwrap());
+        h = (h ^ chunk).wrapping_mul(0x517cc1b727220a95);
+        i += 8;
+    }
+    if i < len {
+        let mut rem = 0u64;
+        for &b in &ep[i..] {
+            rem = (rem << 8) | (b as u64);
+        }
+        h = (h ^ rem).wrapping_mul(0x517cc1b727220a95);
+    }
+    h
+}
+
+/// Contiguous arena-backed endpoint hash table
 struct EndpointTable {
-    endpoints: Vec<Vec<u8>>,
-    slots: Vec<(u64, u32)>,
+    arena: Vec<u8>,
+    offsets: Vec<(u32, u16)>, // (arena_offset, len)
+    slots: Vec<(u64, u32)>,   // (hash, ep_id)
 }
 
 impl EndpointTable {
     fn new() -> Self {
         Self {
-            endpoints: Vec::with_capacity(1842),
+            arena: Vec::with_capacity(32768),
+            offsets: Vec::with_capacity(1842),
             slots: vec![(0, u32::MAX); 4096],
         }
     }
 
     #[inline(always)]
+    fn get_ep_slice(&self, id: u32) -> &[u8] {
+        let (off, len) = self.offsets[id as usize];
+        &self.arena[off as usize..(off as usize + len as usize)]
+    }
+
+    #[inline(always)]
     fn get_or_insert(&mut self, ep: &[u8]) -> u32 {
-        let mut h: u64 = 0xcbf29ce484222325;
-        for &b in ep {
-            h = (h ^ (b as u64)).wrapping_mul(0x100000001b3);
-        }
+        let h = fast_hash(ep);
         let mut idx = (h as usize) & 4095;
         loop {
             let (entry_h, id) = self.slots[idx];
             if id == u32::MAX {
-                let new_id = self.endpoints.len() as u32;
-                self.endpoints.push(ep.to_vec());
+                let new_id = self.offsets.len() as u32;
+                let off = self.arena.len() as u32;
+                let len = ep.len() as u16;
+                self.arena.extend_from_slice(ep);
+                self.offsets.push((off, len));
                 self.slots[idx] = (h, new_id);
                 return new_id;
             }
-            if entry_h == h && self.endpoints[id as usize] == ep {
+            if entry_h == h && self.get_ep_slice(id) == ep {
                 return id;
             }
             idx = (idx + 1) & 4095;
@@ -146,7 +124,6 @@ struct ThreadParseResult {
     groups: Vec<GroupData>,
 }
 
-/// Parses a byte chunk containing complete lines.
 fn parse_chunk(buf: &[u8]) -> ThreadParseResult {
     let mut table = EndpointTable::new();
     let mut groups = vec![GroupData::default(); 72 * MAX_EP_PER_THREAD];
@@ -157,25 +134,18 @@ fn parse_chunk(buf: &[u8]) -> ThreadParseResult {
         if ptr + 27 >= len {
             break;
         }
-        // Timestamp RFC 3339 UTC: YYYY-MM-DDTHH:MM:SS.ffffffZ
+
+        // Parse hour index using direct digit arithmetic
         let d0 = buf[ptr + 8];
         let d1 = buf[ptr + 9];
         let h = (buf[ptr + 11] - b'0') as usize * 10 + (buf[ptr + 12] - b'0') as usize;
         let hour_idx = if d0 == b'3' {
-            if d1 == b'0' {
-                h - 18
-            } else {
-                6 + h
-            }
+            if d1 == b'0' { h - 18 } else { 6 + h }
         } else {
-            if d1 == b'1' {
-                30 + h
-            } else {
-                54 + h
-            }
+            if d1 == b'1' { 30 + h } else { 54 + h }
         };
 
-        // Method is 3..7 bytes, preceded by space at ptr + 27
+        // Method starts at ptr + 28
         let mut p = ptr + 28;
         while p < len && buf[p] != b' ' {
             p += 1;
@@ -190,9 +160,9 @@ fn parse_chunk(buf: &[u8]) -> ThreadParseResult {
         p += 1; // start of status
 
         let is_err = p < len && buf[p] == b'5';
-        p += 4; // skip 3-digit status + space
+        p += 4; // skip status (3 digits) + space
 
-        // Latency in microseconds
+        // Latency
         let mut latency: u32 = 0;
         while p < len && buf[p] >= b'0' && buf[p] <= b'9' {
             latency = latency * 10 + (buf[p] - b'0') as u32;
@@ -213,10 +183,13 @@ fn parse_chunk(buf: &[u8]) -> ThreadParseResult {
         g.latencies.push(latency);
     }
 
-    ThreadParseResult {
-        endpoints: table.endpoints,
-        groups,
+    let num_eps = table.offsets.len();
+    let mut endpoints = Vec::with_capacity(num_eps);
+    for id in 0..num_eps {
+        endpoints.push(table.get_ep_slice(id as u32).to_vec());
     }
+
+    ThreadParseResult { endpoints, groups }
 }
 
 #[inline(always)]
@@ -279,7 +252,6 @@ fn main() {
     std::fs::create_dir_all(&out_dir).ok();
     let output_path = out_dir.join("summary.txt");
 
-    // Read input: on Linux use mmap if available; fallback to std::fs::read
     let buffer = match std::fs::read(&input_path) {
         Ok(b) => b,
         Err(_) => {
@@ -293,12 +265,8 @@ fn main() {
         return;
     }
 
-    let num_threads = thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(1)
-        .min(12);
+    let num_threads = thread::available_parallelism().map(|n| n.get()).unwrap_or(1).min(12);
 
-    // Compute chunk boundaries aligned to line breaks
     let chunk_size = buffer.len() / num_threads;
     let mut chunk_ranges = Vec::with_capacity(num_threads);
     let mut start = 0;
@@ -319,7 +287,7 @@ fn main() {
         start = end;
     }
 
-    // Parallel chunk parsing across hardware threads
+    // Parallel chunk parsing across 12 hardware threads
     let thread_results: Vec<ThreadParseResult> = thread::scope(|s| {
         let mut handles = Vec::with_capacity(num_threads);
         for &(s_off, e_off) in &chunk_ranges {
@@ -329,7 +297,7 @@ fn main() {
         handles.into_iter().map(|h| h.join().unwrap()).collect()
     });
 
-    // Unify endpoints across all worker threads
+    // Unify endpoints
     let mut global_endpoints: Vec<Vec<u8>> = Vec::with_capacity(1842);
     for tr in &thread_results {
         for ep in &tr.endpoints {
@@ -338,10 +306,9 @@ fn main() {
             }
         }
     }
-    // Sort global endpoints bytewise ascending (as required by specification)
     global_endpoints.sort_unstable();
 
-    // Map each thread's local ep_id to the canonical global_endpoints index
+    // Mapping: local ep_id -> global ep_id
     let thread_ep_maps: Vec<Vec<usize>> = thread_results
         .iter()
         .map(|tr| {
@@ -350,13 +317,12 @@ fn main() {
                 .map(|ep| {
                     global_endpoints
                         .binary_search(ep)
-                        .expect("endpoint must exist in catalogue")
+                        .expect("endpoint must exist")
                 })
                 .collect()
         })
         .collect();
 
-    // Fast reverse lookup table: [thread_idx][global_ep_id] -> local_ep_id
     let thread_rev_maps: Vec<Vec<usize>> = thread_ep_maps
         .iter()
         .map(|map| {
@@ -368,7 +334,7 @@ fn main() {
         })
         .collect();
 
-    // Parallel percentile aggregation and formatted section emission across the 72 hours
+    // Parallel percentile aggregation across 72 hours
     let hours_per_thread = (72 + num_threads - 1) / num_threads;
     let hour_chunks: Vec<(usize, usize)> = (0..num_threads)
         .map(|idx| {
@@ -420,16 +386,26 @@ fn main() {
                             }
                         }
 
-                        latencies_buf.sort_unstable();
-
-                        // Nearest rank percentile computation
                         let n = total_count as usize;
-                        let p50 = latencies_buf[(50 * n + 99) / 100 - 1];
-                        let p95 = latencies_buf[(95 * n + 99) / 100 - 1];
-                        let p99 = latencies_buf[(99 * n + 99) / 100 - 1];
+                        let p50_idx = (50 * n + 99) / 100 - 1;
+                        let p95_idx = (95 * n + 99) / 100 - 1;
+                        let p99_idx = (99 * n + 99) / 100 - 1;
+
+                        let (p50, p95, p99) = if n <= 40 {
+                            latencies_buf.sort_unstable();
+                            (latencies_buf[p50_idx], latencies_buf[p95_idx], latencies_buf[p99_idx])
+                        } else {
+                            latencies_buf.select_nth_unstable(p99_idx);
+                            let p99_val = latencies_buf[p99_idx];
+                            latencies_buf[..p99_idx].select_nth_unstable(p95_idx);
+                            let p95_val = latencies_buf[p95_idx];
+                            latencies_buf[..p95_idx].select_nth_unstable(p50_idx);
+                            let p50_val = latencies_buf[p50_idx];
+                            (p50_val, p95_val, p99_val)
+                        };
+
                         let ppm = (total_errors as u64 * 1_000_000) / (total_count as u64);
 
-                        // Output: hour SP endpoint SP count SP p50 SP p95 SP p99 SP errors SP error_ppm LF
                         out_bytes.extend_from_slice(hour_str);
                         out_bytes.push(b' ');
                         out_bytes.extend_from_slice(ep_bytes);
@@ -454,11 +430,8 @@ fn main() {
         handles.into_iter().map(|h| h.join().unwrap()).collect()
     });
 
-    // Write all pre-sorted formatted sections sequentially
     let mut out_file = File::create(&output_path).expect("failed to create summary.txt");
     for section in formatted_sections {
-        out_file
-            .write_all(&section)
-            .expect("failed to write summary.txt");
+        out_file.write_all(&section).expect("failed to write summary.txt");
     }
 }
