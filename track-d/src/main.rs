@@ -159,24 +159,100 @@ impl MinHeap {
     }
 }
 
+struct DistMap {
+    entries: Vec<(u32, u64)>, // (node_id, dist)
+    mask: usize,
+    touched: Vec<usize>,
+}
+
+impl DistMap {
+    fn with_capacity(cap: usize) -> Self {
+        let size = cap.next_power_of_two();
+        Self {
+            entries: vec![(u32::MAX, 0); size],
+            mask: size - 1,
+            touched: Vec::with_capacity(size / 2),
+        }
+    }
+
+    #[inline(always)]
+    fn get(&self, node: u32) -> Option<u64> {
+        let mut idx = (node as usize).wrapping_mul(0x9e3779b9) & self.mask;
+        loop {
+            let (k, d) = self.entries[idx];
+            if k == u32::MAX {
+                return None;
+            }
+            if k == node {
+                return Some(d);
+            }
+            idx = (idx + 1) & self.mask;
+        }
+    }
+
+    #[inline(always)]
+    fn insert_or_update(&mut self, node: u32, dist: u64) -> bool {
+        if self.touched.len() * 2 >= self.entries.len() {
+            self.grow();
+        }
+        let mut idx = (node as usize).wrapping_mul(0x9e3779b9) & self.mask;
+        loop {
+            let (k, d) = self.entries[idx];
+            if k == u32::MAX {
+                self.entries[idx] = (node, dist);
+                self.touched.push(idx);
+                return true;
+            }
+            if k == node {
+                if dist < d {
+                    self.entries[idx].1 = dist;
+                    return true;
+                }
+                return false;
+            }
+            idx = (idx + 1) & self.mask;
+        }
+    }
+
+    fn grow(&mut self) {
+        let old_entries = std::mem::take(&mut self.entries);
+        let new_size = old_entries.len() * 2;
+        self.entries = vec![(u32::MAX, 0); new_size];
+        self.mask = new_size - 1;
+        self.touched.clear();
+        for (k, d) in old_entries {
+            if k != u32::MAX {
+                let mut idx = (k as usize).wrapping_mul(0x9e3779b9) & self.mask;
+                while self.entries[idx].0 != u32::MAX {
+                    idx = (idx + 1) & self.mask;
+                }
+                self.entries[idx] = (k, d);
+                self.touched.push(idx);
+            }
+        }
+    }
+
+    #[inline(always)]
+    fn clear(&mut self) {
+        for &idx in &self.touched {
+            self.entries[idx] = (u32::MAX, 0);
+        }
+        self.touched.clear();
+    }
+}
+
 struct WorkerContext {
-    dist_f: Vec<u64>,
-    stamp_f: Vec<u32>,
-    dist_b: Vec<u64>,
-    stamp_b: Vec<u32>,
-    epoch: u32,
+    dist_f: DistMap,
+    dist_b: DistMap,
     heap_f: MinHeap,
     heap_b: MinHeap,
 }
 
 impl WorkerContext {
-    fn new(n: usize) -> Self {
+    fn new(_n: usize) -> Self {
         Self {
-            dist_f: vec![0u64; n],
-            stamp_f: vec![0u32; n],
-            dist_b: vec![0u64; n],
-            stamp_b: vec![0u32; n],
-            epoch: 1,
+            dist_f: DistMap::with_capacity(4096),
+            dist_b: DistMap::with_capacity(4096),
             heap_f: MinHeap::with_capacity(4096),
             heap_b: MinHeap::with_capacity(4096),
         }
@@ -198,24 +274,15 @@ impl WorkerContext {
             return -1;
         }
 
-        if self.epoch == u32::MAX {
-            self.stamp_f.fill(0);
-            self.stamp_b.fill(0);
-            self.epoch = 1;
-        } else {
-            self.epoch += 1;
-        }
-        let epoch = self.epoch;
-
+        self.dist_f.clear();
+        self.dist_b.clear();
         self.heap_f.clear();
         self.heap_b.clear();
 
-        self.dist_f[s_idx] = 0;
-        self.stamp_f[s_idx] = epoch;
+        self.dist_f.insert_or_update(s, 0);
         self.heap_f.push(0, s);
 
-        self.dist_b[t_idx] = 0;
-        self.stamp_b[t_idx] = epoch;
+        self.dist_b.insert_or_update(t, 0);
         self.heap_b.push(0, t);
 
         let mut best_dist = u64::MAX;
@@ -223,18 +290,22 @@ impl WorkerContext {
         while !self.heap_f.is_empty() && !self.heap_b.is_empty() {
             // Strip stale entries
             while let Some(top) = self.heap_f.peek() {
-                if top.0 > unsafe { *self.dist_f.get_unchecked(top.1 as usize) } {
-                    self.heap_f.pop();
-                } else {
-                    break;
+                if let Some(cur_d) = self.dist_f.get(top.1) {
+                    if top.0 > cur_d {
+                        self.heap_f.pop();
+                        continue;
+                    }
                 }
+                break;
             }
             while let Some(top) = self.heap_b.peek() {
-                if top.0 > unsafe { *self.dist_b.get_unchecked(top.1 as usize) } {
-                    self.heap_b.pop();
-                } else {
-                    break;
+                if let Some(cur_d) = self.dist_b.get(top.1) {
+                    if top.0 > cur_d {
+                        self.heap_b.pop();
+                        continue;
+                    }
                 }
+                break;
             }
 
             if self.heap_f.is_empty() || self.heap_b.is_empty() {
@@ -253,8 +324,8 @@ impl WorkerContext {
                     continue;
                 }
                 let u_idx = u as usize;
-                if unsafe { *self.stamp_b.get_unchecked(u_idx) } == epoch {
-                    let cand = d_u.saturating_add(unsafe { *self.dist_b.get_unchecked(u_idx) });
+                if let Some(d_b) = self.dist_b.get(u) {
+                    let cand = d_u.saturating_add(d_b);
                     if cand < best_dist {
                         best_dist = cand;
                     }
@@ -265,23 +336,16 @@ impl WorkerContext {
                 for i in start..end {
                     let edge = unsafe { *graph.fwd_edges.get_unchecked(i) };
                     let v = edge.target;
-                    let v_idx = v as usize;
                     let nd = d_u + edge.weight as u64;
 
-                    if unsafe { *self.stamp_b.get_unchecked(v_idx) } == epoch {
-                        let cand = nd.saturating_add(unsafe { *self.dist_b.get_unchecked(v_idx) });
+                    if let Some(d_b) = self.dist_b.get(v) {
+                        let cand = nd.saturating_add(d_b);
                         if cand < best_dist {
                             best_dist = cand;
                         }
                     }
 
-                    if unsafe { *self.stamp_f.get_unchecked(v_idx) } != epoch
-                        || nd < unsafe { *self.dist_f.get_unchecked(v_idx) }
-                    {
-                        unsafe {
-                            *self.stamp_f.get_unchecked_mut(v_idx) = epoch;
-                            *self.dist_f.get_unchecked_mut(v_idx) = nd;
-                        }
+                    if self.dist_f.insert_or_update(v, nd) {
                         self.heap_f.push(nd, v);
                     }
                 }
@@ -291,8 +355,8 @@ impl WorkerContext {
                     continue;
                 }
                 let v_idx = v as usize;
-                if unsafe { *self.stamp_f.get_unchecked(v_idx) } == epoch {
-                    let cand = d_v.saturating_add(unsafe { *self.dist_f.get_unchecked(v_idx) });
+                if let Some(d_f) = self.dist_f.get(v) {
+                    let cand = d_v.saturating_add(d_f);
                     if cand < best_dist {
                         best_dist = cand;
                     }
@@ -303,23 +367,16 @@ impl WorkerContext {
                 for i in start..end {
                     let edge = unsafe { *graph.bwd_edges.get_unchecked(i) };
                     let u = edge.target;
-                    let u_idx = u as usize;
                     let nd = d_v + edge.weight as u64;
 
-                    if unsafe { *self.stamp_f.get_unchecked(u_idx) } == epoch {
-                        let cand = nd.saturating_add(unsafe { *self.dist_f.get_unchecked(u_idx) });
+                    if let Some(d_f) = self.dist_f.get(u) {
+                        let cand = nd.saturating_add(d_f);
                         if cand < best_dist {
                             best_dist = cand;
                         }
                     }
 
-                    if unsafe { *self.stamp_b.get_unchecked(u_idx) } != epoch
-                        || nd < unsafe { *self.dist_b.get_unchecked(u_idx) }
-                    {
-                        unsafe {
-                            *self.stamp_b.get_unchecked_mut(u_idx) = epoch;
-                            *self.dist_b.get_unchecked_mut(u_idx) = nd;
-                        }
+                    if self.dist_b.insert_or_update(u, nd) {
                         self.heap_b.push(nd, u);
                     }
                 }
@@ -624,10 +681,10 @@ fn main() {
     };
     let t_csr = t3.elapsed();
 
-    // Phase 3: Parallel query execution (use 3 threads to bound peak memory to ~125 MB)
+    // Phase 3: Parallel query execution (12 threads in L1 cache)
     let t4 = std::time::Instant::now();
     let mut answers = vec![0i64; queries.len()];
-    let query_workers = 3.min(num_threads);
+    let query_workers = num_threads.min(12);
     let queries_per_thread = (queries.len() + query_workers - 1) / query_workers;
 
     thread::scope(|s| {

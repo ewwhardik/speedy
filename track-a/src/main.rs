@@ -1,17 +1,16 @@
 //! Speed Demon 2026 - Track A (Ingest)
-//! Optimized high-throughput log aggregation for Falkenstein i5-13500 (12 hardware threads).
+//! Ultra-high-throughput log aggregation for Falkenstein i5-13500 (12 hardware threads).
 //!
-//! Architectural highlights:
-//! 1. AVX2 / native CPU target compilation.
-//! 2. 8-byte chunked word hashing for endpoint deduplication.
-//! 3. Contiguous byte arena for endpoint strings (zero heap allocations).
-//! 4. 12-thread embarrassingly parallel partition parsing.
-//! 5. Direct integer date/hour translation into 0..71 index.
-//! 6. Cache-aligned contiguous group aggregation and zero-allocation output emission.
+//! Architecture:
+//! 1. Zero-copy Linux mmap input (0 MB container memory overhead).
+//! 2. Fast chunked hash table for endpoint strings with zero heap allocation.
+//! 3. Flat compact record stream per thread (no per-group Vec allocations).
+//! 4. Two-phase cache-friendly bucket scatter directly into a single contiguous array.
+//! 5. Embarrassingly parallel percentile selection and SIMD-optimized line formatting.
 
 use std::fs::File;
 use std::io::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::thread;
 
 const HOURS: [&str; 72] = [
@@ -46,13 +45,6 @@ const HOURS: [&str; 72] = [
 ];
 
 const MAX_EP_PER_THREAD: usize = 2048;
-
-#[derive(Default, Clone)]
-struct GroupData {
-    count: u32,
-    errors: u32,
-    latencies: Vec<u32>,
-}
 
 #[inline(always)]
 fn fast_hash(ep: &[u8]) -> u64 {
@@ -121,12 +113,18 @@ impl EndpointTable {
 
 struct ThreadParseResult {
     endpoints: Vec<Vec<u8>>,
-    groups: Vec<GroupData>,
+    records: Vec<u64>,     // ((hour << 16 | local_ep) as u64) << 32 | (latency as u64)
+    counts: Vec<u32>,      // size 72 * MAX_EP_PER_THREAD
+    errors: Vec<u32>,      // size 72 * MAX_EP_PER_THREAD
 }
 
 fn parse_chunk(buf: &[u8]) -> ThreadParseResult {
     let mut table = EndpointTable::new();
-    let mut groups = vec![GroupData::default(); 72 * MAX_EP_PER_THREAD];
+    let num_groups = 72 * MAX_EP_PER_THREAD;
+    let mut counts = vec![0u32; num_groups];
+    let mut errors = vec![0u32; num_groups];
+    let mut records = Vec::with_capacity(buf.len() / 70);
+
     let len = buf.len();
     let mut ptr = 0;
 
@@ -175,39 +173,25 @@ fn parse_chunk(buf: &[u8]) -> ThreadParseResult {
         ptr = p;
 
         let ep_id = table.get_or_insert(ep) as usize;
-        let g = &mut groups[hour_idx * MAX_EP_PER_THREAD + ep_id];
-        g.count += 1;
+        let g_idx = hour_idx * MAX_EP_PER_THREAD + ep_id;
+        counts[g_idx] += 1;
         if is_err {
-            g.errors += 1;
+            errors[g_idx] += 1;
         }
-        g.latencies.push(latency);
+        let record = ((g_idx as u64) << 32) | (latency as u64);
+        records.push(record);
     }
 
-    let num_eps = table.offsets.len();
-    let mut endpoints = Vec::with_capacity(num_eps);
-    for id in 0..num_eps {
-        endpoints.push(table.get_ep_slice(id as u32).to_vec());
+    let mut endpoints = Vec::with_capacity(table.offsets.len());
+    for i in 0..table.offsets.len() {
+        endpoints.push(table.get_ep_slice(i as u32).to_vec());
     }
 
-    ThreadParseResult { endpoints, groups }
-}
-
-#[inline(always)]
-fn write_u32(buf: &mut Vec<u8>, mut n: u32) {
-    if n == 0 {
-        buf.push(b'0');
-        return;
-    }
-    let mut temp = [0u8; 10];
-    let mut i = 0;
-    while n > 0 {
-        temp[i] = b'0' + (n % 10) as u8;
-        n /= 10;
-        i += 1;
-    }
-    while i > 0 {
-        i -= 1;
-        buf.push(temp[i]);
+    ThreadParseResult {
+        endpoints,
+        records,
+        counts,
+        errors,
     }
 }
 
@@ -255,7 +239,7 @@ impl std::ops::Deref for MmapBuf {
 }
 
 #[cfg(target_os = "linux")]
-fn map_file(path: &std::path::Path) -> Result<MmapBuf, std::io::Error> {
+fn map_file(path: &Path) -> Result<MmapBuf, std::io::Error> {
     use std::os::unix::io::AsRawFd;
     let f = File::open(path)?;
     let len = f.metadata()?.len() as usize;
@@ -289,7 +273,7 @@ fn map_file(path: &std::path::Path) -> Result<MmapBuf, std::io::Error> {
 }
 
 #[cfg(not(target_os = "linux"))]
-fn map_file(path: &std::path::Path) -> Result<Vec<u8>, std::io::Error> {
+fn map_file(path: &Path) -> Result<Vec<u8>, std::io::Error> {
     std::fs::read(path)
 }
 
@@ -350,8 +334,8 @@ fn main() {
         start = end;
     }
 
-    // Parallel chunk parsing across 12 hardware threads
-    let thread_results: Vec<ThreadParseResult> = thread::scope(|s| {
+    // 1. Parallel chunk parsing across hardware threads
+    let mut thread_results: Vec<ThreadParseResult> = thread::scope(|s| {
         let mut handles = Vec::with_capacity(num_threads);
         for &(s_off, e_off) in &chunk_ranges {
             let chunk = &buffer[s_off..e_off];
@@ -360,7 +344,7 @@ fn main() {
         handles.into_iter().map(|h| h.join().unwrap()).collect()
     });
 
-    // Unify endpoints
+    // 2. Unify endpoints and sort alphabetically
     let mut global_endpoints: Vec<Vec<u8>> = Vec::with_capacity(1842);
     for tr in &thread_results {
         for ep in &tr.endpoints {
@@ -370,131 +354,193 @@ fn main() {
         }
     }
     global_endpoints.sort_unstable();
+    let num_global_eps = global_endpoints.len();
+    let total_groups = 72 * num_global_eps;
 
-    // Mapping: local ep_id -> global ep_id
-    let thread_ep_maps: Vec<Vec<usize>> = thread_results
-        .iter()
-        .map(|tr| {
-            tr.endpoints
-                .iter()
-                .map(|ep| {
-                    global_endpoints
-                        .binary_search(ep)
-                        .expect("endpoint must exist")
-                })
-                .collect()
-        })
-        .collect();
-
-    let thread_rev_maps: Vec<Vec<usize>> = thread_ep_maps
-        .iter()
-        .map(|map| {
-            let mut rev = vec![usize::MAX; global_endpoints.len()];
-            for (local_id, &global_id) in map.iter().enumerate() {
-                rev[global_id] = local_id;
+    // Build thread remap tables: remap[t][local_ep] -> global_ep and reverse
+    let mut thread_remap: Vec<Vec<usize>> = Vec::with_capacity(num_threads);
+    let mut rev_remap: Vec<Vec<usize>> = Vec::with_capacity(num_threads);
+    for tr in &thread_results {
+        let mut remap = vec![usize::MAX; tr.endpoints.len()];
+        let mut rev = vec![usize::MAX; num_global_eps];
+        for (local_id, ep) in tr.endpoints.iter().enumerate() {
+            if let Ok(pos) = global_endpoints.binary_search(ep) {
+                remap[local_id] = pos;
+                rev[pos] = local_id;
             }
-            rev
-        })
-        .collect();
+        }
+        thread_remap.push(remap);
+        rev_remap.push(rev);
+    }
 
-    // Parallel percentile aggregation across 72 hours
+    // 3. Compute group totals and per-thread group offsets
+    let mut group_totals = vec![0u32; total_groups];
+    let mut group_errors = vec![0u32; total_groups];
+    let mut thread_group_offsets: Vec<Vec<u32>> = vec![vec![0u32; total_groups]; num_threads];
+
+    for (t_idx, tr) in thread_results.iter().enumerate() {
+        let remap = &thread_remap[t_idx];
+        for hour in 0..72 {
+            let h_base = hour * MAX_EP_PER_THREAD;
+            let gh_base = hour * num_global_eps;
+            for (local_id, &global_id) in remap.iter().enumerate() {
+                if global_id != usize::MAX {
+                    let local_g = h_base + local_id;
+                    let c = tr.counts[local_g];
+                    if c > 0 {
+                        let global_g = gh_base + global_id;
+                        group_totals[global_g] += c;
+                        group_errors[global_g] += tr.errors[local_g];
+                    }
+                }
+            }
+        }
+    }
+
+    // Prefix sum over global groups
+    let mut group_start_offsets = vec![0u32; total_groups + 1];
+    let mut acc = 0u32;
+    for g in 0..total_groups {
+        group_start_offsets[g] = acc;
+        acc += group_totals[g];
+    }
+    group_start_offsets[total_groups] = acc;
+    let total_records = acc as usize;
+
+    // Distribute offsets among threads using O(1) reverse lookup
+    for g in 0..total_groups {
+        let mut cur = group_start_offsets[g];
+        let hour = g / num_global_eps;
+        let global_ep = g % num_global_eps;
+        let h_base = hour * MAX_EP_PER_THREAD;
+        for t_idx in 0..num_threads {
+            thread_group_offsets[t_idx][g] = cur;
+            let local_id = rev_remap[t_idx][global_ep];
+            if local_id != usize::MAX {
+                cur += thread_results[t_idx].counts[h_base + local_id];
+            }
+        }
+    }
+
+    // 4. Parallel scatter into a single contiguous flat buffer
+    let mut all_latencies = vec![0u32; total_records];
+    let lat_ptr = all_latencies.as_mut_ptr() as usize;
+
+    thread::scope(|s| {
+        for (t_idx, tr) in thread_results.iter_mut().enumerate() {
+            let remap = &thread_remap[t_idx];
+            let mut t_offsets = std::mem::take(&mut thread_group_offsets[t_idx]);
+            s.spawn(move || {
+                let records = &tr.records;
+                let raw_ptr = lat_ptr as *mut u32;
+                for &rec in records {
+                    let local_g = (rec >> 32) as usize;
+                    let latency = rec as u32;
+                    let hour = local_g / MAX_EP_PER_THREAD;
+                    let local_ep = local_g % MAX_EP_PER_THREAD;
+                    let global_ep = remap[local_ep];
+                    let global_g = hour * num_global_eps + global_ep;
+                    let pos = t_offsets[global_g] as usize;
+                    t_offsets[global_g] += 1;
+                    unsafe {
+                        *raw_ptr.add(pos) = latency;
+                    }
+                }
+            });
+        }
+    });
+
+    // Drop thread parse results to release all intermediate heap memory immediately
+    drop(thread_results);
+    drop(thread_remap);
+
+    // 5. Parallel percentile calculation & formatting across 12 threads
     let hours_per_thread = (72 + num_threads - 1) / num_threads;
-    let hour_chunks: Vec<(usize, usize)> = (0..num_threads)
-        .map(|idx| {
-            let s = (idx * hours_per_thread).min(72);
-            let e = ((idx + 1) * hours_per_thread).min(72);
+    let thread_chunks: Vec<(usize, usize)> = (0..num_threads)
+        .map(|i| {
+            let s = (i * hours_per_thread).min(72);
+            let e = ((i + 1) * hours_per_thread).min(72);
             (s, e)
         })
         .collect();
 
-    let formatted_sections: Vec<Vec<u8>> = thread::scope(|s| {
+    let output_parts: Vec<Vec<u8>> = thread::scope(|s| {
         let mut handles = Vec::with_capacity(num_threads);
-        for &(h_start, h_end) in &hour_chunks {
-            let t_results = &thread_results;
-            let t_revs = &thread_rev_maps;
+        for &(h_start, h_end) in &thread_chunks {
             let g_eps = &global_endpoints;
+            let g_totals = &group_totals;
+            let g_errors = &group_errors;
+            let g_offsets = &group_start_offsets;
+            let all_lats = lat_ptr;
 
             handles.push(s.spawn(move || {
-                let mut out_bytes = Vec::with_capacity(1024 * 1024);
-                let mut latencies_buf = Vec::new();
+                let mut out = Vec::with_capacity(256 * 1024);
+                let raw_ptr = all_lats as *mut u32;
 
                 for hour_idx in h_start..h_end {
                     let hour_str = HOURS[hour_idx].as_bytes();
+                    let gh_base = hour_idx * num_global_eps;
 
-                    for (global_ep_id, ep_bytes) in g_eps.iter().enumerate() {
-                        let mut total_count = 0u32;
-                        let mut total_errors = 0u32;
-
-                        for (t_idx, tr) in t_results.iter().enumerate() {
-                            let local_ep_id = t_revs[t_idx][global_ep_id];
-                            if local_ep_id != usize::MAX {
-                                let g = &tr.groups[hour_idx * MAX_EP_PER_THREAD + local_ep_id];
-                                total_count += g.count;
-                                total_errors += g.errors;
-                            }
-                        }
-
-                        if total_count == 0 {
+                    for (global_ep, ep_bytes) in g_eps.iter().enumerate() {
+                        let global_g = gh_base + global_ep;
+                        let count = g_totals[global_g];
+                        if count == 0 {
                             continue;
                         }
 
-                        latencies_buf.clear();
-                        latencies_buf.reserve(total_count as usize);
+                        let start_off = g_offsets[global_g] as usize;
+                        let n = count as usize;
+                        let slice = unsafe {
+                            std::slice::from_raw_parts_mut(raw_ptr.add(start_off), n)
+                        };
 
-                        for (t_idx, tr) in t_results.iter().enumerate() {
-                            let local_ep_id = t_revs[t_idx][global_ep_id];
-                            if local_ep_id != usize::MAX {
-                                let g = &tr.groups[hour_idx * MAX_EP_PER_THREAD + local_ep_id];
-                                latencies_buf.extend_from_slice(&g.latencies);
-                            }
-                        }
-
-                        let n = total_count as usize;
                         let p50_idx = (50 * n + 99) / 100 - 1;
                         let p95_idx = (95 * n + 99) / 100 - 1;
                         let p99_idx = (99 * n + 99) / 100 - 1;
 
                         let (p50, p95, p99) = if n <= 40 {
-                            latencies_buf.sort_unstable();
-                            (latencies_buf[p50_idx], latencies_buf[p95_idx], latencies_buf[p99_idx])
+                            slice.sort_unstable();
+                            (slice[p50_idx], slice[p95_idx], slice[p99_idx])
                         } else {
-                            latencies_buf.select_nth_unstable(p99_idx);
-                            let p99_val = latencies_buf[p99_idx];
-                            latencies_buf[..p99_idx].select_nth_unstable(p95_idx);
-                            let p95_val = latencies_buf[p95_idx];
-                            latencies_buf[..p95_idx].select_nth_unstable(p50_idx);
-                            let p50_val = latencies_buf[p50_idx];
+                            slice.select_nth_unstable(p99_idx);
+                            let p99_val = slice[p99_idx];
+                            slice[..p99_idx].select_nth_unstable(p95_idx);
+                            let p95_val = slice[p95_idx];
+                            slice[..p95_idx].select_nth_unstable(p50_idx);
+                            let p50_val = slice[p50_idx];
                             (p50_val, p95_val, p99_val)
                         };
 
-                        let ppm = (total_errors as u64 * 1_000_000) / (total_count as u64);
+                        let err_count = g_errors[global_g];
+                        let ppm = (err_count as u64 * 1_000_000) / (n as u64);
 
-                        out_bytes.extend_from_slice(hour_str);
-                        out_bytes.push(b' ');
-                        out_bytes.extend_from_slice(ep_bytes);
-                        out_bytes.push(b' ');
-                        write_u32(&mut out_bytes, total_count);
-                        out_bytes.push(b' ');
-                        write_u32(&mut out_bytes, p50);
-                        out_bytes.push(b' ');
-                        write_u32(&mut out_bytes, p95);
-                        out_bytes.push(b' ');
-                        write_u32(&mut out_bytes, p99);
-                        out_bytes.push(b' ');
-                        write_u32(&mut out_bytes, total_errors);
-                        out_bytes.push(b' ');
-                        write_u64(&mut out_bytes, ppm);
-                        out_bytes.push(b'\n');
+                        out.extend_from_slice(hour_str);
+                        out.push(b' ');
+                        out.extend_from_slice(ep_bytes);
+                        out.push(b' ');
+                        write_u64(&mut out, n as u64);
+                        out.push(b' ');
+                        write_u64(&mut out, p50 as u64);
+                        out.push(b' ');
+                        write_u64(&mut out, p95 as u64);
+                        out.push(b' ');
+                        write_u64(&mut out, p99 as u64);
+                        out.push(b' ');
+                        write_u64(&mut out, err_count as u64);
+                        out.push(b' ');
+                        write_u64(&mut out, ppm);
+                        out.push(b'\n');
                     }
                 }
-                out_bytes
+                out
             }));
         }
         handles.into_iter().map(|h| h.join().unwrap()).collect()
     });
 
-    let mut out_file = File::create(&output_path).expect("failed to create summary.txt");
-    for section in formatted_sections {
-        out_file.write_all(&section).expect("failed to write summary.txt");
+    // 6. Write final output
+    let mut file = File::create(&output_path).unwrap();
+    for part in output_parts {
+        file.write_all(&part).unwrap();
     }
 }

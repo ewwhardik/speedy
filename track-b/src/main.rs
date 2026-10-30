@@ -388,8 +388,13 @@ fn main() {
         })
         .collect();
 
-    // Each thread extracts tokens for its documents and populates thread-local postings
-    let thread_postings: Vec<Vec<Vec<u32>>> = thread::scope(|s| {
+    struct ThreadIndexResult {
+        records: Vec<(u32, u32)>, // (tid, doc_id)
+        counts: Vec<u32>,         // size num_query_terms
+    }
+
+    // Each thread extracts tokens for its documents and populates thread-local records
+    let thread_indexes: Vec<ThreadIndexResult> = thread::scope(|s| {
         let mut handles = Vec::with_capacity(num_threads);
         for &(d_start, d_end) in &doc_chunks {
             let ranges = &doc_text_ranges[d_start..d_end];
@@ -397,7 +402,8 @@ fn main() {
             let tm = &term_map;
 
             handles.push(s.spawn(move || {
-                let mut local_postings: Vec<Vec<u32>> = vec![Vec::new(); num_query_terms];
+                let mut records = Vec::with_capacity(ranges.len() * 20);
+                let mut counts = vec![0u32; num_query_terms];
                 let mut seen_stamp = vec![0u32; num_query_terms];
                 let mut token_buf = [0u8; 32];
 
@@ -426,28 +432,74 @@ fn main() {
                                 let tid_idx = tid as usize;
                                 if seen_stamp[tid_idx] != current_stamp {
                                     seen_stamp[tid_idx] = current_stamp;
-                                    local_postings[tid_idx].push(doc_id);
+                                    records.push((tid, doc_id));
+                                    counts[tid_idx] += 1;
                                 }
                             }
                         }
                     }
                 }
-                local_postings
+                ThreadIndexResult { records, counts }
             }));
         }
         handles.into_iter().map(|h| h.join().unwrap()).collect()
     });
 
-    // Merge postings from all threads into global sorted postings
-    let mut postings: Vec<Vec<u32>> = Vec::with_capacity(num_query_terms);
-    for t_idx in 0..num_query_terms {
-        let total_len: usize = thread_postings.iter().map(|tp| tp[t_idx].len()).sum();
-        let mut term_p = Vec::with_capacity(total_len);
-        for tp in &thread_postings {
-            term_p.extend_from_slice(&tp[t_idx]);
+    // Compute prefix sums over global query terms
+    let mut offsets = vec![0u32; num_query_terms + 1];
+    let mut thread_term_offsets: Vec<Vec<u32>> = vec![vec![0u32; num_query_terms]; num_threads];
+
+    let mut acc = 0u32;
+    for tid in 0..num_query_terms {
+        offsets[tid] = acc;
+        let mut cur = acc;
+        for t in 0..num_threads {
+            thread_term_offsets[t][tid] = cur;
+            cur += thread_indexes[t].counts[tid];
         }
-        postings.push(term_p);
+        acc = cur;
     }
+    offsets[num_query_terms] = acc;
+    let total_postings = acc as usize;
+
+    let mut doc_ids = vec![0u32; total_postings];
+    let doc_ptr = doc_ids.as_mut_ptr() as usize;
+
+    // Parallel scatter into contiguous doc_ids
+    thread::scope(|s| {
+        for (t_idx, tr) in thread_indexes.into_iter().enumerate() {
+            let mut t_offs = std::mem::take(&mut thread_term_offsets[t_idx]);
+            s.spawn(move || {
+                let raw_ptr = doc_ptr as *mut u32;
+                for &(tid, doc_id) in &tr.records {
+                    let pos = t_offs[tid as usize] as usize;
+                    t_offs[tid as usize] += 1;
+                    unsafe {
+                        *raw_ptr.add(pos) = doc_id;
+                    }
+                }
+            });
+        }
+    });
+
+    struct CsrPostings<'a> {
+        offsets: &'a [u32],
+        doc_ids: &'a [u32],
+    }
+
+    impl<'a> CsrPostings<'a> {
+        #[inline(always)]
+        fn get(&self, tid: u32) -> &'a [u32] {
+            let s = self.offsets[tid as usize] as usize;
+            let e = self.offsets[tid as usize + 1] as usize;
+            &self.doc_ids[s..e]
+        }
+    }
+
+    let postings = CsrPostings {
+        offsets: &offsets,
+        doc_ids: &doc_ids,
+    };
 
     // 3. Parallel query execution
     let queries_per_thread = (parsed_queries.len() + num_threads - 1) / num_threads;
@@ -481,7 +533,7 @@ fn main() {
                         Query::Bool { terms, ops } => {
                             if let Some(first_tid) = terms[0] {
                                 r_set.clear();
-                                r_set.extend_from_slice(&post_lists[first_tid as usize]);
+                                r_set.extend_from_slice(post_lists.get(first_tid));
                             } else {
                                 r_set.clear();
                             }
@@ -494,7 +546,7 @@ fn main() {
                                         if let Some(tid) = term_tid {
                                             intersect(
                                                 &r_set,
-                                                &post_lists[tid as usize],
+                                                post_lists.get(tid),
                                                 &mut temp_buf,
                                             );
                                             std::mem::swap(&mut r_set, &mut temp_buf);
@@ -505,7 +557,7 @@ fn main() {
                                     1 => {
                                         // OR
                                         if let Some(tid) = term_tid {
-                                            union(&r_set, &post_lists[tid as usize], &mut temp_buf);
+                                            union(&r_set, post_lists.get(tid), &mut temp_buf);
                                             std::mem::swap(&mut r_set, &mut temp_buf);
                                         }
                                     }
@@ -514,7 +566,7 @@ fn main() {
                                         if let Some(tid) = term_tid {
                                             difference(
                                                 &r_set,
-                                                &post_lists[tid as usize],
+                                                post_lists.get(tid),
                                                 &mut temp_buf,
                                             );
                                             std::mem::swap(&mut r_set, &mut temp_buf);
@@ -557,11 +609,11 @@ fn main() {
                             // Intersect postings of phrase terms to find candidate documents
                             let first_tid = terms[0].unwrap();
                             cand_docs.clear();
-                            cand_docs.extend_from_slice(&post_lists[first_tid as usize]);
+                            cand_docs.extend_from_slice(post_lists.get(first_tid));
 
                             for &t in &terms[1..] {
                                 let tid = t.unwrap();
-                                intersect(&cand_docs, &post_lists[tid as usize], &mut temp_buf);
+                                intersect(&cand_docs, post_lists.get(tid), &mut temp_buf);
                                 std::mem::swap(&mut cand_docs, &mut temp_buf);
                                 if cand_docs.is_empty() {
                                     break;

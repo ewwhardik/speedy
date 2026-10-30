@@ -43,25 +43,25 @@ impl Default for ThreadAcc {
     }
 }
 
-/// 128-bit dual hash function for distinct name strings.
-/// Combines 64-bit FNV-1a with a 64-bit Murmur/Wyhash mixer for 0-collision guarantee.
+/// Fast 64-bit chunked hash function for distinct name strings.
 #[inline(always)]
-fn hash_name(bytes: &[u8]) -> (u64, u64) {
-    let mut h1: u64 = 0xcbf29ce484222325;
-    for &b in bytes {
-        h1 = (h1 ^ (b as u64)).wrapping_mul(0x100000001b3);
+fn hash_name(bytes: &[u8]) -> u64 {
+    let len = bytes.len();
+    let mut h: u64 = 0xcbf29ce484222325 ^ (len as u64);
+    let mut i = 0;
+    while i + 8 <= len {
+        let chunk = u64::from_ne_bytes(bytes[i..i + 8].try_into().unwrap());
+        h = (h ^ chunk).wrapping_mul(0x100000001b3);
+        i += 8;
     }
-
-    let mut h2: u64 = 0x517cc1b727220a95 ^ (bytes.len() as u64);
-    for &b in bytes {
-        h2 = (h2 ^ (b as u64)).wrapping_mul(0x9e3779b97f4a7c15);
-        h2 = (h2 << 13) | (h2 >> 51);
+    if i < len {
+        let mut rem = 0u64;
+        for &b in &bytes[i..] {
+            rem = (rem << 8) | (b as u64);
+        }
+        h = (h ^ rem).wrapping_mul(0x100000001b3);
     }
-    h2 ^= h2 >> 33;
-    h2 = h2.wrapping_mul(0xff51afd7ed558ccd);
-    h2 ^= h2 >> 33;
-
-    (h1, h2)
+    h
 }
 
 fn write_u64(out: &mut Vec<u8>, mut n: u64) {
@@ -185,7 +185,7 @@ fn load_regions(path: &Path) -> RegionsLookup {
 
 struct ThreadResult {
     accs: Vec<ThreadAcc>,
-    country_names: Vec<Vec<(u64, u64)>>,
+    country_names: Vec<Vec<u64>>,
 }
 
 fn parse_records_chunk(
@@ -197,7 +197,7 @@ fn parse_records_chunk(
     num_total_countries: usize,
 ) -> ThreadResult {
     let mut accs = vec![ThreadAcc::default(); num_total_countries];
-    let mut country_names: Vec<Vec<(u64, u64)>> =
+    let mut country_names: Vec<Vec<u64>> =
         (0..num_total_countries).map(|_| Vec::new()).collect();
 
     let mut unescape_buf = Vec::with_capacity(256);
@@ -227,7 +227,7 @@ fn parse_records_chunk(
 
         // 2. Parse name: quoted or unquoted
         let name_bytes: u64;
-        let name_hash: (u64, u64);
+        let name_hash: u64;
 
         if pos < buf.len() && buf[pos] == b'"' {
             pos += 1; // skip opening '"'
@@ -372,6 +372,11 @@ fn parse_records_chunk(
         acc.name_bytes += name_bytes;
         acc.note_bytes += note_bytes;
         country_names[country_idx].push(name_hash);
+    }
+
+    for names in &mut country_names {
+        names.sort_unstable();
+        names.dedup();
     }
 
     ThreadResult {
