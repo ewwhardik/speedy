@@ -235,7 +235,7 @@ int main(void) {
 
   cpu_set_t cpus; // the CPUs this container may use, not the host's count
   nth = sched_getaffinity(0, sizeof cpus, &cpus) ? 1 : CPU_COUNT(&cpus);
-  nth = nth < 1 ? 1 : nth > 6 ? 6 : nth;
+  nth = nth < 1 ? 1 : nth > 64 ? 64 : nth;
   th = calloc(nth, sizeof(Th));
   th[0].beg = body;
   for (int i = 1; i < nth; i++) {
@@ -296,6 +296,7 @@ int main(void) {
   malloc_trim(0);
 
   ans = malloc((nq + 1) * sizeof *ans);
+  nth = nth > 6 ? 6 : nth;
   run_threads(answer);
   FILE *out = fopen("/out/distances.txt", "w");
   if (!out)
