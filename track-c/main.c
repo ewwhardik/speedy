@@ -11,11 +11,12 @@
 #include <unistd.h>
 
 #define BUFSZ (1 << 16)
-#define MAPN 10000000
+#define MAPN 1000001
 #define MAXG 256
 #define IDBITS 24
 #define IDMASK ((1u << IDBITS) - 1)
 #define INL 24
+#define MAXNAMES 105000
 
 typedef struct {
   uint64_t count, id_sum, name_bytes, note_bytes;
@@ -79,7 +80,7 @@ static uint32_t name_id(Th *t, const char *s, uint32_t n, uint64_t h, uint64_t w
   for (uint32_t i = h & (cap - 1);; i = (i + 1) & (cap - 1)) {
     uint64_t v = __atomic_load_n(&slots[i], __ATOMIC_ACQUIRE);
     if (v == 0) {
-      if (__atomic_load_n(&nnames, __ATOMIC_RELAXED) >= cap / 4 * 3) {
+      if (__atomic_load_n(&nnames, __ATOMIC_RELAXED) >= MAXNAMES - 1000 || __atomic_load_n(&nnames, __ATOMIC_RELAXED) >= cap / 4 * 3) {
         overflow = 1;
         return 0;
       }
@@ -311,7 +312,7 @@ int main(void) {
   for (cap = 1 << 18;; cap *= 4) {
     if (cap > 1u << IDBITS) die("too many distinct names");
     slots = calloc(cap, 8);
-    names = aligned_alloc(64, cap * sizeof(Name));
+    names = aligned_alloc(64, MAXNAMES * sizeof(Name));
     nnames = overflow = arena_used = 0;
     run_threads(parse);
     if (!overflow) break;
