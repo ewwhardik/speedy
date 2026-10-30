@@ -8,6 +8,7 @@
 #include <cstring>
 #include <fcntl.h>
 #include <immintrin.h>
+#include <malloc.h>
 #include <string>
 #include <string_view>
 #include <sys/mman.h>
@@ -61,8 +62,13 @@ inline u64 digits(const char* s, const char* e) {
 
 class Structure {
 public:
-    struct Separator { const char* at; u64 quotes; };
+    struct Separator {
+        const char* at;
+        u64 quotes;
+    };
+
     Structure(const char* p, const char* file_end) : block_(p - 64), end_(file_end) {}
+
     Separator next() {
         while (bits_ == 0) {
             block_ += 64;
@@ -78,6 +84,7 @@ public:
         bits_ &= bits_ - 1;
         return {block_ + i, before_ + __builtin_popcountll(q_ & ((u64(1) << i) - 1))};
     }
+
 private:
     const char* block_;
     const char* end_;
@@ -87,7 +94,11 @@ private:
 class NameTable {
 public:
     static constexpr u32 SLOTS = 1 << 17, IDS = 1 << 17, HEAD = 24;
-    struct Probe { u32 slot; u16 tag; };
+
+    struct Probe {
+        u32 slot;
+        u16 tag;
+    };
 
     Probe probe(const char* s, u32 len) const {
         u64 h = len;
@@ -129,7 +140,11 @@ public:
 
 private:
     static constexpr u16 BUSY = 0xFFFF;
-    struct alignas(32) Slot { u32 id, len; char head[HEAD]; };
+    struct alignas(32) Slot {
+        u32 id, len;
+        char head[HEAD];
+    };
+
     static bool same_head(const Slot& slot, const char* s, u32 len) {
         __m256i a = _mm256_load_si256(reinterpret_cast<const __m256i*>(&slot));
         __m256i b = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(s - 8));
@@ -140,7 +155,7 @@ private:
     std::atomic<u16>* tags_ = zeroed<std::atomic<u16>>(SLOTS);
     Slot* slots_ = zeroed<Slot>(SLOTS);
     u32* overflow_ = zeroed<u32>(SLOTS);
-    char* arena_ = zeroed<char>(1 << 20);
+    char* arena_ = zeroed<char>(8 << 20);
     std::atomic<u32> used_{0}, next_id_{0};
 };
 
@@ -152,13 +167,17 @@ struct Totals {
 struct NamesSeen {
     static constexpr u32 WORDS = NameTable::IDS / 64;
     std::atomic<u64>* bits = zeroed<std::atomic<u64>>(256 * WORDS);
+
     std::atomic<u64>& word(u32 c, u32 name) { return bits[c * WORDS + name / 64]; }
+
     void prefetch(u32 c, u32 name) { _mm_prefetch(reinterpret_cast<const char*>(&word(c, name)), _MM_HINT_T0); }
+
     void mark(u32 c, u32 name) {
         u64 bit = u64(1) << (name % 64);
         if (!(word(c, name).load(std::memory_order_relaxed) & bit))
             word(c, name).fetch_or(bit, std::memory_order_relaxed);
     }
+
     u64 count(u32 c) const {
         u64 n = 0;
         for (u32 w = 0; w < WORDS; ++w) n += __builtin_popcountll(bits[c * WORDS + w].load(std::memory_order_relaxed));
@@ -171,8 +190,14 @@ inline u32 text_length(const char* s, const char* e, u32 q) { return (e - s) - (
 void parse_records(const char* p, const char* end, const char* file_end, const u8* country_of,
                    size_t regions, NameTable& names, NamesSeen& seen, Totals* totals) {
     constexpr u64 LAG = 16;
-    struct Pending { const char* name; u32 len, country; NameTable::Probe probe; } pending[LAG];
-    struct Mark { u32 country, id; } marks[LAG];
+    struct Pending {
+        const char* name;
+        u32 len, country;
+        NameTable::Probe probe;
+    } pending[LAG];
+    struct Mark {
+        u32 country, id;
+    } marks[LAG];
     u64 n = 0, last = UINT64_MAX;
     auto advance = [&] {
         u32 k = n % LAG;
@@ -242,7 +267,7 @@ void put_money(std::string& out, i64 cents) {
 
 int main() {
     prctl(PR_SET_THP_DISABLE, 1, 0, 0, 0);
-    const int nthreads = 12;
+        const int nthreads = 12;
     size_t rsize, size;
     const char* regions = map_file("/data/regions.csv", rsize);
     const char* records = map_file("/data/records.csv", size);

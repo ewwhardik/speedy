@@ -359,6 +359,9 @@ Index build_index(const File& f, TermTable& terms, std::vector<u32>& query_terms
         ix.post.reset(new uint16_t[total]);
     });
 
+    const size_t scratch_bytes = size_t(nthreads) * nterms * sizeof(u32);
+    auto* scratch = static_cast<u32*>(mmap(nullptr, scratch_bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0));
+
     std::vector<std::thread> pool;
     for (int t = 0; t < nthreads; ++t) {
         pool.emplace_back([&, t] {
@@ -367,7 +370,8 @@ Index build_index(const File& f, TermTable& terms, std::vector<u32>& query_terms
             const u32 first = ix.first[t] = begin < end ? parse_id(begin) : 0;
             auto& cnt = count[t];
             cnt.assign(nterms, 0);
-            std::vector<u32> last_doc(nterms, NONE);
+            u32* last_doc = scratch + t * nterms;
+            std::fill(last_doc, last_doc + nterms, NONE);
 
             u32 doc = first;
             for (const uint8_t* p = begin; p < end; ++doc) {
@@ -385,7 +389,7 @@ Index build_index(const File& f, TermTable& terms, std::vector<u32>& query_terms
 
             sync.arrive_and_wait();
 
-            std::fill(last_doc.begin(), last_doc.end(), NONE);
+            std::fill(last_doc, last_doc + nterms, NONE);
             doc = first;
             for (const uint8_t* p = begin; p < end; ++doc) {
                 const uint8_t* nl = base + ix.text[2 * size_t(doc) + 1];
@@ -406,6 +410,7 @@ Index build_index(const File& f, TermTable& terms, std::vector<u32>& query_terms
         });
     }
     for (auto& th : pool) th.join();
+    munmap(scratch, scratch_bytes);
 
     madvise(const_cast<uint8_t*>(base), size, MADV_DONTNEED);
     malloc_trim(0);
@@ -709,6 +714,7 @@ int main() {
     prctl(PR_SET_THP_DISABLE, 1, 0, 0, 0);
     // Large blocks always come from mmap and go back to the kernel when freed
     // (glibc otherwise raises this threshold after the first free and keeps them).
+    mallopt(M_ARENA_MAX, 1);
     mallopt(M_MMAP_THRESHOLD, 1 << 16);
     const int nthreads = std::max(1u, std::min(12u, std::thread::hardware_concurrency()));
     File qf = map_file("/data/queries.txt");
