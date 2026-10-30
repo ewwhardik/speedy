@@ -380,6 +380,69 @@ fn parse_records_chunk(
     }
 }
 
+#[cfg(target_os = "linux")]
+struct MmapBuf {
+    ptr: *const u8,
+    len: usize,
+}
+
+#[cfg(target_os = "linux")]
+unsafe impl Send for MmapBuf {}
+#[cfg(target_os = "linux")]
+unsafe impl Sync for MmapBuf {}
+
+#[cfg(target_os = "linux")]
+impl std::ops::Deref for MmapBuf {
+    type Target = [u8];
+    #[inline(always)]
+    fn deref(&self) -> &[u8] {
+        if self.len == 0 {
+            &[]
+        } else {
+            unsafe { std::slice::from_raw_parts(self.ptr, self.len) }
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn map_file(path: &Path) -> Result<MmapBuf, std::io::Error> {
+    use std::os::unix::io::AsRawFd;
+    let f = File::open(path)?;
+    let len = f.metadata()?.len() as usize;
+    if len == 0 {
+        return Ok(MmapBuf {
+            ptr: std::ptr::null(),
+            len: 0,
+        });
+    }
+    let fd = f.as_raw_fd();
+    let mut addr: *mut u8;
+    unsafe {
+        core::arch::asm!(
+            "syscall",
+            in("rax") 9usize,
+            in("rdi") 0usize,
+            in("rsi") len,
+            in("rdx") 1usize,
+            in("r10") 2usize,
+            in("r8") fd as usize,
+            in("r9") 0usize,
+            lateout("rax") addr,
+            lateout("rcx") _,
+            lateout("r11") _,
+        );
+    }
+    if (addr as isize) < 0 && (addr as isize) >= -4095 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(MmapBuf { ptr: addr, len })
+}
+
+#[cfg(not(target_os = "linux"))]
+fn map_file(path: &Path) -> Result<Vec<u8>, std::io::Error> {
+    std::fs::read(path)
+}
+
 fn main() {
     let mut data_dir = PathBuf::from("/data");
     let mut out_dir = PathBuf::from("/out");
@@ -419,7 +482,7 @@ fn main() {
     let t_regions = std::time::Instant::now();
 
     // 2. Read records.csv into memory
-    let buf = std::fs::read(&records_path).unwrap_or_else(|e| {
+    let buf = map_file(&records_path).unwrap_or_else(|e| {
         eprintln!("Failed to read records file {:?}: {}", records_path, e);
         std::process::exit(1);
     });
