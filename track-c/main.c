@@ -17,10 +17,10 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/mman.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
-#define BUFSZ (1 << 16) // read buffer per thread; a record is far smaller
 #define MAPN 1000000   // region ids at or above this are unmatched
 #define MAXG 256        // groups: _UNMATCHED (0) plus the countries (240 in the spec)
 #define IDBITS 24       // name ids per table slot; the table never exceeds 2^24 slots
@@ -38,13 +38,14 @@ typedef struct {
 } Name;                   // 64 bytes, one cache line
 typedef struct {
   long beg, end;
-  char *buf, *tmp;
+  char tmp[512];
   uint64_t distinct[MAXG];
   Agg agg[MAXG];
 } Th;
 
 static int fd, nth, ngroups, overflow;
 static Th *th;
+static const char *rec_data;
 static uint8_t *region; // region id -> group, 0 = _UNMATCHED
 static char codes[MAXG][12]; // "XYZ" or "_UNMATCHED"
 // Name table slot: 0 empty, 1 being written, else hash bits above IDBITS | id.
@@ -216,27 +217,14 @@ static void *parse(void *arg) {
   Th *t = arg;
   for (int g = 0; g < ngroups; g++)
     t->agg[g] = (Agg){0, 0, 0, 0, 0, INT64_MAX, INT64_MIN};
-  size_t have = 0;
-  for (long off = t->beg;;) {
-    long want = t->end - off < (long)(BUFSZ - have) ? t->end - off : (long)(BUFSZ - have);
-    if (want > 0) {
-      ssize_t n = pread(fd, t->buf + have, want, off);
-      if (n <= 0)
-        die("read failed");
-      off += n;
-      have += n;
-    }
-    int eof = off >= t->end;
-    const char *p = t->buf, *end = t->buf + have, *q;
-    while (p < end && (q = record(t, p, end, eof)))
-      p = q;
-    if (p < end && (eof || (p == t->buf && have == BUFSZ)))
+  const char *p = rec_data + t->beg, *end = rec_data + t->end;
+  while (p < end) {
+    const char *q = record(t, p, end, p == end);
+    if (!q)
       die("malformed records.csv");
-    have = end - p;
-    memmove(t->buf, p, have);
-    if (eof)
-      return NULL;
+    p = q;
   }
+  return NULL;
 }
 
 static void run_threads(void *(*f)(void *)) {
@@ -305,11 +293,15 @@ int main(void) {
   if (fd < 0 || fstat(fd, &st))
     die("cannot open /data/records.csv");
   long size = st.st_size, body = 0;
+  rec_data = mmap(NULL, size, PROT_READ, MAP_SHARED, fd, 0);
+  if (rec_data == MAP_FAILED)
+    die("mmap failed");
   { // skip the BOM and the header line
-    char c[64];
-    ssize_t n = pread(fd, c, sizeof c, 0);
-    char *nl = n > 0 ? memchr(c, '\n', n) : NULL;
-    body = nl ? nl - c + 1 : size;
+    const char *cp = rec_data;
+    if (size >= 3 && (uint8_t)cp[0] == 0xEF && (uint8_t)cp[1] == 0xBB && (uint8_t)cp[2] == 0xBF)
+      cp += 3;
+    const char *nl = memchr(cp, '\n', size - (cp - rec_data));
+    body = nl ? nl - rec_data + 1 : size;
   }
   cpu_set_t cpus; // the CPUs this container may use, not the host's count
   nth = sched_getaffinity(0, sizeof cpus, &cpus) ? 1 : CPU_COUNT(&cpus);
@@ -320,27 +312,15 @@ int main(void) {
   th[0].beg = body;
   for (int i = 1; i < nth; i++) {
     long pos = body + (size - body) * i / nth;
-    for (;;) {
-      unsigned char c[4096];
-      ssize_t n = pread(fd, c, sizeof c, pos), k = 0;
-      if (n <= 1) {
-        pos = size;
+    while (pos < size) {
+      if (rec_data[pos - 1] == '\n' && ((rec_data[pos] >= '0' && rec_data[pos] <= '9') || (uint8_t)rec_data[pos] == 0xEF))
         break;
-      }
-      while (k + 1 < n && !(c[k] == '\n' && ((c[k + 1] >= '0' && c[k + 1] <= '9') || c[k + 1] == 0xEF)))
-        k++;
-      pos += k + 1;
-      if (k + 1 < n)
-        break;
-      pos--; // re-read the last byte: it may be an LF whose follower is in the next window
+      pos++;
     }
-    th[i].beg = pos < th[i - 1].beg ? th[i - 1].beg : pos;
+    th[i].beg = pos;
+    th[i - 1].end = pos;
   }
-  for (int i = 0; i < nth; i++) {
-    th[i].end = i + 1 < nth ? th[i + 1].beg : size;
-    th[i].buf = malloc(BUFSZ + 64);
-    th[i].tmp = malloc(BUFSZ + 64);
-  }
+  th[nth - 1].end = size;
 
   if (size > UINT32_MAX)
     die("records.csv over 4 GB"); // arena offsets are 32-bit
@@ -356,12 +336,9 @@ int main(void) {
       break;
     free(slots);
   }
+  munmap((void *)rec_data, size);
   close(fd);
   free(region);
-  for (int i = 0; i < nth; i++) {
-    free(th[i].buf);
-    free(th[i].tmp);
-  }
   run_threads(count_names);
   free(names);
   free(arena);

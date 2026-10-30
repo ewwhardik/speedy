@@ -284,6 +284,36 @@ int main(void) {
   for (int i = 0; i < nth; i++)
     free(th[i].buf);
 
+  // Renumber the nodes in breadth-first order, so that nodes near each other in
+  // the network are near each other in memory (the input ids are shuffled).
+  uint32_t *order = malloc(n * 4ull), *perm = malloc(n * 4ull), tail = 0;
+  memset(perm, 0xff, n * 4ull);
+  for (uint32_t r = 0; r < n; r++) {
+    if (perm[r] != INF32)
+      continue;
+    perm[r] = tail, order[tail++] = r;
+    for (uint32_t h = tail - 1; h < tail; h++)
+      for (uint32_t e = off[order[h]]; e < off[order[h] + 1]; e++)
+        if (perm[edges[e].v] == INF32)
+          perm[edges[e].v] = tail, order[tail++] = edges[e].v;
+  }
+  uint32_t *off2 = malloc((n + 2) * 4ull);
+  Edge *edges2 = malloc((off[n] + 1ull) * sizeof(Edge));
+  off2[0] = 0;
+  for (uint32_t i = 0; i < n; i++) {
+    uint32_t u = order[i], k = off2[i];
+    for (uint32_t e = off[u]; e < off[u + 1]; e++)
+      edges2[k++] = (Edge){perm[edges[e].v], edges[e].w};
+    off2[i + 1] = k;
+  }
+  uint8_t *has_in2 = calloc(n + 1, 1);
+  for (uint32_t i = 0; i < n; i++)
+    has_in2[i] = has_in[order[i]];
+  free(edges), free(off), free(has_in), free(order);
+  edges = edges2, off = off2, has_in = has_in2;
+  for (uint32_t i = 0; i < nq; i++)
+    qs[i] = perm[qs[i]], qt[i] = perm[qt[i]];
+  free(perm);
   malloc_trim(0);
 
   ans = malloc((nq + 1) * sizeof *ans);
