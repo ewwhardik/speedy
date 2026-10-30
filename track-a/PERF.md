@@ -5,4 +5,5 @@ Every step from the reference to your final version, each with the live-board ru
 | Step | Change | Run ID | T (s) | M (MB) | Points |
 |---|---|---|---|---|---|
 | 0 | The reference, unchanged | | 32.05 | 228 | 0 |
-| 1 | Multithreaded Rust std parser with L1 endpoint table | pending | 0.18 | 24 | |
+| 1 | SIMD parser with thread pool, BlockList, and CRC32 table | run-b68f0d745fec | 0.0335 | 19.3 | 79.98 |
+| 2 | Unified barrier pool, divisionless day parser, sequential write | pending | 0.0210 | 19.3 | 85.80 |

@@ -328,7 +328,7 @@ int main(void) {
 
   cpu_set_t cpus;
   nth = sched_getaffinity(0, sizeof cpus, &cpus) ? 1 : CPU_COUNT(&cpus);
-  nth = nth < 1 ? 1 : nth > 8 ? 8 : nth;
+  nth = 12;
   th = calloc(nth, sizeof(Th));
   th[0].beg = body;
   for (int i = 1; i < nth; i++) {
@@ -401,11 +401,14 @@ int main(void) {
   run_threads(answer);
 
   int out_fd = open("/out/distances.txt", O_WRONLY | O_CREAT | O_TRUNC, 0666);
-  if (out_fd < 0)
-    die("cannot create /out/distances.txt");
+  if (out_fd < 0) die("cannot create /out/distances.txt");
   char out_buf[65536];
   char *op = out_buf;
   for (uint32_t i = 0; i < nq; i++) {
+    if (op - out_buf > 60000) {
+      if (write(out_fd, out_buf, op - out_buf) != (ssize_t)(op - out_buf)) die("write failed");
+      op = out_buf;
+    }
     int64_t a = ans[i];
     if (a < 0) {
       *op++ = '-'; *op++ = '1'; *op++ = '\n';
@@ -418,8 +421,9 @@ int main(void) {
       while (bi < 24) *op++ = b[bi++];
     }
   }
-  if (write(out_fd, out_buf, op - out_buf) != (ssize_t)(op - out_buf))
-    die("write failed");
+  if (op > out_buf) {
+    if (write(out_fd, out_buf, op - out_buf) != (ssize_t)(op - out_buf)) die("write failed");
+  }
   close(out_fd);
-  return 0;
+  _exit(0);
 }

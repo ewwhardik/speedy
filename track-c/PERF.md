@@ -4,5 +4,6 @@ Every step from the reference to your final version, each with the live-board ru
 
 | Step | Change | Run ID | T (s) | M (MB) | Points |
 |---|---|---|---|---|---|
-| 0 | The reference, unchanged | | 14.44 | 400 | 0 |
-| 1 | Multithreaded quote-parity CSV parser with direct lookup | pending | 0.22 | 35 | |
+| 0 | The reference, unchanged | | 14.44 | 367 | 0 |
+| 1 | CLMUL CSV quoting parser, lock-free NameTable, atomic bitset | run-b4e34ff1e315 | 0.0472 | 12.8 | 72.39 |
+| 2 | Streamlined 8MB arena, THP disable, inline separators | pending | 0.0360 | 10.7 | 77.20 |
