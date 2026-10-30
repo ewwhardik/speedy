@@ -4,6 +4,7 @@
 #include <charconv>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <fcntl.h>
 #include <immintrin.h>
@@ -12,6 +13,7 @@
 #include <sys/prctl.h>
 #include <thread>
 #include <unistd.h>
+#include <utility>
 #include <vector>
 
 using u32 = uint32_t;
@@ -42,7 +44,8 @@ inline u32 parse_digits(const char* end, u32 len) {
         for (const char* p = end - len; p < end; ++p) v = v * 10 + (*p - '0');
         return v;
     }
-    u64 v = load8(end - 8) & 0x0F0F0F0F0F0F0F0F & ~u64(0) << 8 * (8 - len);
+    u64 mask = (len == 8) ? ~0ull : (~0ull << (8 * (8 - len)));
+    u64 v = load8(end - 8) & 0x0F0F0F0F0F0F0F0F & mask;
     v = (v * 10 + (v >> 8)) & 0x00FF00FF00FF00FF;
     v = (v * 100 + (v >> 16)) & 0x0000FFFF0000FFFF;
     return (v * 10000 + (v >> 32)) & 0xFFFFFFFF;
@@ -94,12 +97,37 @@ struct Worker {
             int hour = (p[11] - '0') * 10 + (p[12] - '0');
             int h = day_idx * 24 + hour - 18;
 
-            const char* m = p + 28;
-            u64 sp = match32(m, ' ') | u64(match32(m + 32, ' ')) << 32;
-            u64 nl = match32(m, '\n') | u64(match32(m + 32, '\n')) << 32;
-            const char* ep = m + __builtin_ctzll(sp) + 1;
-            const char* ee = nl ? m + __builtin_ctzll(sp & (sp - 1)) : find(ep, ' ');
-            const char* eol = nl ? m + __builtin_ctzll(nl) : find(ee + 5, '\n');
+            const char* ep;
+            switch (p[28]) {
+                case 'G': ep = p + 32; break;
+                case 'P': ep = p + (p[29] == 'O' ? 33 : (p[29] == 'U' ? 32 : 34)); break;
+                case 'H': ep = p + 33; break;
+                case 'D': ep = p + 35; break;
+                case 'O': ep = p + 36; break;
+                default: {
+                    ep = p + 28;
+                    while (*ep != ' ') ++ep;
+                    ++ep;
+                    break;
+                }
+            }
+
+            u32 sp_mask = match32(ep, ' ');
+            const char* ee;
+            const char* eol;
+            if (__builtin_expect(sp_mask != 0, 1)) {
+                ee = ep + __builtin_ctz(sp_mask);
+                u32 nl_mask = match32(ee + 5, '\n');
+                if (__builtin_expect(nl_mask != 0, 1)) {
+                    eol = ee + 5 + __builtin_ctz(nl_mask);
+                } else {
+                    eol = find(ee + 5, '\n');
+                }
+            } else {
+                ee = find(ep + 32, ' ');
+                eol = find(ee + 5, '\n');
+            }
+
             const u32 key = endpoints.intern(ep, ee - ep) | (ee[1] == '5' ? ERR_BIT : 0);
             const u32 lat = parse_digits(eol, eol - ee - 5);
             p = eol + 1;
@@ -195,7 +223,7 @@ int main() {
                 cursor.assign(count.begin(), count.end() - 1);
                 lat.resize(count[ne]);
                 for (int wt = 0; wt < nthreads; ++wt) {
-                    for (Block* b = workers[wt].head[h]; b; madvise(std::exchange(b, b->next), sizeof(Block), MADV_DONTNEED))
+                    for (Block* b = workers[wt].head[h]; b; b = b->next)
                         for (u32 i = 0; i < b->n; ++i)
                             lat[cursor[rank[wt][b->rec[i] & ID_MASK]]++] = b->rec[i] >> KEY_BITS;
                     for (auto [l, key] : workers[wt].big[h])
@@ -217,7 +245,7 @@ int main() {
                         if (a[0] > a[1]) std::swap(a[0], a[1]);
                         v[1] = a[0];
                         v[2] = v[3] = a[1];
-                    } else if (n <= 128) {
+                    } else if (n <= 256) {
                         std::sort(a, a + n);
                         v[1] = a[(50u * n + 99) / 100 - 1];
                         v[2] = a[(95u * n + 99) / 100 - 1];

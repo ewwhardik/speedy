@@ -249,76 +249,6 @@ struct Index {
     std::vector<u32> text;             // per doc: offset of its text, then of its end (2 per doc)
 };
 
-class BlockList {
-public:
-    struct Block {
-        Block* next;
-        size_t cap;
-        size_t n;
-        uint8_t data[];
-    };
-
-    BlockList() = default;
-    BlockList(const BlockList&) = delete;
-    BlockList& operator=(const BlockList&) = delete;
-    BlockList(BlockList&& o) noexcept : head_(o.head_), tail_(o.tail_), cur_(o.cur_) {
-        o.head_ = o.tail_ = o.cur_ = nullptr;
-    }
-    BlockList& operator=(BlockList&& o) noexcept {
-        if (this != &o) {
-            this->~BlockList();
-            head_ = o.head_; tail_ = o.tail_; cur_ = o.cur_;
-            o.head_ = o.tail_ = o.cur_ = nullptr;
-        }
-        return *this;
-    }
-    ~BlockList() {
-        for (Block* b = head_; b;) {
-            Block* next = b->next;
-            munmap(b, sizeof(Block) + 3 * b->cap + 1);
-            b = next;
-        }
-    }
-
-    void push(u32 x) {
-        if (!cur_ || cur_->n == cur_->cap) {
-            size_t next_cap = cur_ ? std::min<size_t>(cur_->cap * 4, 16384) : 512;
-            size_t bytes = sizeof(Block) + 3 * next_cap + 1;
-            auto* b = static_cast<Block*>(mmap(nullptr, bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0));
-            b->next = nullptr;
-            b->cap = next_cap;
-            b->n = 0;
-            if (!head_) head_ = b;
-            else tail_->next = b;
-            tail_ = b;
-            cur_ = b;
-        }
-        memcpy(cur_->data + 3 * cur_->n++, &x, 4);
-    }
-
-    template <class F>
-    void drain(F&& f) {
-        for (Block* b = head_; b;) {
-            for (size_t i = 0; i < b->n; ++i) {
-                u32 x;
-                memcpy(&x, b->data + 3 * i, 4);
-                f(x & 0xFFFFFF);
-            }
-            Block* next = b->next;
-            munmap(b, sizeof(Block) + 3 * b->cap + 1);
-            b = next;
-        }
-        head_ = tail_ = cur_ = nullptr;
-    }
-
-private:
-    Block* head_ = nullptr;
-    Block* tail_ = nullptr;
-    Block* cur_ = nullptr;
-};
-
-constexpr u32 BUCKET_BITS = 9, DOC_BITS = 15;
-
 u32 parse_id(const uint8_t* p) {
     u32 v = 0;
     while (*p >= '0' && *p <= '9') v = v * 10 + (*p++ - '0');
@@ -340,7 +270,6 @@ Index build_index(const File& f, TermTable& terms, std::vector<u32>& query_terms
     ix.text.resize(2 * size_t(ix.docs));
     ix.words = (ix.docs + 63) / 64;
     ix.dense.assign(nterms, NONE);
-    const u32 nbuckets = (nterms >> BUCKET_BITS) + 1;
 
     std::vector<size_t> cut(nthreads + 1);
     for (int t = 0; t <= nthreads; ++t) {
@@ -348,12 +277,11 @@ Index build_index(const File& f, TermTable& terms, std::vector<u32>& query_terms
         while (c > 0 && c < size && base[c - 1] != '\n') ++c;
         cut[t] = c;
     }
-    std::vector<std::vector<BlockList>> seen(nthreads);
+
     std::vector<std::vector<u32>> count(nthreads);
-    std::vector<u32> sampled(nthreads);
+    std::vector<std::vector<u32>> thread_start(nthreads);
     std::barrier sync(nthreads, [&]() noexcept {
-        u64 docs = 0;
-        for (u32 s : sampled) docs += s;
+        u64 total_docs = ix.docs;
         std::vector<u64> df(nterms);
         std::vector<u32> order(nterms), new_id(nterms);
         for (u32 id = 0; id < nterms; ++id) {
@@ -364,12 +292,29 @@ Index build_index(const File& f, TermTable& terms, std::vector<u32>& query_terms
         u32 ndense = 0;
         for (u32 rank = 0; rank < nterms; ++rank) {
             new_id[order[rank]] = rank;
-            if (df[order[rank]] * 32 > docs) ix.dense[rank] = ndense++;
+            if (df[order[rank]] * 32 > total_docs) ix.dense[rank] = ndense++;
         }
         terms.renumber(new_id);
         for (u32& id : query_terms) id = new_id[id];
         ix.bits.assign(ndense * ix.words, 0);
+
+        ix.start.resize(nterms + 1);
+        u32 total = 0;
+        for (int t = 0; t < nthreads; ++t) thread_start[t].resize(nterms);
+        for (u32 rank = 0; rank < nterms; ++rank) {
+            ix.start[rank] = total;
+            u32 old_id = order[rank];
+            if (ix.dense[rank] == NONE) {
+                for (int t = 0; t < nthreads; ++t) {
+                    thread_start[t][rank] = total;
+                    total += count[t][old_id];
+                }
+            }
+        }
+        ix.start[nterms] = total;
+        ix.post.reset(new uint16_t[total]);
     });
+
     std::vector<std::thread> pool;
     for (int t = 0; t < nthreads; ++t) {
         pool.emplace_back([&, t] {
@@ -380,76 +325,54 @@ Index build_index(const File& f, TermTable& terms, std::vector<u32>& query_terms
             cnt.assign(nterms, 0);
             std::vector<u32> last_doc(nterms, NONE);
 
-            auto walk = [&](const uint8_t* stop, auto&& term, auto&& done) {
-                u32 doc = first;
-                for (const uint8_t* p = begin; p < stop; ++doc) {
-                    const uint8_t* nl = static_cast<const uint8_t*>(memchr(p, '\n', end - p));
-                    const uint8_t* tx = static_cast<const uint8_t*>(memchr(p, '\t', nl - p)) + 1;
-                    ix.text[2 * size_t(doc)] = tx - base;
-                    ix.text[2 * size_t(doc) + 1] = nl - base;
-                    for_each_token(tx, nl, terms, [&](u32 id) {
-                        if (id != NONE && last_doc[id] != doc) last_doc[id] = doc, term(id, doc);
-                    });
-                    done();
-                    p = nl + 1;
-                }
-                return doc - first;
-            };
-
-            sampled[t] = walk(begin + (end - begin) / 32, [&](u32 id, u32) { ++cnt[id]; }, [] {});
-            sync.arrive_and_wait();
-            std::fill(cnt.begin(), cnt.end(), 0);
-            std::fill(last_doc.begin(), last_doc.end(), NONE);
-            auto& out = seen[t];
-            out.resize(nbuckets);
-            const u32 docs = walk(end, [&](u32 id, u32 doc) {
-                if (u32 d = ix.dense[id]; d != NONE) {
-                    std::atomic_ref<u64>(ix.bits[d * ix.words + doc / 64])
-                        .fetch_or(1ull << (doc % 64), std::memory_order_relaxed);
-                } else {
-                    out[id >> BUCKET_BITS].push((id & ((1u << BUCKET_BITS) - 1)) << DOC_BITS | (doc - first));
-                    ++cnt[id];
-                }
-            }, [] {});
-            if (docs >> DOC_BITS) { fputs("too many documents per thread\n", stderr); _exit(1); }
-        });
-    }
-    for (auto& th : pool) th.join();
-    pool.clear();
-
-    ix.start.resize(nterms + 1);
-    u32 total = 0;
-    for (u32 id = 0; id < nterms; ++id) {
-        ix.start[id] = total;
-        for (int t = 0; t < nthreads; ++t) {
-            u32 c = count[t][id];
-            count[t][id] = total;
-            total += c;
-        }
-    }
-    ix.start[nterms] = total;
-    ix.post.reset(new uint16_t[total]);  // not zeroed: every slot is written below
-    for (int t = 0; t < nthreads; ++t) {
-        pool.emplace_back([&, t] {
-            for (u32 b = 0; b < nbuckets; ++b)
-                seen[t][b].drain([&](u32 x) {
-                    u32 id = b << BUCKET_BITS | x >> DOC_BITS;
-                    ix.post[count[t][id]++] = x & ((1u << DOC_BITS) - 1);
+            u32 doc = first;
+            for (const uint8_t* p = begin; p < end; ++doc) {
+                const uint8_t* nl = static_cast<const uint8_t*>(memchr(p, '\n', end - p));
+                const uint8_t* tx = static_cast<const uint8_t*>(memchr(p, '\t', nl - p)) + 1;
+                ix.text[2 * size_t(doc)] = tx - base;
+                ix.text[2 * size_t(doc) + 1] = nl - base;
+                for_each_token(tx, nl, terms, [&](u32 id) {
+                    if (id != NONE && last_doc[id] != doc) {
+                        last_doc[id] = doc;
+                        ++cnt[id];
+                    }
                 });
+                p = nl + 1;
+            }
+
+            sync.arrive_and_wait();
+
+            std::fill(last_doc.begin(), last_doc.end(), NONE);
+            auto& offsets = thread_start[t];
+            doc = first;
+            for (const uint8_t* p = begin; p < end; ++doc) {
+                const uint8_t* tx = base + ix.text[2 * size_t(doc)];
+                const uint8_t* nl = base + ix.text[2 * size_t(doc) + 1];
+                for_each_token(tx, nl, terms, [&](u32 id) {
+                    if (id != NONE && last_doc[id] != doc) {
+                        last_doc[id] = doc;
+                        if (u32 d = ix.dense[id]; d != NONE) {
+                            std::atomic_ref<u64>(ix.bits[d * ix.words + doc / 64])
+                                .fetch_or(1ull << (doc % 64), std::memory_order_relaxed);
+                        } else {
+                            ix.post[offsets[id]++] = doc - first;
+                        }
+                    }
+                });
+                p = nl + 1;
+            }
         });
     }
     for (auto& th : pool) th.join();
-    seen.clear();
-    seen.shrink_to_fit();
-    malloc_trim(0);
-    ix.seg_end = std::move(count);
 
+    ix.seg_end = std::move(thread_start);
     ix.df.resize(nterms);
     for (u32 id = 0; id < nterms; ++id) {
         ix.df[id] = ix.start[id + 1] - ix.start[id];
-        if (ix.dense[id] != NONE)
+        if (ix.dense[id] != NONE) {
             for (size_t w = 0; w < ix.words; ++w)
                 ix.df[id] += __builtin_popcountll(ix.bits[ix.dense[id] * ix.words + w]);
+        }
     }
     return ix;
 }

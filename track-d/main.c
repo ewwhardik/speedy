@@ -289,7 +289,6 @@ static void run_threads(void *(*f)(void *)) {
 
 int main(void) {
   prctl(PR_SET_THP_DISABLE, 1, 0, 0, 0);
-  mallopt(M_MMAP_THRESHOLD, 1 << 16);
 
   FILE *qf = fopen("/data/queries.txt", "r");
   if (!qf)
