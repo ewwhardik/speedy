@@ -46,7 +46,7 @@ impl Default for ThreadAcc {
 /// 128-bit dual hash function for distinct name strings.
 /// Combines 64-bit FNV-1a with a 64-bit Murmur/Wyhash mixer for 0-collision guarantee.
 #[inline(always)]
-fn hash_name(bytes: &[u8]) -> u128 {
+fn hash_name(bytes: &[u8]) -> (u64, u64) {
     let mut h1: u64 = 0xcbf29ce484222325;
     for &b in bytes {
         h1 = (h1 ^ (b as u64)).wrapping_mul(0x100000001b3);
@@ -61,7 +61,7 @@ fn hash_name(bytes: &[u8]) -> u128 {
     h2 = h2.wrapping_mul(0xff51afd7ed558ccd);
     h2 ^= h2 >> 33;
 
-    ((h1 as u128) << 64) | (h2 as u128)
+    (h1, h2)
 }
 
 fn write_u64(out: &mut Vec<u8>, mut n: u64) {
