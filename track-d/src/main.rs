@@ -561,10 +561,11 @@ fn main() {
     };
     let t_csr = t3.elapsed();
 
-    // Phase 3: Parallel query execution
+    // Phase 3: Parallel query execution (use 3 threads to bound peak memory to ~125 MB)
     let t4 = std::time::Instant::now();
     let mut answers = vec![0i64; queries.len()];
-    let queries_per_thread = (queries.len() + num_threads - 1) / num_threads;
+    let query_workers = 3.min(num_threads);
+    let queries_per_thread = (queries.len() + query_workers - 1) / query_workers;
 
     thread::scope(|s| {
         let g = &graph;
