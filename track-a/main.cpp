@@ -1,26 +1,13 @@
-// Speed Demon 2026, Track A (Ingest).
-//
-// The log is memory-mapped and split into line-aligned ranges, one per thread.
-// Each thread parses its range with fixed byte offsets (the timestamp is always
-// 27 bytes and the 72-hour span is fixed, so the hour index comes straight from
-// the day and hour digits), interns endpoints in a small private hash table and
-// files (latency, endpoint, 5xx flag) into a block list for that hour. The
-// private endpoint tables are merged and sorted once, so an endpoint's global id
-// is its rank in byte order. Then every hour is finished on its own: a counting
-// sort by endpoint rank lays its ~43k latencies out in L2-sized scratch, three
-// nth_element calls per group give the percentiles, and the lines are formatted
-// in output order. A writer thread writes each hour as soon as it is done.
 #include <algorithm>
 #include <atomic>
-#include <charconv>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <fcntl.h>
 #include <immintrin.h>
+#include <malloc.h>
 #include <string>
 #include <string_view>
-#include <malloc.h>
 #include <sys/mman.h>
 #include <sys/prctl.h>
 #include <thread>
@@ -31,59 +18,50 @@
 using u32 = uint32_t;
 using u64 = uint64_t;
 
-constexpr int HOURS = 72;          // 2026-10-30T18:00Z to 2026-11-02T17:59:59Z
-// A record is one u32: the latency above a 12-bit key (11-bit local endpoint
-// id, then the 5xx flag). Latencies of 2^20 us or more (about 1% of lines)
-// do not fit and go to a side list with their key.
+constexpr int HOURS = 72;
 constexpr u32 KEY_BITS = 12, ID_MASK = (1u << 11) - 1, ERR_BIT = 1u << 11, BIG = 1u << 20;
 
-u64 load8(const char* p) {
+inline u64 load8(const char* p) {
     u64 v;
     memcpy(&v, p, 8);
     return v;
 }
 
-// Bit i is set when byte i of the 32 at p equals c.
-u32 match32(const char* p, char c) {
+inline u32 match32(const char* p, char c) {
     __m256i v = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(p));
     return _mm256_movemask_epi8(_mm256_cmpeq_epi8(v, _mm256_set1_epi8(c)));
 }
 
-// The first byte c at or after s (one is known to follow).
-const char* find(const char* s, char c) {
+inline const char* find(const char* s, char c) {
     for (;; s += 32)
         if (u32 m = match32(s, c)) return s + __builtin_ctz(m);
 }
 
-// The value of the len (1 to 10) decimal digits that end just before end,
-// without a loop: the 16 bytes before end, minus '0', with the bytes ahead of
-// the number zeroed, are folded 2, 4 and 8 digits at a time.
-u32 parse_digits(const char* end, u32 len) {
-    __m128i v = _mm_loadu_si128(reinterpret_cast<const __m128i*>(end - 16));
-    v = _mm_subs_epu8(v, _mm_set1_epi8('0'));
-    __m128i lane = _mm_setr_epi8(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15);
-    v = _mm_and_si128(v, _mm_cmpgt_epi8(lane, _mm_set1_epi8(char(15 - len))));
-    v = _mm_maddubs_epi16(v, _mm_set1_epi16(0x010A));  // byte pairs (10, 1)
-    v = _mm_madd_epi16(v, _mm_set1_epi32(0x00010064));  // word pairs (100, 1)
-    v = _mm_packus_epi32(v, v);
-    v = _mm_madd_epi16(v, _mm_set1_epi32(0x00012710));  // word pairs (10000, 1)
-    u64 high = u32(_mm_cvtsi128_si32(v)), low = u32(_mm_extract_epi32(v, 1));
-    return u32(high * 100000000 + low);
+inline u32 parse_digits(const char* end, u32 len) {
+    const char* s = end - len;
+    u32 v = 0;
+    while (s < end) v = v * 10 + (*s++ - '0');
+    return v;
 }
 
-// Endpoint interning: open addressing on a CRC of the endpoint's first and last
-// eight bytes (masked to the endpoint when it is shorter; the line around it
-// keeps both loads in bounds). Ids follow first sight; names point into the log.
+inline char* write_u32(char* p, u32 x) {
+    char b[10];
+    int i = 10;
+    do { b[--i] = '0' + (x % 10); x /= 10; } while (x);
+    while (i < 10) *p++ = b[i++];
+    return p;
+}
+
 class EndpointTable {
 public:
-    static constexpr u32 SLOTS = 1 << 12, MAX = SLOTS / 2;  // ids fit 11 bits; a seed has 1,842
+    static constexpr u32 SLOTS = 1 << 12, MAX = SLOTS / 2;
     std::vector<std::string_view> names;
 
     u32 intern(const char* s, u32 len) {
         u64 a = load8(s), b = len >= 8 ? load8(s + len - 8) : 0;
         if (len < 8) a &= (u64(1) << 8 * len) - 1;
         for (u32 i = _mm_crc32_u64(_mm_crc32_u64(len, a), b);; ++i) {
-            u32& slot = slots_[i % SLOTS];
+            u32& slot = slots_[i & (SLOTS - 1)];
             if (slot == 0) {
                 if (names.size() == MAX) { fputs("too many endpoints\n", stderr); _exit(1); }
                 names.emplace_back(s, len);
@@ -95,14 +73,9 @@ public:
     }
 
 private:
-    std::vector<u32> slots_ = std::vector<u32>(SLOTS);  // id + 1, 0 when empty
+    std::vector<u32> slots_ = std::vector<u32>(SLOTS);
 };
 
-// A chunk of one hour's records from one thread, 16 KB. Each thread carves
-// its blocks from one region it maps up front, and an hour's blocks are given
-// back to the kernel (MADV_DONTNEED) as soon as the hour is done: malloc
-// would keep freed blocks resident, and an mmap per block would serialise the
-// threads on the address-space lock.
 struct Block {
     static constexpr u32 CAP = (16384 - 16) / 4;
     Block* next;
@@ -113,25 +86,18 @@ struct Block {
 struct Worker {
     EndpointTable endpoints;
     Block* head[HOURS] = {};
-    std::vector<std::pair<u32, u32>> big[HOURS];  // (latency, key) of the long ones
-
+    std::vector<std::pair<u32, u32>> big[HOURS];
     char* region = nullptr;
     size_t used = 0;
 
     void parse(const char* p, const char* end) {
-        // A line is at least 40 bytes; each hour may leave one block part full.
         const size_t reserve = ((end - p) / 40 / Block::CAP + 1 + HOURS) * sizeof(Block);
         region = static_cast<char*>(mmap(nullptr, reserve, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0));
         while (p < end) {
-            // YYYY-MM-DDTHH: month digit at 6, day at 8-9, hour at 11-12. The
-            // day index counts Oct 30, Oct 31, Nov 1, Nov 2.
             int day = (p[8] - '0') * 10 + p[9] - '0';
             int hour = (p[11] - '0') * 10 + p[12] - '0';
             int h = (p[6] == '0' ? day - 30 : day + 1) * 24 + hour - 18;
 
-            // One scan of the 64 bytes after the timestamp finds the end of the
-            // method and, for all but the longest lines, the end of the endpoint
-            // and of the line. The first space always lies inside the window.
             const char* m = p + 28;
             u64 sp = match32(m, ' ') | u64(match32(m + 32, ' ')) << 32;
             u64 nl = match32(m, '\n') | u64(match32(m + 32, '\n')) << 32;
@@ -157,9 +123,8 @@ struct Worker {
     }
 };
 
-// "YYYY-MM-DDTHH:00:00Z " for hour index h, plus a terminating zero.
 void hour_label(int h, char* o) {
-    int day = (h + 18) / 24;  // Oct 30, Oct 31, Nov 1, Nov 2
+    int day = (h + 18) / 24;
     sprintf(o, "2026-%02d-%02dT%02d:00:00Z ", day < 2 ? 10 : 11,
             day < 2 ? 30 + day : day - 1, (h + 18) % 24);
 }
@@ -179,7 +144,6 @@ int main() {
     FILE* out = fopen("/out/summary.txt", "wb");
     if (fd < 0 || !out) { perror("open"); return 1; }
 
-    // Map the log over a spare zero page, so the 64-byte scans stay in bounds.
     size_t size = lseek(fd, 0, SEEK_END);
     auto* data = static_cast<char*>(
         mmap(nullptr, size + 4096, PROT_READ, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0));
@@ -188,7 +152,6 @@ int main() {
         return 1;
     }
 
-    // Line-aligned ranges, one per thread.
     std::vector<size_t> cut(nthreads + 1, size);
     cut[0] = 0;
     for (int t = 1; t < nthreads; ++t) {
@@ -198,8 +161,6 @@ int main() {
     std::vector<Worker> workers(nthreads);
     run_threads(nthreads, [&](int t) { workers[t].parse(data + cut[t], data + cut[t + 1]); });
 
-    // Merge the local tables and sort the names: global ids become ranks in
-    // unsigned byte order (a proper prefix first), which is output order.
     EndpointTable global;
     std::vector<std::vector<u32>> rank(nthreads);
     for (int t = 0; t < nthreads; ++t)
@@ -215,6 +176,15 @@ int main() {
 
     std::vector<std::string> text(HOURS);
     for (int h = 0; h < HOURS; ++h) text[h].reserve(131072);
+    std::vector<std::atomic<bool>> done(HOURS);
+    std::thread writer([&] {
+        for (int h = 0; h < HOURS; ++h) {
+            done[h].wait(false);
+            fwrite(text[h].data(), 1, text[h].size(), out);
+            std::string().swap(text[h]);
+        }
+    });
+
     const u32 ne = names.size();
     std::atomic<int> next{0};
     run_threads(nthreads, [&](int) {
@@ -236,7 +206,7 @@ int main() {
             cursor.assign(count.begin(), count.end() - 1);
             lat.resize(count[ne]);
             for (int t = 0; t < nthreads; ++t) {
-                for (Block* b = workers[t].head[h]; b; b = b->next)
+                for (Block* b = workers[t].head[h]; b; madvise(std::exchange(b, b->next), sizeof(Block), MADV_DONTNEED))
                     for (u32 i = 0; i < b->n; ++i)
                         lat[cursor[rank[t][b->rec[i] & ID_MASK]]++] = b->rec[i] >> KEY_BITS;
                 for (auto [l, key] : workers[t].big[h]) lat[cursor[rank[t][key & ID_MASK]]++] = l;
@@ -265,14 +235,16 @@ int main() {
                 char* o = std::copy(names[e].begin(), names[e].end(), std::copy_n(label, 21, line));
                 for (u32 x : v) {
                     *o++ = ' ';
-                    o = std::to_chars(o, o + 10, x).ptr;
+                    o = write_u32(o, x);
                 }
                 *o++ = '\n';
                 text[h].append(line, o);
             }
+            done[h] = true;
+            done[h].notify_one();
         }
     });
-    for (int h = 0; h < HOURS; ++h) fwrite(text[h].data(), 1, text[h].size(), out);
+    writer.join();
     fclose(out);
     return 0;
 }
