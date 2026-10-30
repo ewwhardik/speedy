@@ -37,10 +37,16 @@ typedef struct {
   uint64_t groups[4];     // the groups this name occurs in
 } Name;                   // 64 bytes, one cache line
 typedef struct {
+  uint64_t h, w0;
+  uint32_t id, len;
+} NameCache;
+
+typedef struct {
   long beg, end;
   char tmp[512];
   uint64_t distinct[MAXG];
   Agg agg[MAXG];
+  NameCache cache[512];
 } Th;
 
 static int fd, nth, ngroups, overflow;
@@ -75,9 +81,16 @@ static uint64_t hash_bytes(const char *s, uint32_t n) { // reads up to 7 bytes p
 // The id of name s[0..n) in the shared table, inserted when new. An inserter
 // claims an empty slot by swapping 0 for 1, fills the record, then publishes
 // hash | id.
-static uint32_t name_id(const char *s, uint32_t n) {
+static uint32_t name_id(Th *t, const char *s, uint32_t n) {
   uint64_t h = hash_bytes(s, n), key = h & ~(uint64_t)IDMASK, w[INL / 8] = {0};
   memcpy(w, s, n < INL ? n : INL);
+  uint32_t ci = (uint32_t)(h & 511);
+  NameCache *c = &t->cache[ci];
+  if (c->h == h && c->len == n && c->w0 == w[0]) {
+    Name *e = &names[c->id];
+    if (e->inl[1] == w[1] && e->inl[2] == w[2] && (n <= INL || memcmp(arena + e->off, s + INL, n - INL) == 0))
+      return c->id;
+  }
   for (uint32_t i = h & (cap - 1);; i = (i + 1) & (cap - 1)) {
     uint64_t v = __atomic_load_n(&slots[i], __ATOMIC_ACQUIRE);
     if (v == 0) {
@@ -96,6 +109,7 @@ static uint32_t name_id(const char *s, uint32_t n) {
           memcpy(arena + e->off, s + INL, n - INL);
         }
         __atomic_store_n(&slots[i], key | id, __ATOMIC_RELEASE);
+        c->h = h; c->id = id; c->len = n; c->w0 = w[0];
         return id;
       }
     }
@@ -104,8 +118,10 @@ static uint32_t name_id(const char *s, uint32_t n) {
     if ((v & ~(uint64_t)IDMASK) == key) {
       Name *e = &names[v & IDMASK];
       if (e->len == n && e->inl[0] == w[0] && e->inl[1] == w[1] && e->inl[2] == w[2] &&
-          (n <= INL || memcmp(arena + e->off, s + INL, n - INL) == 0))
+          (n <= INL || memcmp(arena + e->off, s + INL, n - INL) == 0)) {
+        c->h = h; c->id = v & IDMASK; c->len = n; c->w0 = w[0];
         return v & IDMASK;
+      }
     }
   }
 }
@@ -195,7 +211,7 @@ static const char *record(Th *t, const char *p, const char *end, int eof) {
   a->max = cents > a->max ? cents : a->max;
   a->name_bytes += nlen;
   a->note_bytes += xlen;
-  uint32_t nid = name_id(name, nlen);
+  uint32_t nid = name_id(t, name, nlen);
   uint64_t *w = &names[nid].groups[g / 64], bit = 1ull << (g % 64);
   if (!(__atomic_load_n(w, __ATOMIC_RELAXED) & bit))
     __atomic_fetch_or(w, bit, __ATOMIC_RELAXED);

@@ -221,10 +221,6 @@ static void flush_ready(void) {
 static void *hours(void *arg) {
   Th *t = arg;
   for (int hr; (hr = __atomic_fetch_add(&next_hour, 1, __ATOMIC_RELAXED)) < HOURS;) {
-    while (hr > __atomic_load_n(&turn, __ATOMIC_ACQUIRE) + 2) {
-      flush_ready();
-      _mm_pause();
-    }
     uint32_t n = 0;
     memset(t->cnt, 0, E * 4);
     memset(t->err, 0, E * 4);
