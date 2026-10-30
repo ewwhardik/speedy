@@ -296,7 +296,6 @@ int main(void) {
   malloc_trim(0);
 
   ans = malloc((nq + 1) * sizeof *ans);
-  nth = nth > 6 ? 6 : nth;
   run_threads(answer);
   FILE *out = fopen("/out/distances.txt", "w");
   if (!out)
