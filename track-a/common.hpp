@@ -14,6 +14,7 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+// The mapping stays alive until every string_view referring to it is destroyed.
 struct MappedFile {
     const char* data = "";
     size_t size = 0;
@@ -24,10 +25,9 @@ struct MappedFile {
         if (fstat(fd, &st) != 0) { close(fd); throw std::runtime_error("Cannot stat " + path); }
         size = static_cast<size_t>(st.st_size);
         if (size) {
-            void* p = mmap(nullptr, size, PROT_READ, MAP_SHARED, fd, 0);
+            void* p = mmap(nullptr, size, PROT_READ, MAP_PRIVATE, fd, 0);
             if (p == MAP_FAILED) { close(fd); throw std::runtime_error("Cannot map " + path); }
             data = static_cast<const char*>(p);
-            madvise(p, size, MADV_WILLNEED | MADV_SEQUENTIAL);
         }
         close(fd);
     }

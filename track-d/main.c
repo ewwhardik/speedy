@@ -18,6 +18,7 @@
 #include <string.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#include <malloc.h>
 
 #define BUFSZ (1 << 16)
 #define INF32 UINT32_MAX
@@ -234,7 +235,7 @@ int main(void) {
 
   cpu_set_t cpus; // the CPUs this container may use, not the host's count
   nth = sched_getaffinity(0, sizeof cpus, &cpus) ? 1 : CPU_COUNT(&cpus);
-  nth = nth < 1 ? 1 : nth > 64 ? 64 : nth;
+  nth = nth < 1 ? 1 : nth > 6 ? 6 : nth;
   th = calloc(nth, sizeof(Th));
   th[0].beg = body;
   for (int i = 1; i < nth; i++) {
@@ -292,6 +293,7 @@ int main(void) {
   for (uint32_t i = 0; i < nq; i++)
     qs[i] = perm[qs[i]], qt[i] = perm[qt[i]];
   free(perm);
+  malloc_trim(0);
 
   ans = malloc((nq + 1) * sizeof *ans);
   run_threads(answer);

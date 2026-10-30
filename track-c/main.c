@@ -20,7 +20,7 @@
 #include <unistd.h>
 
 #define BUFSZ (1 << 16) // read buffer per thread; a record is far smaller
-#define MAPN 10000000   // region ids at or above this are unmatched
+#define MAPN 1000000   // region ids at or above this are unmatched
 #define MAXG 256        // groups: _UNMATCHED (0) plus the countries (240 in the spec)
 #define IDBITS 24       // name ids per table slot; the table never exceeds 2^24 slots
 #define IDMASK ((1u << IDBITS) - 1)
@@ -336,7 +336,7 @@ int main(void) {
 
   if (size > UINT32_MAX)
     die("records.csv over 4 GB"); // arena offsets are 32-bit
-  arena = malloc(size + 64);      // untouched pages cost nothing
+  arena = malloc(4 * 1024 * 1024); // 4 MB arena for suffixes past 24 bytes
   for (cap = 1 << 18;; cap *= 4) { // redone with a larger name table if it fills
     if (cap > 1u << IDBITS)
       die("too many distinct names");
