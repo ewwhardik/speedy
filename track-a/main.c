@@ -208,7 +208,10 @@ static void flush_ready(void) {
       if (write(out, b, olen[turn]) != (ssize_t)olen[turn])
         die("write failed");
       pthread_mutex_lock(&smu);
-      spare[nspare++] = b;
+      if (nspare < 4)
+        spare[nspare++] = b;
+      else
+        free(b);
       pthread_mutex_unlock(&smu);
       __atomic_store_n(&turn, turn + 1, __ATOMIC_RELEASE);
     }
@@ -248,7 +251,7 @@ static void *hours(void *arg) {
     }
     if (!t->out) {
       pthread_mutex_lock(&smu);
-      t->out = nspare ? spare[--nspare] : malloc(420 * 1024);
+      t->out = nspare ? spare[--nspare] : malloc(260 * 1024);
       pthread_mutex_unlock(&smu);
     }
     int day = (hr + 18) / 24;
