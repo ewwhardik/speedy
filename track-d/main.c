@@ -94,29 +94,44 @@ static void *scan(void *arg) {
   return NULL;
 }
 
-static void push(Th *t, size_t *hn, uint64_t d, uint32_t u) {
+static inline void push(Th *t, size_t *hn, uint64_t d, uint32_t u) {
   if (*hn == t->hcap) {
     t->hcap *= 2;
     t->heap = realloc(t->heap, t->hcap * sizeof(Item));
   }
   size_t i = (*hn)++;
-  for (; i && t->heap[(i - 1) / 2].d > d; i = (i - 1) / 2)
-    t->heap[i] = t->heap[(i - 1) / 2];
+  while (i) {
+    size_t p = (i - 1) >> 2;
+    if (t->heap[p].d <= d)
+      break;
+    t->heap[i] = t->heap[p];
+    i = p;
+  }
   t->heap[i] = (Item){d, u};
 }
 
-static Item pop(Th *t, size_t *hn) {
-  Item top = t->heap[0], last = t->heap[--*hn];
+static inline Item pop(Th *t, size_t *hn) {
+  Item top = t->heap[0];
+  size_t n = --*hn;
+  if (!n)
+    return top;
+  Item last = t->heap[n];
   size_t i = 0;
-  for (size_t c; (c = 2 * i + 1) < *hn; i = c) {
-    if (c + 1 < *hn && t->heap[c + 1].d < t->heap[c].d)
-      c++;
-    if (t->heap[c].d >= last.d)
+  while (1) {
+    size_t c = (i << 2) + 1;
+    if (c >= n)
       break;
-    t->heap[i] = t->heap[c];
+    size_t min_c = c;
+    uint64_t min_d = t->heap[c].d;
+    if (c + 1 < n && t->heap[c + 1].d < min_d) { min_c = c + 1; min_d = t->heap[c + 1].d; }
+    if (c + 2 < n && t->heap[c + 2].d < min_d) { min_c = c + 2; min_d = t->heap[c + 2].d; }
+    if (c + 3 < n && t->heap[c + 3].d < min_d) { min_c = c + 3; min_d = t->heap[c + 3].d; }
+    if (last.d <= min_d)
+      break;
+    t->heap[i] = t->heap[min_c];
+    i = min_c;
   }
-  if (*hn)
-    t->heap[i] = last;
+  t->heap[i] = last;
   return top;
 }
 
@@ -265,7 +280,6 @@ int main(void) {
   pass = 2;
   run_threads(scan);
   free(cur);
-  posix_fadvise(fd, 0, 0, POSIX_FADV_DONTNEED);
   close(fd);
   for (int i = 0; i < nth; i++)
     free(th[i].buf);

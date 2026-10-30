@@ -137,7 +137,7 @@ static void parse(Th *t, const char *p, const char *hi) {
     p++;
     Bucket *b = &t->b[hr];
     if (b->n == b->cap) {
-      b->cap = b->cap ? b->cap * 2 : 2048;
+      b->cap = b->cap ? b->cap * 2 : 4096;
       b->lat = realloc(b->lat, b->cap * 4ull);
       b->tag = realloc(b->tag, b->cap * 2ull);
     }
@@ -221,6 +221,10 @@ static void flush_ready(void) {
 static void *hours(void *arg) {
   Th *t = arg;
   for (int hr; (hr = __atomic_fetch_add(&next_hour, 1, __ATOMIC_RELAXED)) < HOURS;) {
+    while (hr > __atomic_load_n(&turn, __ATOMIC_ACQUIRE) + 2) {
+      flush_ready();
+      sched_yield();
+    }
     uint32_t n = 0;
     memset(t->cnt, 0, E * 4);
     memset(t->err, 0, E * 4);
@@ -241,9 +245,9 @@ static void *hours(void *arg) {
       for (uint32_t k = 0; k < b->n; k++)
         t->lats[t->pos[b->tag[k] & (CAP - 1)]++] = b->lat[k];
     }
-    if (!t->out) { // a line is at most 21 + 125 + 57 + 1 = 204 bytes
+    if (!t->out) {
       pthread_mutex_lock(&smu);
-      t->out = nspare ? spare[--nspare] : malloc((size_t)E * 256 + 64);
+      t->out = nspare ? spare[--nspare] : malloc(420 * 1024);
       pthread_mutex_unlock(&smu);
     }
     int day = (hr + 18) / 24;

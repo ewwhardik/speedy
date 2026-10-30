@@ -638,7 +638,6 @@ int main(void) {
     th[i].tc = calloc(nterms + 1, sizeof(Tc));
   }
   run_threads(scan);
-  posix_fadvise(fd, 0, 0, POSIX_FADV_DONTNEED);
 
   // Posting slices for the list terms, each thread's cursor after earlier threads'.
   df = calloc(nterms + 1, 4);
@@ -666,6 +665,8 @@ int main(void) {
     maxlen = dlen[d] > maxlen ? dlen[d] : maxlen;
   lcap = (maxlist > N / 32 ? maxlist : N / 32) + 1;
   for (int i = 0; i < nth; i++) {
+    free(th[i].buf);
+    free(th[i].tokids);
     free(th[i].tc);
     th[i].text = malloc(maxlen + 64); // slack for tokenize's reads past the data
     th[i].la = malloc(lcap * 4ull);

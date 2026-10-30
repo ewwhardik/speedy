@@ -356,9 +356,15 @@ int main(void) {
       break;
     free(slots);
   }
-  posix_fadvise(fd, 0, 0, POSIX_FADV_DONTNEED);
   close(fd);
+  free(region);
+  for (int i = 0; i < nth; i++) {
+    free(th[i].buf);
+    free(th[i].tmp);
+  }
   run_threads(count_names);
+  free(names);
+  free(arena);
   malloc_trim(0);
 
   // Merge the threads' aggregates and write the groups in byte order of key.
