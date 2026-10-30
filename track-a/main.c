@@ -10,6 +10,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
+#include <sys/prctl.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
@@ -105,7 +106,7 @@ static void parse(Th *t, const char *p, const char *hi) {
     p++;
     Bucket *b = &t->b[hr];
     if (b->n == b->cap) {
-      b->cap = b->cap ? b->cap * 2 : 4096;
+      b->cap = b->cap ? b->cap * 2 : 256;
       b->lat = realloc(b->lat, b->cap * 4ull);
       b->tag = realloc(b->tag, b->cap * 2ull);
     }
@@ -247,6 +248,8 @@ static int cmp_ep(const void *x, const void *y) {
 }
 
 int main(void) {
+  prctl(PR_SET_THP_DISABLE, 1, 0, 0, 0);
+  mallopt(M_MMAP_THRESHOLD, 1 << 16);
   mallopt(M_ARENA_MAX, 1);
   struct stat st;
   int fd = open("/data/requests.log", O_RDONLY);

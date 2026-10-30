@@ -7,6 +7,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/prctl.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
@@ -251,6 +252,8 @@ static int cmp_group(const void *x, const void *y) {
 }
 
 int main(void) {
+  prctl(PR_SET_THP_DISABLE, 1, 0, 0, 0);
+  mallopt(M_MMAP_THRESHOLD, 1 << 16);
   mallopt(M_ARENA_MAX, 1);
   int rf = open("/data/regions.csv", O_RDONLY);
   if (rf < 0) die("cannot open /data/regions.csv");

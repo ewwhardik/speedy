@@ -20,6 +20,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/prctl.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
@@ -545,6 +546,8 @@ static char *slurp(const char *path, long *size) {
 }
 
 int main(void) {
+  prctl(PR_SET_THP_DISABLE, 1, 0, 0, 0);
+  mallopt(M_MMAP_THRESHOLD, 1 << 16);
   mallopt(M_ARENA_MAX, 1);
   // Queries: BOOL t1 op t2 ... or PHRASE "t1 t2 ...".
   long qsize;

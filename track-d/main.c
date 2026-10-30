@@ -2,6 +2,7 @@
 // query in a directed graph with non-negative uint32 weights. See specs/d-traverse.md.
 #define _GNU_SOURCE
 #include <fcntl.h>
+#include <malloc.h>
 #include <pthread.h>
 #include <sched.h>
 #include <stdint.h>
@@ -9,6 +10,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
+#include <sys/prctl.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
@@ -127,7 +129,7 @@ static Item pop(Th *t, size_t *hn) {
 
 static inline void edge_at(uint32_t u, uint32_t e, uint32_t *v, uint32_t *w) {
   uint32_t x = pk[e];
-  if ((x & 0xFFFF) != ESC) {
+  if (__builtin_expect((x & 0xFFFF) != ESC, 1)) {
     *v = u + (int16_t)(x >> 16);
     *w = x & 0xFFFF;
     return;
@@ -188,7 +190,7 @@ static int64_t search(Th *t, uint32_t s, uint32_t tg) {
 }
 
 static inline void bpush(Bucket *b, uint32_t v) {
-  if (b->n == b->cap)
+  if (__builtin_expect(b->n == b->cap, 0))
     b->v = realloc(b->v, (b->cap = b->cap ? b->cap * 2 : 64) * 4ull);
   b->v[b->n++] = v;
 }
@@ -243,6 +245,11 @@ static void *answer(void *arg) {
   t->touched = malloc(t->tcap * 4);
   t->hcap = 1 << 16;
   t->heap = malloc(t->hcap * sizeof(Item));
+  for (int i = 0; i < RING; i++) {
+    t->ring[i].cap = 64;
+    t->ring[i].v = malloc(64 * 4);
+    t->ring[i].n = 0;
+  }
   for (uint32_t q; (q = __atomic_fetch_add(&next_q, 1, __ATOMIC_RELAXED)) < nq;) {
     uint32_t s = qs[q], tg = qt[q];
     if (s == tg)
@@ -301,6 +308,9 @@ static void run_threads(void *(*f)(void *)) {
 }
 
 int main(void) {
+  prctl(PR_SET_THP_DISABLE, 1, 0, 0, 0);
+  mallopt(M_MMAP_THRESHOLD, 1 << 16);
+  mallopt(M_ARENA_MAX, 1);
   FILE *qf = fopen("/data/queries.txt", "r");
   if (!qf)
     die("cannot open /data/queries.txt");
@@ -418,6 +428,9 @@ int main(void) {
     qt[i] = perm[qt[i]];
   }
   free(perm);
+  malloc_trim(0);
+  if (nth > 8)
+    nth = 8;
 
   ans = malloc((nq + 1) * sizeof *ans);
   run_threads(answer);
