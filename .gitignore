@@ -7,4 +7,5 @@ board*.json
 *.json
 *.py
 __pycache__/
+scratch/
 
