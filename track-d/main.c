@@ -1,10 +1,5 @@
 // Speed Demon 2026, Track D (Traverse): exact shortest-path distances for each
 // query in a directed graph with non-negative uint32 weights. See specs/d-traverse.md.
-//
-// The graph is read by all threads in two passes into forward and backward CSRs.
-// Self-loops are dropped. Queries run in parallel, each an exact bidirectional
-// Dijkstra search with frontier balancing and 4-ary min-heaps that terminates when
-// the sum of the two frontier minima reaches the best known connection.
 #define _GNU_SOURCE
 #include <fcntl.h>
 #include <malloc.h>
@@ -26,16 +21,17 @@ typedef struct { uint64_t d; uint32_t u; } Item;
 typedef struct {
   long beg, end;
   char *buf;
-  uint32_t *d32[2], *touched[2];
-  uint64_t *d64[2];
-  Item *heap[2];
-  size_t hcap[2], tcap[2];
+  uint32_t *d32, *touched;
+  uint64_t *d64;
+  Item *heap;
+  size_t hcap, tcap;
 } Th;
 
 static int fd, nth, pass, next_q;
 static Th *th;
-static uint32_t n, nq, *f_off, *b_off, *f_cur, *b_cur, *qs, *qt;
-static Edge *f_edges, *b_edges;
+static uint32_t n, nq, *off, *cur, *qs, *qt;
+static uint8_t *has_in;
+static Edge *edges;
 static int64_t *ans;
 
 static void die(const char *m) {
@@ -53,11 +49,10 @@ static void edge_lines(const char *p, const char *lim) {
     p++;
     if (u == v || u >= n || v >= n) continue;
     if (pass == 1) {
-      __atomic_fetch_add(&f_off[u + 1], 1, __ATOMIC_RELAXED);
-      __atomic_fetch_add(&b_off[v + 1], 1, __ATOMIC_RELAXED);
+      __atomic_fetch_add(&off[u + 1], 1, __ATOMIC_RELAXED);
+      __atomic_store_n(&has_in[v], 1, __ATOMIC_RELAXED);
     } else {
-      f_edges[__atomic_fetch_add(&f_cur[u], 1, __ATOMIC_RELAXED)] = (Edge){v, (uint32_t)w};
-      b_edges[__atomic_fetch_add(&b_cur[v], 1, __ATOMIC_RELAXED)] = (Edge){u, (uint32_t)w};
+      edges[__atomic_fetch_add(&cur[u], 1, __ATOMIC_RELAXED)] = (Edge){v, (uint32_t)w};
     }
   }
 }
@@ -80,149 +75,108 @@ static void *scan(void *arg) {
   return NULL;
 }
 
-static inline void push(Th *t, int dir, size_t *hn, uint64_t d, uint32_t u) {
-  if (*hn == t->hcap[dir]) {
-    t->hcap[dir] *= 2;
-    t->heap[dir] = realloc(t->heap[dir], t->hcap[dir] * sizeof(Item));
+static inline void push(Th *t, size_t *hn, uint64_t d, uint32_t u) {
+  if (*hn == t->hcap) {
+    t->hcap *= 2;
+    t->heap = realloc(t->heap, t->hcap * sizeof(Item));
   }
   size_t i = (*hn)++;
   while (i) {
     size_t p = (i - 1) >> 2;
-    if (t->heap[dir][p].d <= d) break;
-    t->heap[dir][i] = t->heap[dir][p];
+    if (t->heap[p].d <= d) break;
+    t->heap[i] = t->heap[p];
     i = p;
   }
-  t->heap[dir][i] = (Item){d, u};
+  t->heap[i] = (Item){d, u};
 }
 
-static inline Item pop(Th *t, int dir, size_t *hn) {
-  Item top = t->heap[dir][0];
+static inline Item pop(Th *t, size_t *hn) {
+  Item top = t->heap[0];
   size_t n_items = --*hn;
   if (!n_items) return top;
-  Item last = t->heap[dir][n_items];
+  Item last = t->heap[n_items];
   size_t i = 0;
   while (1) {
     size_t c = (i << 2) + 1;
     if (c >= n_items) break;
     size_t min_c = c;
-    uint64_t min_d = t->heap[dir][c].d;
-    if (c + 1 < n_items && t->heap[dir][c + 1].d < min_d) { min_c = c + 1; min_d = t->heap[dir][c + 1].d; }
-    if (c + 2 < n_items && t->heap[dir][c + 2].d < min_d) { min_c = c + 2; min_d = t->heap[dir][c + 2].d; }
-    if (c + 3 < n_items && t->heap[dir][c + 3].d < min_d) { min_c = c + 3; min_d = t->heap[dir][c + 3].d; }
+    uint64_t min_d = t->heap[c].d;
+    if (c + 1 < n_items && t->heap[c + 1].d < min_d) { min_c = c + 1; min_d = t->heap[c + 1].d; }
+    if (c + 2 < n_items && t->heap[c + 2].d < min_d) { min_c = c + 2; min_d = t->heap[c + 2].d; }
+    if (c + 3 < n_items && t->heap[c + 3].d < min_d) { min_c = c + 3; min_d = t->heap[c + 3].d; }
     if (last.d <= min_d) break;
-    t->heap[dir][i] = t->heap[dir][min_c];
+    t->heap[i] = t->heap[min_c];
     i = min_c;
   }
-  t->heap[dir][i] = last;
+  t->heap[i] = last;
   return top;
 }
 
 static int64_t search(Th *t, uint32_t s, uint32_t tg, int wide) {
-  size_t tn[2] = {0, 0}, hn[2] = {0, 0};
+  size_t hn = 0, nt = 0;
   int64_t res = -1;
-#define DIST(dir, x) (wide ? t->d64[dir][x] : (uint64_t)t->d32[dir][x])
-#define SET(dir, x, val) (wide ? (void)(t->d64[dir][x] = (val)) : (void)(t->d32[dir][x] = (uint32_t)(val)))
-#define INF (wide ? UINT64_MAX : (uint64_t)INF32)
-
-  SET(0, s, 0);
-  t->touched[0][tn[0]++] = s;
-  push(t, 0, &hn[0], 0, s);
-
-  SET(1, tg, 0);
-  t->touched[1][tn[1]++] = tg;
-  push(t, 1, &hn[1], 0, tg);
-
-  uint64_t best = UINT64_MAX;
-
-  while (1) {
-    while (hn[0] && t->heap[0][0].d > DIST(0, t->heap[0][0].u)) pop(t, 0, &hn[0]);
-    while (hn[1] && t->heap[1][0].d > DIST(1, t->heap[1][0].u)) pop(t, 1, &hn[1]);
-
-    if (!hn[0] || !hn[1]) break;
-
-    uint64_t min0 = t->heap[0][0].d, min1 = t->heap[1][0].d;
-    if (min0 + min1 >= best) break;
-
-    int dir = min0 <= min1 ? 0 : 1;
-    Item it = pop(t, dir, &hn[dir]);
-
-    uint64_t od_u = DIST(1 - dir, it.u);
-    if (od_u != INF) {
-      uint64_t cand = it.d + od_u;
-      if (cand < best) best = cand;
+#define DIST(x) (wide ? t->d64[x] : t->d32[x])
+#define SET(x, val) (wide ? (void)(t->d64[x] = (val)) : (void)(t->d32[x] = (uint32_t)(val)))
+  SET(s, 0);
+  t->touched[nt++] = s;
+  push(t, &hn, 0, s);
+  while (hn) {
+    Item it = pop(t, &hn);
+    if (it.d > DIST(it.u)) continue;
+    if (it.u == tg) {
+      res = it.d;
+      break;
     }
-
-    uint32_t *start_off = dir == 0 ? f_off : b_off;
-    Edge *ed = dir == 0 ? f_edges : b_edges;
-
-    for (uint32_t e = start_off[it.u]; e < start_off[it.u + 1]; e++) {
-      uint32_t v = ed[e].v;
-      uint64_t nd = it.d + ed[e].w;
+    for (uint32_t e = off[it.u]; e < off[it.u + 1]; e++) {
+      uint32_t v = edges[e].v;
+      uint64_t nd = it.d + edges[e].w, dv = DIST(v);
       if (!wide && nd >= INF32) {
         res = -2;
-        goto cleanup;
+        hn = 0;
+        break;
       }
-      if (nd < DIST(dir, v)) {
-        if (DIST(dir, v) == INF) {
-          if (tn[dir] == t->tcap[dir])
-            t->touched[dir] = realloc(t->touched[dir], (t->tcap[dir] *= 2) * 4);
-          t->touched[dir][tn[dir]++] = v;
+      if (nd < dv) {
+        if (dv == (wide ? UINT64_MAX : INF32)) {
+          if (nt == t->tcap)
+            t->touched = realloc(t->touched, (t->tcap *= 2) * 4);
+          t->touched[nt++] = v;
         }
-        SET(dir, v, nd);
-        push(t, dir, &hn[dir], nd, v);
-        uint64_t od_v = DIST(1 - dir, v);
-        if (od_v != INF) {
-          uint64_t cand = nd + od_v;
-          if (cand < best) best = cand;
-        }
+        SET(v, nd);
+        push(t, &hn, nd, v);
       }
     }
   }
-
-  res = (best == UINT64_MAX ? -1 : (int64_t)best);
-
-cleanup:
-  for (size_t i = 0; i < tn[0]; i++) SET(0, t->touched[0][i], INF);
-  for (size_t i = 0; i < tn[1]; i++) SET(1, t->touched[1][i], INF);
+  for (size_t i = 0; i < nt; i++)
+    SET(t->touched[i], wide ? UINT64_MAX : INF32);
   return res;
-#undef DIST
-#undef SET
-#undef INF
 }
 
 static void *answer(void *arg) {
   Th *t = arg;
-  t->d32[0] = malloc(n * 4ull);
-  t->d32[1] = malloc(n * 4ull);
-  memset(t->d32[0], 0xff, n * 4ull);
-  memset(t->d32[1], 0xff, n * 4ull);
-  t->tcap[0] = t->tcap[1] = 1 << 16;
-  t->touched[0] = malloc(t->tcap[0] * 4);
-  t->touched[1] = malloc(t->tcap[1] * 4);
-  t->hcap[0] = t->hcap[1] = 1 << 16;
-  t->heap[0] = malloc(t->hcap[0] * sizeof(Item));
-  t->heap[1] = malloc(t->hcap[1] * sizeof(Item));
-
+  t->d32 = malloc(n * 4ull);
+  memset(t->d32, 0xff, n * 4ull);
+  t->tcap = 1 << 16;
+  t->touched = malloc(t->tcap * 4);
+  t->hcap = 1 << 16;
+  t->heap = malloc(t->hcap * sizeof(Item));
   for (uint32_t q; (q = __atomic_fetch_add(&next_q, 1, __ATOMIC_RELAXED)) < nq;) {
     uint32_t s = qs[q], tg = qt[q];
     if (s == tg)
       ans[q] = 0;
-    else if (f_off[s] == f_off[s + 1] || b_off[tg] == b_off[tg + 1])
+    else if (!has_in[tg] || off[s] == off[s + 1])
       ans[q] = -1;
     else if ((ans[q] = search(t, s, tg, 0)) == -2) {
-      if (!t->d64[0]) {
-        t->d64[0] = malloc(n * 8ull);
-        t->d64[1] = malloc(n * 8ull);
-        memset(t->d64[0], 0xff, n * 8ull);
-        memset(t->d64[1], 0xff, n * 8ull);
+      if (!t->d64) {
+        t->d64 = malloc(n * 8ull);
+        memset(t->d64, 0xff, n * 8ull);
       }
       ans[q] = search(t, s, tg, 1);
     }
   }
-  free(t->d32[0]); free(t->d32[1]);
-  free(t->touched[0]); free(t->touched[1]);
-  free(t->heap[0]); free(t->heap[1]);
-  if (t->d64[0]) { free(t->d64[0]); free(t->d64[1]); }
+  free(t->d32);
+  free(t->touched);
+  free(t->heap);
+  if (t->d64) free(t->d64);
   return NULL;
 }
 
@@ -267,9 +221,8 @@ int main(void) {
   }
   for (uint32_t i = 0; i < nq; i++)
     if (qs[i] >= n || qt[i] >= n) die("query node out of range");
-
-  f_off = calloc(n + 2, 4);
-  b_off = calloc(n + 2, 4);
+  off = calloc(n + 2, 4);
+  has_in = calloc(n + 1, 1);
 
   cpu_set_t cpus;
   nth = sched_getaffinity(0, sizeof cpus, &cpus) ? 1 : CPU_COUNT(&cpus);
@@ -287,25 +240,16 @@ int main(void) {
   }
   th[nth - 1].end = size;
   for (int i = 0; i < nth; i++) th[i].buf = malloc(BUFSZ);
-
   pass = 1;
   run_threads(scan, nth);
-
-  for (uint32_t u = 0; u < n; u++) {
-    f_off[u + 1] += f_off[u];
-    b_off[u + 1] += b_off[u];
-  }
-  f_edges = malloc((f_off[n] + 1ull) * sizeof(Edge));
-  b_edges = malloc((b_off[n] + 1ull) * sizeof(Edge));
-  f_cur = malloc((n + 1) * 4ull);
-  b_cur = malloc((n + 1) * 4ull);
-  memcpy(f_cur, f_off, (n + 1) * 4ull);
-  memcpy(b_cur, b_off, (n + 1) * 4ull);
-
+  for (uint32_t u = 0; u < n; u++)
+    off[u + 1] += off[u];
+  edges = malloc((off[n] + 1ull) * sizeof(Edge));
+  cur = malloc((n + 1) * 4ull);
+  memcpy(cur, off, (n + 1) * 4ull);
   pass = 2;
   run_threads(scan, nth);
-  free(f_cur);
-  free(b_cur);
+  free(cur);
   close(fd);
   for (int i = 0; i < nth; i++) free(th[i].buf);
 
