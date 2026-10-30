@@ -213,24 +213,13 @@ int main() {
     for (auto& r : rank)
         for (u32& id : r) id = rank_of[id];
 
-    // Hours are claimed in order by the pool; a writer thread writes them in
-    // order as each one finishes.
     std::vector<std::string> text(HOURS);
     for (int h = 0; h < HOURS; ++h) text[h].reserve(131072);
-    std::vector<std::atomic<bool>> done(HOURS);
-    std::thread writer([&] {
-        for (int h = 0; h < HOURS; ++h) {
-            done[h].wait(false);
-            fwrite(text[h].data(), 1, text[h].size(), out);
-            std::string().swap(text[h]);
-        }
-    });
     const u32 ne = names.size();
     std::atomic<int> next{0};
     run_threads(nthreads, [&](int) {
         std::vector<u32> count, errors, cursor, lat;
         for (int h; (h = next++) < HOURS;) {
-            // Counting sort of the hour's latencies by endpoint rank.
             count.assign(ne + 1, 0);
             errors.assign(ne, 0);
             for (int t = 0; t < nthreads; ++t) {
@@ -247,7 +236,7 @@ int main() {
             cursor.assign(count.begin(), count.end() - 1);
             lat.resize(count[ne]);
             for (int t = 0; t < nthreads; ++t) {
-                for (Block* b = workers[t].head[h]; b; madvise(std::exchange(b, b->next), sizeof(Block), MADV_DONTNEED))
+                for (Block* b = workers[t].head[h]; b; b = b->next)
                     for (u32 i = 0; i < b->n; ++i)
                         lat[cursor[rank[t][b->rec[i] & ID_MASK]]++] = b->rec[i] >> KEY_BITS;
                 for (auto [l, key] : workers[t].big[h]) lat[cursor[rank[t][key & ID_MASK]]++] = l;
@@ -259,9 +248,6 @@ int main() {
                 u32* a = lat.data() + count[e];
                 u32 n = count[e + 1] - count[e];
                 if (n == 0) continue;
-                // Nearest rank p is index ceil(p * n / 100) - 1. A selection may
-                // reorder its whole range, so read each value before narrowing
-                // to the tail for the next one.
                 u32 v[6] = {n, 0, 0, 0, errors[e], u32(u64(errors[e]) * 1000000 / n)};
                 if (n <= 128) {
                     std::sort(a, a + n);
@@ -284,11 +270,9 @@ int main() {
                 *o++ = '\n';
                 text[h].append(line, o);
             }
-            done[h] = true;
-            done[h].notify_one();
         }
     });
-    writer.join();
+    for (int h = 0; h < HOURS; ++h) fwrite(text[h].data(), 1, text[h].size(), out);
     fclose(out);
     return 0;
 }

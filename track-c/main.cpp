@@ -325,7 +325,6 @@ int main() {
     // With transparent huge pages, a block written only in part can be backed
     // by a whole 2 MB page; plain pages keep memory to what is written.
     prctl(PR_SET_THP_DISABLE, 1, 0, 0, 0);
-    mallopt(M_MMAP_THRESHOLD, 1 << 16);
     const int nthreads = std::clamp<int>(std::thread::hardware_concurrency(), 1, 12);
     size_t rsize, size;
     const char* regions = map_file("/data/regions.csv", rsize);

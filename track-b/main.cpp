@@ -285,6 +285,51 @@ struct Index {
     std::vector<u32> text;             // per doc: offset of its text, then of its end (2 per doc)
 };
 
+// An append-only list of 24-bit entries kept in blocks mapped straight from
+// the kernel (pages count only once written). drain() unmaps each block as soon
+// as it has been read, so the memory really goes back; malloc would keep it.
+class BlockList {
+public:
+    static constexpr size_t BLOCK = 1 << 14;          // entries per block
+    static constexpr size_t BYTES = 3 * BLOCK + 1;    // a 4-byte store at the last entry spills one byte
+    ~BlockList() { for (uint8_t* b : blocks_) munmap(b, BYTES); }
+
+    void push(u32 x) {
+        if (fill_ == BLOCK) {
+            cur_ = static_cast<uint8_t*>(mmap(nullptr, BYTES, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0));
+            blocks_.push_back(cur_);
+            fill_ = 0;
+        }
+        memcpy(cur_ + 3 * fill_++, &x, 4);
+    }
+
+    template <class F>
+    void drain(F&& f) {
+        for (size_t b = 0; b < blocks_.size(); ++b) {
+            size_t n = b + 1 == blocks_.size() ? fill_ : BLOCK;
+            for (size_t i = 0; i < n; ++i) {
+                u32 x;
+                memcpy(&x, blocks_[b] + 3 * i, 4);
+                f(x & 0xFFFFFF);
+            }
+            munmap(blocks_[b], BYTES);
+        }
+        blocks_.clear();
+    }
+
+private:
+    std::vector<uint8_t*> blocks_;
+    uint8_t* cur_ = nullptr;
+    size_t fill_ = BLOCK;
+};
+
+// The scan files each posting under a bucket of 512 consecutive term ids, as
+// the term's offset in the bucket (9 bits) above the doc's offset in the
+// thread's range (15 bits). The scatter then fills the posting lists one
+// bucket at a time, so the lists' pages are touched only as the scan output
+// that fills them is freed.
+constexpr u32 BUCKET_BITS = 9, DOC_BITS = 15;
+
 u32 parse_id(const uint8_t* p) {
     u32 v = 0;
     while (*p >= '0' && *p <= '9') v = v * 10 + (*p++ - '0');
@@ -297,6 +342,7 @@ Index build_index(const File& f, TermTable& terms, std::vector<u32>& query_terms
     const uint8_t* base = f.data;
     const size_t size = f.size;
     if (size) {
+        // Ids are dense, so the last line's id gives the document count.
         size_t last = size - 1;
         while (last > 0 && base[last - 1] != '\n') --last;
         ix.docs = parse_id(base + last) + 1;
@@ -306,16 +352,24 @@ Index build_index(const File& f, TermTable& terms, std::vector<u32>& query_terms
     ix.text.resize(2 * size_t(ix.docs));
     ix.words = (ix.docs + 63) / 64;
     ix.dense.assign(nterms, NONE);
+    const u32 nbuckets = (nterms >> BUCKET_BITS) + 1;
 
+    // Each thread takes a byte range snapped to line starts. It first samples
+    // the start of its range so the dense terms can be picked, then scans it all:
+    // dense terms set bits, other terms' (term, doc) pairs go to `seen`, one
+    // block list per bucket of terms.
     std::vector<size_t> cut(nthreads + 1);
     for (int t = 0; t <= nthreads; ++t) {
         size_t c = size * t / nthreads;
         while (c > 0 && c < size && base[c - 1] != '\n') ++c;
         cut[t] = c;
     }
+    std::vector<std::vector<BlockList>> seen(nthreads);
     std::vector<std::vector<u32>> count(nthreads);
-    std::vector<u32> sampled(nthreads), thread_docs(nthreads);
-
+    std::vector<u32> sampled(nthreads);
+    // After the sample: renumber the terms by sampled frequency, most frequent
+    // first (the scan's per-term state for common terms then shares a few
+    // cache lines), and make the terms over 1/32 of the sample bitmaps.
     std::barrier sync(nthreads, [&]() noexcept {
         u64 docs = 0;
         for (u32 s : sampled) docs += s;
@@ -335,22 +389,6 @@ Index build_index(const File& f, TermTable& terms, std::vector<u32>& query_terms
         for (u32& id : query_terms) id = new_id[id];
         ix.bits.assign(ndense * ix.words, 0);
     });
-
-    std::barrier sync2(nthreads, [&]() noexcept {
-        ix.start.resize(nterms + 1);
-        u32 total = 0;
-        for (u32 id = 0; id < nterms; ++id) {
-            ix.start[id] = total;
-            for (int t = 0; t < nthreads; ++t) {
-                u32 c = count[t][id];
-                count[t][id] = total;
-                total += c;
-            }
-        }
-        ix.start[nterms] = total;
-        ix.post.reset(new uint16_t[total]);
-    });
-
     std::vector<std::thread> pool;
     for (int t = 0; t < nthreads; ++t) {
         pool.emplace_back([&, t] {
@@ -361,6 +399,8 @@ Index build_index(const File& f, TermTable& terms, std::vector<u32>& query_terms
             cnt.assign(nterms, 0);
             std::vector<u32> last_doc(nterms, NONE);
 
+            // Calls term(id, doc) once per distinct known term of each document
+            // in [begin, stop), and done() after each document. Returns the count.
             auto walk = [&](const uint8_t* stop, auto&& term, auto&& done) {
                 u32 doc = first;
                 for (const uint8_t* p = begin; p < stop; ++doc) {
@@ -381,34 +421,48 @@ Index build_index(const File& f, TermTable& terms, std::vector<u32>& query_terms
             sync.arrive_and_wait();
             std::fill(cnt.begin(), cnt.end(), 0);
             std::fill(last_doc.begin(), last_doc.end(), NONE);
-
+            auto& out = seen[t];
+            out.resize(nbuckets);
             const u32 docs = walk(end, [&](u32 id, u32 doc) {
                 if (u32 d = ix.dense[id]; d != NONE) {
+                    // Neighbouring threads can share a boundary word.
                     std::atomic_ref<u64>(ix.bits[d * ix.words + doc / 64])
                         .fetch_or(1ull << (doc % 64), std::memory_order_relaxed);
                 } else {
+                    out[id >> BUCKET_BITS].push((id & ((1u << BUCKET_BITS) - 1)) << DOC_BITS | (doc - first));
                     ++cnt[id];
                 }
             }, [] {});
-            thread_docs[t] = docs;
+            if (docs >> DOC_BITS) { fputs("too many documents per thread\n", stderr); _exit(1); }
+        });
+    }
+    for (auto& th : pool) th.join();
+    pool.clear();
 
-            sync2.arrive_and_wait();
-
-            // Pass 2: write directly into ix.post
-            std::fill(last_doc.begin(), last_doc.end(), NONE);
-            for (u32 d = 0; d < docs; ++d) {
-                u32 doc = first + d;
-                const uint8_t* tx = base + ix.text[2 * size_t(doc)];
-                const uint8_t* nl = base + ix.text[2 * size_t(doc) + 1];
-                for_each_token(tx, nl, terms, [&](u32 id) {
-                    if (id != NONE && last_doc[id] != doc) {
-                        last_doc[id] = doc;
-                        if (ix.dense[id] == NONE) {
-                            ix.post[cnt[id]++] = uint16_t(d);
-                        }
-                    }
+    // Turn the per-thread counts into write cursors. Threads cover ascending doc
+    // ranges, so laying them out in thread order keeps every list sorted.
+    ix.start.resize(nterms + 1);
+    u32 total = 0;
+    for (u32 id = 0; id < nterms; ++id) {
+        ix.start[id] = total;
+        for (int t = 0; t < nthreads; ++t) {
+            u32 c = count[t][id];
+            count[t][id] = total;
+            total += c;
+        }
+    }
+    ix.start[nterms] = total;
+    ix.post.reset(new uint16_t[total]);  // not zeroed: every slot is written below
+    // Each thread drains its own lists bucket by bucket into its own segment of
+    // every term, so the threads never share a cursor. The cursors end at the
+    // segment ends, which the queries use to decode the lists.
+    for (int t = 0; t < nthreads; ++t) {
+        pool.emplace_back([&, t] {
+            for (u32 b = 0; b < nbuckets; ++b)
+                seen[t][b].drain([&](u32 x) {
+                    u32 id = b << BUCKET_BITS | x >> DOC_BITS;
+                    ix.post[count[t][id]++] = x & ((1u << DOC_BITS) - 1);
                 });
-            }
         });
     }
     for (auto& th : pool) th.join();
