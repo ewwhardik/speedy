@@ -53,8 +53,7 @@ inline u32 match32(const char* p, char c) {
 inline u64 match64(const char* p, char c) { return match32(p, c) | u64(match32(p + 32, c)) << 32; }
 
 inline u64 digits(const char* s, const char* e) {
-    u64 mask = ~0ull << (64 - ((e - s) << 3));
-    u64 v = (load8(e - 8) & 0x0F0F0F0F0F0F0F0F) & mask;
+    u64 v = load8(e - 8) & 0x0F0F0F0F0F0F0F0F & ~u64(0) << 8 * (8 - (e - s));
     v = (v * 10 + (v >> 8)) & 0x00FF00FF00FF00FF;
     v = (v * 100 + (v >> 16)) & 0x0000FFFF0000FFFF;
     return (v * 10000 + (v >> 32)) & 0xFFFFFFFF;
