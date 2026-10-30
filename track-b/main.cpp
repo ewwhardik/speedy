@@ -300,8 +300,7 @@ Index build_index(const File& f, TermTable& terms, std::vector<u32>& query_terms
     const size_t size = f.size;
     if (size) {
         size_t last = size - 1;
-        while (last > 0 && base[last - 1] != '
-') --last;
+        while (last > 0 && base[last - 1] != '\n') --last;
         ix.docs = parse_id(base + last) + 1;
     }
     ix.threads = nthreads;
@@ -313,8 +312,7 @@ Index build_index(const File& f, TermTable& terms, std::vector<u32>& query_terms
     std::vector<size_t> cut(nthreads + 1);
     for (int t = 0; t <= nthreads; ++t) {
         size_t c = size * t / nthreads;
-        while (c > 0 && c < size && base[c - 1] != '
-') ++c;
+        while (c > 0 && c < size && base[c - 1] != '\n') ++c;
         cut[t] = c;
     }
 
@@ -373,10 +371,9 @@ Index build_index(const File& f, TermTable& terms, std::vector<u32>& query_terms
 
             u32 doc = first;
             for (const uint8_t* p = begin; p < end; ++doc) {
-                const uint8_t* nl = static_cast<const uint8_t*>(memchr(p, '
-', end - p));
+                const uint8_t* nl = static_cast<const uint8_t*>(memchr(p, '\n', end - p));
                 if (!nl) nl = end;
-                const uint8_t* tx = static_cast<const uint8_t*>(memchr(p, '	', nl - p));
+                const uint8_t* tx = static_cast<const uint8_t*>(memchr(p, '\t', nl - p));
                 if (!tx) tx = p; else ++tx;
                 ix.text[2 * size_t(doc)] = tx - base;
                 ix.text[2 * size_t(doc) + 1] = nl - base;
