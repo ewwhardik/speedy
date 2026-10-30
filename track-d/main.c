@@ -124,7 +124,7 @@ static Item pop(Th *t, size_t *hn) {
 // -2 when 32-bit distances would overflow (wide = 0 only).
 static int64_t search(Th *t, uint32_t s, uint32_t tg, int wide) {
   size_t hn = 0, nt = 0;
-  int64_t res = -1;
+  uint64_t tg_bound = wide ? UINT64_MAX : INF32;
 #define DIST(x) (wide ? t->d64[x] : t->d32[x])
 #define SET(x, val) (wide ? (void)(t->d64[x] = (val)) : (void)(t->d32[x] = (uint32_t)(val)))
   SET(s, 0);
@@ -134,15 +134,16 @@ static int64_t search(Th *t, uint32_t s, uint32_t tg, int wide) {
     Item it = pop(t, &hn);
     if (it.d > DIST(it.u))
       continue; // stale: u was settled at a shorter distance
-    if (it.u == tg) {
-      res = it.d;
+    if (it.u == tg || it.d >= tg_bound)
       break;
-    }
     for (uint32_t e = off[it.u]; e < off[it.u + 1]; e++) {
       uint32_t v = edges[e].v;
-      uint64_t nd = it.d + edges[e].w, dv = DIST(v);
+      uint64_t nd = it.d + edges[e].w;
+      if (nd >= tg_bound)
+        continue;
+      uint64_t dv = DIST(v);
       if (!wide && nd >= INF32) {
-        res = -2;
+        tg_bound = (uint64_t)-2;
         hn = 0;
         break;
       }
@@ -153,13 +154,17 @@ static int64_t search(Th *t, uint32_t s, uint32_t tg, int wide) {
           t->touched[nt++] = v;
         }
         SET(v, nd);
+        if (v == tg)
+          tg_bound = nd;
         push(t, &hn, nd, v);
       }
     }
   }
   for (size_t i = 0; i < nt; i++) // reset only what this search touched
     SET(t->touched[i], wide ? UINT64_MAX : INF32);
-  return res;
+  if (tg_bound == (uint64_t)-2)
+    return -2;
+  return tg_bound == (wide ? UINT64_MAX : INF32) ? -1 : (int64_t)tg_bound;
 }
 
 static void *answer(void *arg) {
@@ -189,14 +194,19 @@ static void *answer(void *arg) {
 
 static void run_threads(void *(*f)(void *)) {
   pthread_t id[64];
+  pthread_attr_t attr;
+  pthread_attr_init(&attr);
+  pthread_attr_setstacksize(&attr, 64 * 1024);
   for (int i = 0; i < nth; i++)
-    if (pthread_create(&id[i], NULL, f, &th[i]))
+    if (pthread_create(&id[i], &attr, f, &th[i]))
       die("pthread_create failed");
+  pthread_attr_destroy(&attr);
   for (int i = 0; i < nth; i++)
     pthread_join(id[i], NULL);
 }
 
 int main(void) {
+  mallopt(M_ARENA_MAX, 1);
   // queries.txt: "s t" per line.
   FILE *qf = fopen("/data/queries.txt", "r");
   if (!qf)

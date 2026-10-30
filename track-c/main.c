@@ -241,9 +241,13 @@ static void *parse(void *arg) {
 
 static void run_threads(void *(*f)(void *)) {
   pthread_t id[64];
+  pthread_attr_t attr;
+  pthread_attr_init(&attr);
+  pthread_attr_setstacksize(&attr, 64 * 1024);
   for (int i = 0; i < nth; i++)
-    if (pthread_create(&id[i], NULL, f, &th[i]))
+    if (pthread_create(&id[i], &attr, f, &th[i]))
       die("pthread_create failed");
+  pthread_attr_destroy(&attr);
   for (int i = 0; i < nth; i++)
     pthread_join(id[i], NULL);
 }
@@ -259,6 +263,7 @@ static int cmp_group(const void *x, const void *y) {
 }
 
 int main(void) {
+  mallopt(M_ARENA_MAX, 1);
   // regions.csv: "region_id,country" lines after the header.
   int rf = open("/data/regions.csv", O_RDONLY);
   struct stat st;
