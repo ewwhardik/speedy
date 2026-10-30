@@ -38,10 +38,16 @@ inline const char* find(const char* s, char c) {
 }
 
 inline u32 parse_digits(const char* end, u32 len) {
-    const char* s = end - len;
-    u32 v = 0;
-    while (s < end) v = v * 10 + (*s++ - '0');
-    return v;
+    __m128i v = _mm_loadu_si128(reinterpret_cast<const __m128i*>(end - 16));
+    v = _mm_subs_epu8(v, _mm_set1_epi8('0'));
+    __m128i lane = _mm_setr_epi8(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15);
+    v = _mm_and_si128(v, _mm_cmpgt_epi8(lane, _mm_set1_epi8(char(15 - len))));
+    v = _mm_maddubs_epi16(v, _mm_set1_epi16(0x010A));
+    v = _mm_madd_epi16(v, _mm_set1_epi32(0x00010064));
+    v = _mm_packus_epi32(v, v);
+    v = _mm_madd_epi16(v, _mm_set1_epi32(0x00012710));
+    u64 high = u32(_mm_cvtsi128_si32(v)), low = u32(_mm_extract_epi32(v, 1));
+    return u32(high * 100000000 + low);
 }
 
 inline char* write_u32(char* p, u32 x) {

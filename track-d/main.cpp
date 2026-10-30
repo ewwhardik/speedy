@@ -137,6 +137,7 @@ int main() {
         if (p < qdata + qsize) ++p;
         queries.emplace_back(s, t);
     }
+    munmap(const_cast<char*>(qdata), qsize + 4096);
 
     const char* p = graph_data;
     const u32 n = number(p); ++p;
@@ -220,6 +221,13 @@ int main() {
         }
     });
 
+    munmap(const_cast<char*>(graph_data), gsize + 4096);
+    std::vector<std::vector<u32>>().swap(f_count);
+    std::vector<std::vector<u32>>().swap(b_count);
+    std::vector<std::vector<u32>>().swap(f_cur);
+    std::vector<std::vector<u32>>().swap(b_cur);
+    std::vector<size_t>().swap(cut);
+
     std::vector<int64_t> answers(queries.size());
     std::atomic<size_t> next_q{0};
 
@@ -288,7 +296,18 @@ int main() {
 
     std::string out;
     out.reserve(queries.size() * 12);
-    for (int64_t a : answers) out += std::to_string(a) + '\n';
+    char buf[32];
+    for (int64_t a : answers) {
+        if (a < 0) {
+            out += "-1\n";
+        } else {
+            char* p = buf + 31;
+            *p = '\n';
+            uint64_t x = static_cast<uint64_t>(a);
+            do { *--p = '0' + (x % 10); x /= 10; } while (x);
+            out.append(p, (buf + 32) - p);
+        }
+    }
 
     FILE* f = fopen("/out/distances.txt", "wb");
     if (!f) { perror("/out/distances.txt"); return 1; }
