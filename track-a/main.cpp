@@ -20,7 +20,9 @@
 #include <immintrin.h>
 #include <string>
 #include <string_view>
+#include <malloc.h>
 #include <sys/mman.h>
+#include <sys/prctl.h>
 #include <thread>
 #include <unistd.h>
 #include <utility>
@@ -170,6 +172,8 @@ void run_threads(int n, F&& body) {
 }
 
 int main() {
+    prctl(PR_SET_THP_DISABLE, 1, 0, 0, 0);
+    mallopt(M_MMAP_THRESHOLD, 1 << 16);
     const int nthreads = std::clamp<int>(std::thread::hardware_concurrency(), 1, 12);
     int fd = open("/data/requests.log", O_RDONLY);
     FILE* out = fopen("/out/summary.txt", "wb");
@@ -212,6 +216,7 @@ int main() {
     // Hours are claimed in order by the pool; a writer thread writes them in
     // order as each one finishes.
     std::vector<std::string> text(HOURS);
+    for (int h = 0; h < HOURS; ++h) text[h].reserve(131072);
     std::vector<std::atomic<bool>> done(HOURS);
     std::thread writer([&] {
         for (int h = 0; h < HOURS; ++h) {
@@ -258,11 +263,18 @@ int main() {
                 // reorder its whole range, so read each value before narrowing
                 // to the tail for the next one.
                 u32 v[6] = {n, 0, 0, 0, errors[e], u32(u64(errors[e]) * 1000000 / n)};
-                u32 lo = 0, k = 1;
-                for (u32 p : {50u, 95u, 99u}) {
-                    u32 r = (p * n + 99) / 100 - 1;
-                    std::nth_element(a + lo, a + r, a + n);
-                    v[k++] = a[lo = r];
+                if (n <= 128) {
+                    std::sort(a, a + n);
+                    v[1] = a[(50u * n + 99) / 100 - 1];
+                    v[2] = a[(95u * n + 99) / 100 - 1];
+                    v[3] = a[(99u * n + 99) / 100 - 1];
+                } else {
+                    u32 lo = 0, k = 1;
+                    for (u32 p : {50u, 95u, 99u}) {
+                        u32 r = (p * n + 99) / 100 - 1;
+                        std::nth_element(a + lo, a + r, a + n);
+                        v[k++] = a[lo = r];
+                    }
                 }
                 char* o = std::copy(names[e].begin(), names[e].end(), std::copy_n(label, 21, line));
                 for (u32 x : v) {
