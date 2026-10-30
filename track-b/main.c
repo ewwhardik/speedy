@@ -665,8 +665,6 @@ int main(void) {
     maxlen = dlen[d] > maxlen ? dlen[d] : maxlen;
   lcap = (maxlist > N / 32 ? maxlist : N / 32) + 1;
   for (int i = 0; i < nth; i++) {
-    free(th[i].buf);
-    free(th[i].tokids);
     free(th[i].tc);
     th[i].text = malloc(maxlen + 64); // slack for tokenize's reads past the data
     th[i].la = malloc(lcap * 4ull);
