@@ -98,7 +98,7 @@ private:
 
 class NameTable {
 public:
-    static constexpr u32 SLOTS = 1 << 17, IDS = 1 << 17, HEAD = 24;
+    static constexpr u32 SLOTS = 1 << 18, IDS = 1 << 17, HEAD = 24;
 
     struct Probe {
         u32 slot;
