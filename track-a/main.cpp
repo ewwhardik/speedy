@@ -11,18 +11,16 @@
 // nth_element calls per group give the percentiles, and the lines are formatted
 // in output order. A writer thread writes each hour as soon as it is done.
 #include <algorithm>
-#include <array>
 #include <atomic>
-#include <barrier>
 #include <charconv>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <fcntl.h>
 #include <immintrin.h>
-#include <malloc.h>
 #include <string>
 #include <string_view>
+#include <malloc.h>
 #include <sys/mman.h>
 #include <sys/prctl.h>
 #include <thread>
@@ -74,41 +72,35 @@ u32 parse_digits(const char* end, u32 len) {
 }
 
 // Endpoint interning: open addressing on a CRC of the endpoint's first and last
-// eight bytes. Slot caches head8 and tail4 to eliminate memcmp for short names.
+// eight bytes. Filter caches head8 to eliminate memcmp for short names.
 class EndpointTable {
 public:
-    static constexpr u32 SLOTS = 1 << 12;
-    struct alignas(16) Slot {
-        u64 head8;
-        u32 tail4;
-        u16 len;
-        u16 id;  // 0 = empty, else id + 1
-    };
+    static constexpr u32 SLOTS = 1 << 12, MAX = SLOTS / 2;
     std::vector<std::string_view> names;
-    std::vector<Slot> slots_ = std::vector<Slot>(SLOTS);
 
     u32 intern(const char* s, u32 len) {
-        u64 a = load8(s);
-        u64 b = len >= 8 ? load8(s + len - 8) : 0;
+        u64 a = load8(s), b = len >= 8 ? load8(s + len - 8) : 0;
         if (len < 8) a &= (u64(1) << (8 * len)) - 1;
-        u32 h = _mm_crc32_u64(_mm_crc32_u64(len, a), b);
-        u32 t4 = len >= 4 ? *reinterpret_cast<const u32*>(s + len - 4) : 0;
-        for (u32 i = h & (SLOTS - 1);; i = (i + 1) & (SLOTS - 1)) {
-            Slot& slot = slots_[i];
-            if (slot.id == 0) {
-                slot.head8 = a;
-                slot.tail4 = t4;
-                slot.len = len;
+        for (u32 i = _mm_crc32_u64(_mm_crc32_u64(len, a), b);; ++i) {
+            u32 slot_idx = i & (SLOTS - 1);
+            u32& slot = slots_[slot_idx];
+            if (slot == 0) {
+                if (names.size() == MAX) { fputs("too many endpoints\n", stderr); _exit(1); }
                 names.emplace_back(s, len);
-                return (slot.id = names.size()) - 1;
+                heads_[slot_idx] = a;
+                return (slot = names.size()) - 1;
             }
-            if (slot.len == len && slot.head8 == a) {
-                if (len <= 8 || (len <= 12 && slot.tail4 == t4)) return slot.id - 1;
-                std::string_view n = names[slot.id - 1];
-                if (memcmp(n.data(), s, len) == 0) return slot.id - 1;
+            if (heads_[slot_idx] == a) {
+                if (len <= 8) return slot - 1;
+                std::string_view n = names[slot - 1];
+                if (n.size() == len && memcmp(n.data(), s, len) == 0) return slot - 1;
             }
         }
     }
+
+private:
+    std::vector<u32> slots_ = std::vector<u32>(SLOTS);
+    std::vector<u64> heads_ = std::vector<u64>(SLOTS);
 };
 
 struct Block {
@@ -172,6 +164,13 @@ void hour_label(int h, char* o) {
             day < 2 ? 30 + day : day - 1, (h + 18) % 24);
 }
 
+template <class F>
+void run_threads(int n, F&& body) {
+    std::vector<std::thread> pool;
+    for (int t = 0; t < n; ++t) pool.emplace_back(body, t);
+    for (auto& th : pool) th.join();
+}
+
 int main() {
     prctl(PR_SET_THP_DISABLE, 1, 0, 0, 0);
     mallopt(M_MMAP_THRESHOLD, 1 << 16);
@@ -196,32 +195,24 @@ int main() {
         while (cut[t] < size && data[cut[t] - 1] != '\n') ++cut[t];
     }
     std::vector<Worker> workers(nthreads);
+    run_threads(nthreads, [&](int t) { workers[t].parse(data + cut[t], data + cut[t + 1]); });
 
     EndpointTable global;
     std::vector<std::vector<u32>> rank(nthreads);
-    std::vector<std::string_view> names;
-    std::vector<u32> rank_of;
-    u32 ne = 0;
+    for (int t = 0; t < nthreads; ++t)
+        for (std::string_view n : workers[t].endpoints.names)
+            rank[t].push_back(global.intern(n.data(), n.size()));
+    std::vector<std::string_view> names = global.names;
+    std::sort(names.begin(), names.end());
+    std::vector<u32> rank_of(names.size());
+    for (u32 i = 0; i < names.size(); ++i)
+        rank_of[global.intern(names[i].data(), names[i].size())] = i;
+    for (auto& r : rank)
+        for (u32& id : r) id = rank_of[id];
 
     std::vector<std::string> text(HOURS);
     for (int h = 0; h < HOURS; ++h) text[h].reserve(131072);
     std::vector<std::atomic<bool>> done(HOURS);
-    std::atomic<int> next{0};
-
-    std::barrier sync(nthreads, [&]() noexcept {
-        for (int t = 0; t < nthreads; ++t)
-            for (std::string_view n : workers[t].endpoints.names)
-                rank[t].push_back(global.intern(n.data(), n.size()));
-        names = global.names;
-        std::sort(names.begin(), names.end());
-        rank_of.resize(names.size());
-        for (u32 i = 0; i < names.size(); ++i)
-            rank_of[global.intern(names[i].data(), names[i].size())] = i;
-        for (auto& r : rank)
-            for (u32& id : r) id = rank_of[id];
-        ne = names.size();
-    });
-
     std::thread writer([&] {
         for (int h = 0; h < HOURS; ++h) {
             done[h].wait(false);
@@ -229,71 +220,65 @@ int main() {
             std::string().swap(text[h]);
         }
     });
-
-    std::vector<std::thread> pool;
-    for (int t = 0; t < nthreads; ++t) {
-        pool.emplace_back([&, t] {
-            workers[t].parse(data + cut[t], data + cut[t + 1]);
-            sync.arrive_and_wait();
-
-            std::vector<u32> count, errors, cursor, lat;
-            for (int h; (h = next++) < HOURS;) {
-                count.assign(ne + 1, 0);
-                errors.assign(ne, 0);
-                for (int w = 0; w < nthreads; ++w) {
-                    auto tally = [&](u32 key) {
-                        u32 e = rank[w][key & ID_MASK];
-                        ++count[e + 1];
-                        errors[e] += (key & ERR_BIT) != 0;
-                    };
-                    for (Block* b = workers[w].head[h]; b; b = b->next)
-                        for (u32 i = 0; i < b->n; ++i) tally(b->rec[i]);
-                    for (auto [l, key] : workers[w].big[h]) tally(key);
-                }
-                for (u32 e = 0; e < ne; ++e) count[e + 1] += count[e];
-                cursor.assign(count.begin(), count.end() - 1);
-                lat.resize(count[ne]);
-                for (int w = 0; w < nthreads; ++w) {
-                    for (Block* b = workers[w].head[h]; b; b = b->next)
-                        for (u32 i = 0; i < b->n; ++i)
-                            lat[cursor[rank[w][b->rec[i] & ID_MASK]]++] = b->rec[i] >> KEY_BITS;
-                    for (auto [l, key] : workers[w].big[h]) lat[cursor[rank[w][key & ID_MASK]]++] = l;
-                }
-
-                char label[22], line[256];
-                hour_label(h, label);
-                for (u32 e = 0; e < ne; ++e) {
-                    u32* a = lat.data() + count[e];
-                    u32 n = count[e + 1] - count[e];
-                    if (n == 0) continue;
-                    u32 v[6] = {n, 0, 0, 0, errors[e], u32(u64(errors[e]) * 1000000 / n)};
-                    if (n <= 128) {
-                        std::sort(a, a + n);
-                        v[1] = a[(50u * n + 99) / 100 - 1];
-                        v[2] = a[(95u * n + 99) / 100 - 1];
-                        v[3] = a[(99u * n + 99) / 100 - 1];
-                    } else {
-                        u32 lo = 0, k = 1;
-                        for (u32 p : {50u, 95u, 99u}) {
-                            u32 r = (p * n + 99) / 100 - 1;
-                            std::nth_element(a + lo, a + r, a + n);
-                            v[k++] = a[lo = r];
-                        }
-                    }
-                    char* o = std::copy(names[e].begin(), names[e].end(), std::copy_n(label, 21, line));
-                    for (u32 x : v) {
-                        *o++ = ' ';
-                        o = std::to_chars(o, o + 10, x).ptr;
-                    }
-                    *o++ = '\n';
-                    text[h].append(line, o);
-                }
-                done[h] = true;
-                done[h].notify_one();
+    const u32 ne = names.size();
+    std::atomic<int> next{0};
+    run_threads(nthreads, [&](int) {
+        std::vector<u32> count, errors, cursor, lat;
+        for (int h; (h = next++) < HOURS;) {
+            count.assign(ne + 1, 0);
+            errors.assign(ne, 0);
+            for (int t = 0; t < nthreads; ++t) {
+                auto tally = [&](u32 key) {
+                    u32 e = rank[t][key & ID_MASK];
+                    ++count[e + 1];
+                    errors[e] += (key & ERR_BIT) != 0;
+                };
+                for (Block* b = workers[t].head[h]; b; b = b->next)
+                    for (u32 i = 0; i < b->n; ++i) tally(b->rec[i]);
+                for (auto [l, key] : workers[t].big[h]) tally(key);
             }
-        });
-    }
-    for (auto& th : pool) th.join();
+            for (u32 e = 0; e < ne; ++e) count[e + 1] += count[e];
+            cursor.assign(count.begin(), count.end() - 1);
+            lat.resize(count[ne]);
+            for (int t = 0; t < nthreads; ++t) {
+                for (Block* b = workers[t].head[h]; b; b = b->next)
+                    for (u32 i = 0; i < b->n; ++i)
+                        lat[cursor[rank[t][b->rec[i] & ID_MASK]]++] = b->rec[i] >> KEY_BITS;
+                for (auto [l, key] : workers[t].big[h]) lat[cursor[rank[t][key & ID_MASK]]++] = l;
+            }
+
+            char label[22], line[256];
+            hour_label(h, label);
+            for (u32 e = 0; e < ne; ++e) {
+                u32* a = lat.data() + count[e];
+                u32 n = count[e + 1] - count[e];
+                if (n == 0) continue;
+                u32 v[6] = {n, 0, 0, 0, errors[e], u32(u64(errors[e]) * 1000000 / n)};
+                if (n <= 128) {
+                    std::sort(a, a + n);
+                    v[1] = a[(50u * n + 99) / 100 - 1];
+                    v[2] = a[(95u * n + 99) / 100 - 1];
+                    v[3] = a[(99u * n + 99) / 100 - 1];
+                } else {
+                    u32 lo = 0, k = 1;
+                    for (u32 p : {50u, 95u, 99u}) {
+                        u32 r = (p * n + 99) / 100 - 1;
+                        std::nth_element(a + lo, a + r, a + n);
+                        v[k++] = a[lo = r];
+                    }
+                }
+                char* o = std::copy(names[e].begin(), names[e].end(), std::copy_n(label, 21, line));
+                for (u32 x : v) {
+                    *o++ = ' ';
+                    o = std::to_chars(o, o + 10, x).ptr;
+                }
+                *o++ = '\n';
+                text[h].append(line, o);
+            }
+            done[h] = true;
+            done[h].notify_one();
+        }
+    });
     writer.join();
     fclose(out);
     return 0;
