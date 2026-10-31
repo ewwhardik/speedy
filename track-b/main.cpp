@@ -58,10 +58,11 @@ File map_file(const std::string& path) {
     fstat(fd, &st);
     f.size = st.st_size;
     void* p = mmap(nullptr, f.size + 4096, PROT_READ, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-    if (f.size && mmap(p, f.size, PROT_READ, MAP_PRIVATE | MAP_FIXED, fd, 0) == MAP_FAILED) {
+    if (f.size && mmap(p, f.size, PROT_READ, MAP_PRIVATE | MAP_FIXED | MAP_POPULATE, fd, 0) == MAP_FAILED) {
         perror("mmap");
         _exit(1);
     }
+    madvise(p, f.size, MADV_WILLNEED | MADV_HUGEPAGE);
     f.data = static_cast<const uint8_t*>(p);
     close(fd);
     return f;

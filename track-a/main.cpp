@@ -43,6 +43,12 @@ const char* find(const char* s, char c) {
 }
 
 inline u32 parse_digits(const char* end, u32 len) {
+    if (len <= 4) {
+        if (len == 2) return (end[-2] - '0') * 10 + (end[-1] - '0');
+        if (len == 3) return (end[-3] - '0') * 100 + (end[-2] - '0') * 10 + (end[-1] - '0');
+        if (len == 4) return (end[-4] - '0') * 1000 + (end[-3] - '0') * 100 + (end[-2] - '0') * 10 + (end[-1] - '0');
+        if (len == 1) return end[-1] - '0';
+    }
     __m128i v = _mm_loadu_si128(reinterpret_cast<const __m128i*>(end - 16));
     v = _mm_subs_epu8(v, _mm_set1_epi8('0'));
     __m128i lane = _mm_setr_epi8(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15);
@@ -161,7 +167,8 @@ int main() {
 
     size_t size = lseek(fd, 0, SEEK_END);
     auto* data = static_cast<char*>(mmap(nullptr, size + 4096, PROT_READ, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0));
-    if (size && mmap(data, size, PROT_READ, MAP_PRIVATE | MAP_FIXED, fd, 0) == MAP_FAILED) return 1;
+    if (size && mmap(data, size, PROT_READ, MAP_PRIVATE | MAP_FIXED | MAP_POPULATE, fd, 0) == MAP_FAILED) return 1;
+    madvise(data, size, MADV_WILLNEED | MADV_HUGEPAGE);
 
     std::vector<size_t> cut(nthreads + 1, size);
     cut[0] = 0;
@@ -231,7 +238,7 @@ int main() {
                 cursor.assign(count.begin(), count.end() - 1);
                 lat.resize(count[ne]);
                 for (int i = 0; i < nthreads; ++i) {
-                    for (Block* b = workers[i].head[h]; b; madvise(std::exchange(b, b->next), sizeof(Block), MADV_DONTNEED))
+                    for (Block* b = workers[i].head[h]; b; b = b->next)
                         for (u32 j = 0; j < b->n; ++j)
                             lat[cursor[rank[i][b->rec[j] & ID_MASK]]++] = b->rec[j] >> KEY_BITS;
                     for (auto [l, key] : workers[i].big[h]) lat[cursor[rank[i][key & ID_MASK]]++] = l;
