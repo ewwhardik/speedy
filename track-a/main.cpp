@@ -121,11 +121,11 @@ struct Worker {
     void parse(const char* p, const char* end) {
         const size_t reserve = ((end - p) / 40 / Block::CAP + 1 + HOURS) * sizeof(Block);
         region = static_cast<char*>(mmap(nullptr, reserve, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0));
-        u32 last_prefix = 0;
+        u64 last_prefix = 0;
         int last_h = 0;
+        Block* cur_b = nullptr;
         while (p < end) {
-            u32 prefix;
-            memcpy(&prefix, p + 8, 4);
+            u64 prefix = load8(p + 6);
             int h;
             if (__builtin_expect(prefix == last_prefix, 1)) {
                 h = last_h;
@@ -135,6 +135,7 @@ struct Worker {
                 h = (p[6] == '0' ? day - 30 : day + 1) * 24 + hour - 18;
                 last_prefix = prefix;
                 last_h = h;
+                cur_b = head[h];
             }
 
             const char* m = p + 28;
@@ -156,14 +157,14 @@ struct Worker {
                 big[h].push_back({lat, key});
                 continue;
             }
-            Block*& b = head[h];
-            if (!b || b->n == Block::CAP) {
+            if (__builtin_expect(!cur_b || cur_b->n == Block::CAP, 0)) {
                 auto* fresh = reinterpret_cast<Block*>(region + used);
                 used += sizeof(Block);
-                fresh->next = b;
-                b = fresh;
+                fresh->next = head[h];
+                head[h] = fresh;
+                cur_b = fresh;
             }
-            b->rec[b->n++] = lat << KEY_BITS | key;
+            cur_b->rec[cur_b->n++] = lat << KEY_BITS | key;
         }
     }
 };
