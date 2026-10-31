@@ -290,7 +290,7 @@ struct Index {
 // as it has been read, so the memory really goes back; malloc would keep it.
 class BlockList {
 public:
-    static constexpr size_t BLOCK = 1 << 12;          // entries per block
+    static constexpr size_t BLOCK = 1 << 14;          // entries per block
     static constexpr size_t BYTES = 3 * BLOCK + 1;    // a 4-byte store at the last entry spills one byte
     ~BlockList() { for (uint8_t* b : blocks_) munmap(b, BYTES); }
 
@@ -401,9 +401,8 @@ Index build_index(const File& f, TermTable& terms, std::vector<u32>& query_terms
 
             // Calls term(id, doc) once per distinct known term of each document
             // in [begin, stop), and done() after each document. Returns the count.
-            auto walk = [&](const uint8_t* stop, auto&& term, auto&& done, bool discard_pages = false) {
+            auto walk = [&](const uint8_t* stop, auto&& term, auto&& done) {
                 u32 doc = first;
-                const uint8_t* adv = begin;
                 for (const uint8_t* p = begin; p < stop; ++doc) {
                     const uint8_t* nl = static_cast<const uint8_t*>(memchr(p, '\n', end - p));
                     const uint8_t* tx = static_cast<const uint8_t*>(memchr(p, '\t', nl - p)) + 1;
@@ -414,14 +413,6 @@ Index build_index(const File& f, TermTable& terms, std::vector<u32>& query_terms
                     });
                     done();
                     p = nl + 1;
-                    if (discard_pages && p - adv >= (256 << 10)) {
-                        size_t len = (p - adv) & ~size_t(4095);
-                        madvise(const_cast<uint8_t*>(adv), len, MADV_DONTNEED);
-                        adv += len;
-                    }
-                }
-                if (discard_pages && adv < stop) {
-                    madvise(const_cast<uint8_t*>(adv), stop - adv, MADV_DONTNEED);
                 }
                 return doc - first;
             };
@@ -441,7 +432,7 @@ Index build_index(const File& f, TermTable& terms, std::vector<u32>& query_terms
                     out[id >> BUCKET_BITS].push((id & ((1u << BUCKET_BITS) - 1)) << DOC_BITS | (doc - first));
                     ++cnt[id];
                 }
-            }, [] {}, true);
+            }, [] {});
             if (docs >> DOC_BITS) { fputs("too many documents per thread\n", stderr); _exit(1); }
         });
     }
@@ -476,6 +467,7 @@ Index build_index(const File& f, TermTable& terms, std::vector<u32>& query_terms
     }
     for (auto& th : pool) th.join();
     ix.seg_end = std::move(count);
+    seen.clear();
     malloc_trim(0);
 
     ix.df.resize(nterms);

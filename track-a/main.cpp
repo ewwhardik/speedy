@@ -60,37 +60,31 @@ public:
     static constexpr u32 SLOTS = 1 << 12, MAX = SLOTS / 2;
     std::vector<std::string_view> names;
 
-    struct alignas(8) Slot {
-        u32 hash = 0;
-        u16 id_plus_1 = 0;
-        u16 len = 0;
-    };
-
     u32 intern(const char* s, u32 len) {
         u64 a = load8(s), b = len >= 8 ? load8(s + len - 8) : 0;
         if (len < 8) a &= (u64(1) << (8 * len)) - 1;
         u32 h = _mm_crc32_u64(_mm_crc32_u64(len, a), b);
+        u64 tag = (u64(h) << 32) | (u64(len) << 16);
         for (u32 i = h;; ++i) {
-            Slot& slot = slots_[i & (SLOTS - 1)];
-            if (slot.id_plus_1 == 0) {
+            u64& slot = slots_[i & (SLOTS - 1)];
+            if (__builtin_expect((slot & 0xFFFF) == 0, 0)) {
                 if (names.size() == MAX) _exit(1);
                 u32 id = names.size();
                 names.emplace_back(s, len);
-                slot.hash = h;
-                slot.len = len;
-                slot.id_plus_1 = id + 1;
+                slot = tag | (id + 1);
                 return id;
             }
-            if (slot.hash == h && slot.len == len) {
-                std::string_view name = names[slot.id_plus_1 - 1];
+            if (__builtin_expect((slot & 0xFFFFFFFFFFFF0000ull) == tag, 1)) {
+                u32 id = u32(slot & 0xFFFF) - 1;
+                std::string_view name = names[id];
                 if (__builtin_expect(memcmp(name.data(), s, len) == 0, 1))
-                    return slot.id_plus_1 - 1;
+                    return id;
             }
         }
     }
 
 private:
-    std::array<Slot, SLOTS> slots_{};
+    std::array<u64, SLOTS> slots_{};
 };
 
 struct Block {
@@ -157,13 +151,6 @@ void hour_label(int h, char out[22]) {
             day < 2 ? 30 + day : day - 1, (h + 18) % 24);
 }
 
-template <class F>
-void run_threads(int n, F&& body) {
-    std::vector<std::thread> pool;
-    for (int t = 0; t < n; ++t) pool.emplace_back(body, t);
-    for (auto& th : pool) th.join();
-}
-
 int main() {
     prctl(PR_SET_THP_DISABLE, 1, 0, 0, 0);
     mallopt(M_MMAP_THRESHOLD, 1 << 16);
@@ -183,20 +170,10 @@ int main() {
         while (cut[t] < size && data[cut[t] - 1] != '\n') ++cut[t];
     }
     std::vector<Worker> workers(nthreads);
-    run_threads(nthreads, [&](int t) { workers[t].parse(data + cut[t], data + cut[t + 1]); });
 
     EndpointTable global;
     std::vector<std::vector<u32>> rank(nthreads);
-    for (int t = 0; t < nthreads; ++t)
-        for (std::string_view n : workers[t].endpoints.names)
-            rank[t].push_back(global.intern(n.data(), n.size()));
-    std::vector<std::string_view> names = global.names;
-    std::sort(names.begin(), names.end());
-    std::vector<u32> rank_of(names.size());
-    for (u32 i = 0; i < names.size(); ++i)
-        rank_of[global.intern(names[i].data(), names[i].size())] = i;
-    for (auto& r : rank)
-        for (u32& id : r) id = rank_of[id];
+    std::vector<std::string_view> names;
 
     std::vector<std::string> text(HOURS);
     for (int h = 0; h < HOURS; ++h) text[h].reserve(131072);
@@ -209,16 +186,40 @@ int main() {
         }
     });
 
-    const u32 ne = names.size();
     std::atomic<int> next{0};
-    run_threads(nthreads, [&](int) {
-        std::vector<u32> count, errors, cursor, lat;
-        for (int h; (h = next++) < HOURS;) {
-            count.assign(ne + 1, 0);
-            errors.assign(ne, 0);
-            for (int i = 0; i < nthreads; ++i) {
-                auto tally = [&](u32 key) {
-                    u32 e = rank[i][key & ID_MASK];
+    std::atomic<int> arrived{0};
+    std::atomic<int> stage{0};
+
+    std::vector<std::thread> pool;
+    for (int t = 0; t < nthreads; ++t) {
+        pool.emplace_back([&, t] {
+            workers[t].parse(data + cut[t], data + cut[t + 1]);
+            if (arrived.fetch_add(1, std::memory_order_acq_rel) == nthreads - 1) {
+                for (int i = 0; i < nthreads; ++i)
+                    for (std::string_view n : workers[i].endpoints.names)
+                        rank[i].push_back(global.intern(n.data(), n.size()));
+                names = global.names;
+                std::sort(names.begin(), names.end());
+                std::vector<u32> rank_of(names.size());
+                for (u32 i = 0; i < names.size(); ++i)
+                    rank_of[global.intern(names[i].data(), names[i].size())] = i;
+                for (auto& r : rank)
+                    for (u32& id : r) id = rank_of[id];
+                stage.store(1, std::memory_order_release);
+            } else {
+                while (stage.load(std::memory_order_acquire) == 0) {
+                    _mm_pause();
+                }
+            }
+
+            const u32 ne = names.size();
+            std::vector<u32> count, errors, cursor, lat;
+            for (int h; (h = next++) < HOURS;) {
+                count.assign(ne + 1, 0);
+                errors.assign(ne, 0);
+                for (int i = 0; i < nthreads; ++i) {
+                    auto tally = [&](u32 key) {
+                        u32 e = rank[i][key & ID_MASK];
                         ++count[e + 1];
                         errors[e] += (key & ERR_BIT) != 0;
                     };
@@ -268,6 +269,8 @@ int main() {
                 done[h].notify_one();
             }
         });
+    }
+    for (auto& th : pool) th.join();
     writer.join();
     fclose(out);
     return 0;
