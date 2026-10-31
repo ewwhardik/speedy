@@ -145,7 +145,8 @@ void hour_label(int h, char out[22]) {
 
 int main() {
     prctl(PR_SET_THP_DISABLE, 1, 0, 0, 0);
-    const int nthreads = 12;
+    mallopt(M_MMAP_THRESHOLD, 1 << 16);
+    const int nthreads = std::clamp<int>(std::thread::hardware_concurrency(), 1, 12);
     int fd = open("/data/requests.log", O_RDONLY);
     FILE* out = fopen("/out/summary.txt", "wb");
     if (fd < 0 || !out) return 1;
