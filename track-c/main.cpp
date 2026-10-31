@@ -74,8 +74,17 @@ public:
             block_ += 64;
             if (block_ >= end_) return {end_, before_ + __builtin_popcountll(q_)};
             before_ += __builtin_popcountll(q_);
-            __m256i v0 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(block_));
-            __m256i v1 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(block_ + 32));
+            __m256i v0, v1;
+            if (__builtin_expect(block_ + 64 <= end_, 1)) {
+                v0 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(block_));
+                v1 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(block_ + 32));
+            } else {
+                alignas(32) char tail[64] = {};
+                size_t rem = end_ > block_ ? size_t(end_ - block_) : 0;
+                memcpy(tail, block_, rem);
+                v0 = _mm256_load_si256(reinterpret_cast<const __m256i*>(tail));
+                v1 = _mm256_load_si256(reinterpret_cast<const __m256i*>(tail + 32));
+            }
             u64 q0 = _mm256_movemask_epi8(_mm256_cmpeq_epi8(v0, _mm256_set1_epi8('"')));
             u64 q1 = _mm256_movemask_epi8(_mm256_cmpeq_epi8(v1, _mm256_set1_epi8('"')));
             q_ = q0 | (q1 << 32);
