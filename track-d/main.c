@@ -184,7 +184,7 @@ static void bpush(Bucket *b, uint32_t v) {
 static int64_t dial(Th *t, uint32_t s, uint32_t tg) {
   size_t live = 1, nt = 0;
   int64_t res = -1;
-  t->d32[s] = 0;
+  t->d32[s] = 1;
   t->touched[nt++] = s;
   bpush(&t->ring[0], s);
   for (uint32_t d = 0; live && res == -1; d++) {
@@ -192,7 +192,7 @@ static int64_t dial(Th *t, uint32_t s, uint32_t tg) {
     for (uint32_t k = 0; k < b->n && res == -1; k++) {
       uint32_t u = b->v[k];
       live--;
-      if (t->d32[u] != d)
+      if (t->d32[u] != d + 1)
         continue;
       if (u == tg)
         res = d;
@@ -200,15 +200,15 @@ static int64_t dial(Th *t, uint32_t s, uint32_t tg) {
         uint32_t v, w;
         edge_at(u, e, &v, &w);
         uint64_t nd = (uint64_t)d + w;
-        if (w >= RING || nd >= INF32)
+        if (w >= RING || nd + 1 >= INF32)
           res = -2;
-        else if (nd < t->d32[v]) {
-          if (t->d32[v] == INF32) {
+        else if (!t->d32[v] || nd + 1 < t->d32[v]) {
+          if (!t->d32[v]) {
             if (nt == t->tcap)
               t->touched = realloc(t->touched, (t->tcap *= 2) * 4);
             t->touched[nt++] = v;
           }
-          t->d32[v] = nd;
+          t->d32[v] = nd + 1;
           bpush(&t->ring[nd & (RING - 1)], v);
           live++;
         }
@@ -219,14 +219,13 @@ static int64_t dial(Th *t, uint32_t s, uint32_t tg) {
   for (int i = 0; i < RING; i++)
     t->ring[i].n = 0;
   for (size_t i = 0; i < nt; i++)
-    t->d32[t->touched[i]] = INF32;
+    t->d32[t->touched[i]] = 0;
   return res;
 }
 
 static void *answer(void *arg) {
   Th *t = arg;
-  t->d32 = malloc(n * 4ull);
-  memset(t->d32, 0xff, n * 4ull);
+  t->d32 = dist_array(n * 4ull);
   t->tcap = 1 << 16;
   t->touched = malloc(t->tcap * 4);
   t->hcap = 1 << 16;
