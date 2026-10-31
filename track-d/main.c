@@ -21,9 +21,6 @@ typedef struct {
   uint32_t v, w;
 } Edge;
 typedef struct {
-  uint32_t e, v, w;
-} Esc;
-typedef struct {
   uint64_t d;
   uint32_t u;
 } Item;
@@ -36,21 +33,16 @@ typedef struct {
   uint32_t *d32, *touched;
   uint64_t *d64;
   Item *heap;
-  Esc *esc;
-  size_t hcap, tcap, nesc, esccap;
+  size_t hcap, tcap;
   Bucket ring[RING];
 } Th;
 
 static int fd, nth, pass, next_q;
 static Th *th;
 static uint32_t n, nq, *off, *cur, *qs, *qt;
-static uint8_t *has_in, *has_in2;
+static uint8_t *has_in;
 static Edge *edges;
-static uint32_t *pk;
-static Esc *esc;
-static size_t nesc;
 static int64_t *ans;
-static uint32_t *order, *perm, *off2;
 
 static void die(const char *m) {
   fprintf(stderr, "%s\n", m);
@@ -126,29 +118,9 @@ static Item pop(Th *t, size_t *hn) {
 }
 
 static inline void edge_at(uint32_t u, uint32_t e, uint32_t *v, uint32_t *w) {
-  uint32_t x = pk[e];
-  if ((x & 0xFFFF) != ESC) {
-    *v = u + (int16_t)(x >> 16);
-    *w = x & 0xFFFF;
-    return;
-  }
-  if (!nesc) { *v = 0; *w = 0; return; }
-  size_t lo = 0, hi = nesc - 1;
-  while (lo <= hi) {
-    size_t mid = lo + (hi - lo) / 2;
-    if (esc[mid].e == e) {
-      *v = esc[mid].v;
-      *w = esc[mid].w;
-      return;
-    }
-    if (esc[mid].e < e) {
-      lo = mid + 1;
-    } else {
-      if (mid == 0) break;
-      hi = mid - 1;
-    }
-  }
-  *v = 0; *w = 0;
+  (void)u;
+  *v = edges[e].v;
+  *w = edges[e].w;
 }
 
 static void *dist_array(size_t bytes) {
@@ -262,42 +234,6 @@ static void *answer(void *arg) {
   return NULL;
 }
 
-static void share(Th *t, uint32_t *lo, uint32_t *hi) {
-  *lo = (uint64_t)n * (t - th) / nth;
-  *hi = (uint64_t)n * (t - th + 1) / nth;
-}
-
-static void *degrees(void *arg) {
-  uint32_t lo, hi;
-  share(arg, &lo, &hi);
-  for (uint32_t i = lo; i < hi; i++)
-    off2[i + 1] = off[order[i] + 1] - off[order[i]];
-  return NULL;
-}
-
-static void *remap(void *arg) {
-  Th *t = arg;
-  uint32_t lo, hi;
-  share(t, &lo, &hi);
-  for (uint32_t i = lo; i < hi; i++) {
-    uint32_t u = order[i], k = off2[i];
-    for (uint32_t e = off[u]; e < off[u + 1]; e++, k++) {
-      uint32_t v = perm[edges[e].v], w = edges[e].w;
-      int64_t dv = (int64_t)v - i;
-      if (dv >= INT16_MIN && dv <= INT16_MAX && w < ESC) {
-        pk[k] = (uint32_t)(uint16_t)dv << 16 | w;
-        continue;
-      }
-      if (t->nesc == t->esccap)
-        t->esc = realloc(t->esc, (t->esccap = t->esccap ? 2 * t->esccap : 256) * sizeof(Esc));
-      t->esc[t->nesc++] = (Esc){k, v, w};
-      pk[k] = ESC;
-    }
-    has_in2[i] = has_in[u];
-  }
-  return NULL;
-}
-
 static void run_threads(void *(*f)(void *)) {
   pthread_t id[64];
   for (int i = 0; i < nth; i++)
@@ -375,56 +311,6 @@ int main(void) {
   free(cur);
   for (int i = 0; i < nth; i++)
     free(th[i].buf);
-
-  order = malloc(n * 4ull);
-  perm = malloc(n * 4ull);
-  uint32_t tail = 0;
-  memset(perm, 0xff, n * 4ull);
-  for (uint32_t r = 0; r < n; r++) {
-    if (perm[r] != INF32)
-      continue;
-    perm[r] = tail;
-    order[tail++] = r;
-    for (uint32_t h = tail - 1; h < tail; h++) {
-      if (h + 16 < tail)
-        __builtin_prefetch(&off[order[h + 16]]);
-      if (h + 8 < tail)
-        __builtin_prefetch(&edges[off[order[h + 8]]]);
-      for (uint32_t e = h + 4 < tail ? off[order[h + 4]] : 0; h + 4 < tail && e < off[order[h + 4] + 1]; e++)
-        __builtin_prefetch(&perm[edges[e].v]);
-      for (uint32_t e = off[order[h]]; e < off[order[h] + 1]; e++)
-        if (perm[edges[e].v] == INF32) {
-          perm[edges[e].v] = tail;
-          order[tail++] = edges[e].v;
-        }
-    }
-  }
-
-  off2 = malloc((n + 2) * 4ull);
-  pk = malloc((off[n] + 1ull) * 4);
-  has_in2 = malloc(n + 1ull);
-  off2[0] = 0;
-  run_threads(degrees);
-  for (uint32_t i = 0; i < n; i++)
-    off2[i + 1] += off2[i];
-  run_threads(remap);
-  free(edges);
-  free(off);
-  free(has_in);
-  free(order);
-  off = off2;
-  has_in = has_in2;
-  for (int i = 0; i < nth; i++)
-    nesc += th[i].nesc;
-  esc = malloc((nesc + 1) * sizeof(Esc));
-  for (int i = 0, k = 0; i < nth; k += th[i].nesc, i++)
-    if (th[i].nesc)
-      memcpy(esc + k, th[i].esc, th[i].nesc * sizeof(Esc));
-  for (uint32_t i = 0; i < nq; i++) {
-    qs[i] = perm[qs[i]];
-    qt[i] = perm[qt[i]];
-  }
-  free(perm);
 
   ans = malloc((nq + 1) * sizeof *ans);
   run_threads(answer);
