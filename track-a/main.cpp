@@ -32,9 +32,6 @@ using u32 = uint32_t;
 using u64 = uint64_t;
 
 constexpr int HOURS = 72;          // 2026-10-30T18:00Z to 2026-11-02T17:59:59Z
-// A record is one u32: the latency above a 12-bit key (11-bit local endpoint
-// id, then the 5xx flag). Latencies of 2^20 us or more (about 1% of lines)
-// do not fit and go to a side list with their key.
 constexpr u32 KEY_BITS = 12, ID_MASK = (1u << 11) - 1, ERR_BIT = 1u << 11, BIG = 1u << 20;
 
 inline u64 load8(const char* p) {
@@ -55,52 +52,49 @@ const char* find(const char* s, char c) {
         if (u32 m = match32(s, c)) return s + __builtin_ctz(m);
 }
 
-// The value of the len (1 to 10) decimal digits that end just before end,
-// without a loop: the 16 bytes before end, minus '0', with the bytes ahead of
-// the number zeroed, are folded 2, 4 and 8 digits at a time.
-u32 parse_digits(const char* end, u32 len) {
-    __m128i v = _mm_loadu_si128(reinterpret_cast<const __m128i*>(end - 16));
-    v = _mm_subs_epu8(v, _mm_set1_epi8('0'));
-    __m128i lane = _mm_setr_epi8(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15);
-    v = _mm_and_si128(v, _mm_cmpgt_epi8(lane, _mm_set1_epi8(char(15 - len))));
-    v = _mm_maddubs_epi16(v, _mm_set1_epi16(0x010A));  // byte pairs (10, 1)
-    v = _mm_madd_epi16(v, _mm_set1_epi32(0x00010064));  // word pairs (100, 1)
-    v = _mm_packus_epi32(v, v);
-    v = _mm_madd_epi16(v, _mm_set1_epi32(0x00012710));  // word pairs (10000, 1)
-    u64 high = u32(_mm_cvtsi128_si32(v)), low = u32(_mm_extract_epi32(v, 1));
-    return u32(high * 100000000 + low);
+// Fast scalar decimal parser for latency values.
+inline u32 parse_digits(const char* end, u32 len) {
+    const char* s = end - len;
+    u32 v = 0;
+    while (s < end) v = v * 10 + (*s++ - '0');
+    return v;
 }
 
-// Endpoint interning: open addressing on a CRC of the endpoint's first and last
-// eight bytes. Filter caches head8 to eliminate memcmp for short names.
+// Endpoint interning: L1d-resident open-addressing table.
+// Each slot packs head8, length, and id into one cache-aligned struct.
 class EndpointTable {
 public:
     static constexpr u32 SLOTS = 1 << 12, MAX = SLOTS / 2;
+    struct Slot {
+        u64 head;
+        u32 id_len;  // (id + 1) << 16 | len
+    };
     std::vector<std::string_view> names;
 
     u32 intern(const char* s, u32 len) {
         u64 a = load8(s), b = len >= 8 ? load8(s + len - 8) : 0;
         if (len < 8) a &= (u64(1) << (8 * len)) - 1;
-        for (u32 i = _mm_crc32_u64(_mm_crc32_u64(len, a), b);; ++i) {
-            u32 slot_idx = i & (SLOTS - 1);
-            u32& slot = slots_[slot_idx];
-            if (slot == 0) {
+        u32 h = _mm_crc32_u64(_mm_crc32_u64(len, a), b);
+        for (u32 i = h & (SLOTS - 1);; i = (i + 1) & (SLOTS - 1)) {
+            Slot& slot = table_[i];
+            if (slot.id_len == 0) {
                 if (names.size() == MAX) { fputs("too many endpoints\n", stderr); _exit(1); }
                 names.emplace_back(s, len);
-                heads_[slot_idx] = a;
-                return (slot = names.size()) - 1;
+                slot.head = a;
+                slot.id_len = (u32(names.size()) << 16) | (len & 0xFFFF);
+                return names.size() - 1;
             }
-            if (heads_[slot_idx] == a) {
-                if (len <= 8) return slot - 1;
-                std::string_view n = names[slot - 1];
-                if (n.size() == len && memcmp(n.data(), s, len) == 0) return slot - 1;
+            if (slot.head == a && (slot.id_len & 0xFFFF) == len) {
+                u32 id = (slot.id_len >> 16) - 1;
+                if (len <= 8) return id;
+                std::string_view n = names[id];
+                if (memcmp(n.data(), s, len) == 0) return id;
             }
         }
     }
 
 private:
-    std::vector<u32> slots_ = std::vector<u32>(SLOTS);
-    std::vector<u64> heads_ = std::vector<u64>(SLOTS);
+    std::vector<Slot> table_ = std::vector<Slot>(SLOTS);
 };
 
 struct Block {
