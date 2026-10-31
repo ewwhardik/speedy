@@ -121,10 +121,21 @@ struct Worker {
     void parse(const char* p, const char* end) {
         const size_t reserve = ((end - p) / 40 / Block::CAP + 1 + HOURS) * sizeof(Block);
         region = static_cast<char*>(mmap(nullptr, reserve, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0));
+        u32 last_prefix = 0;
+        int last_h = 0;
         while (p < end) {
-            int day = (p[8] - '0') * 10 + p[9] - '0';
-            int hour = (p[11] - '0') * 10 + p[12] - '0';
-            int h = (p[6] == '0' ? day - 30 : day + 1) * 24 + hour - 18;
+            u32 prefix;
+            memcpy(&prefix, p + 8, 4);
+            int h;
+            if (__builtin_expect(prefix == last_prefix, 1)) {
+                h = last_h;
+            } else {
+                int day = (p[8] - '0') * 10 + p[9] - '0';
+                int hour = (p[11] - '0') * 10 + p[12] - '0';
+                h = (p[6] == '0' ? day - 30 : day + 1) * 24 + hour - 18;
+                last_prefix = prefix;
+                last_h = h;
+            }
 
             const char* m = p + 28;
             __m256i v0 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(m));
@@ -241,7 +252,7 @@ int main() {
             cursor.assign(count.begin(), count.end() - 1);
             lat.resize(count[ne]);
             for (int t = 0; t < nthreads; ++t) {
-                for (Block* b = workers[t].head[h]; b; b = b->next)
+                for (Block* b = workers[t].head[h]; b; madvise(std::exchange(b, b->next), sizeof(Block), MADV_DONTNEED))
                     for (u32 i = 0; i < b->n; ++i)
                         lat[cursor[rank[t][b->rec[i] & ID_MASK]]++] = b->rec[i] >> KEY_BITS;
                 for (auto [l, key] : workers[t].big[h]) lat[cursor[rank[t][key & ID_MASK]]++] = l;

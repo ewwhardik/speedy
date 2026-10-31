@@ -98,7 +98,7 @@ private:
 
 class NameTable {
 public:
-    static constexpr u32 SLOTS = 1 << 18, IDS = 1 << 17, HEAD = 24;
+    static constexpr u32 SLOTS = 1 << 17, IDS = 1 << 17, HEAD = 24;
 
     struct Probe {
         u32 slot;
@@ -162,7 +162,7 @@ private:
     std::atomic<u16>* tags_ = zeroed<std::atomic<u16>>(SLOTS);
     Slot* slots_ = zeroed<Slot>(SLOTS);
     u32* overflow_ = zeroed<u32>(SLOTS);
-    char* arena_ = zeroed<char>(8 << 20);
+    char* arena_ = zeroed<char>(1 << 20);
     std::atomic<u32> used_{0}, next_id_{0};
 };
 
