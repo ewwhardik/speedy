@@ -152,7 +152,7 @@ void hour_label(int h, char out[22]) {
 int main() {
     prctl(PR_SET_THP_DISABLE, 1, 0, 0, 0);
     mallopt(M_MMAP_THRESHOLD, 1 << 16);
-    const int nthreads = 12;
+    const int nthreads = std::clamp<int>(std::thread::hardware_concurrency(), 1, 12);
     int fd = open("/data/requests.log", O_RDONLY);
     FILE* out = fopen("/out/summary.txt", "wb");
     if (fd < 0 || !out) return 1;
@@ -214,7 +214,7 @@ int main() {
             cursor.assign(count.begin(), count.end() - 1);
             lat.resize(count[ne]);
             for (int t = 0; t < nthreads; ++t) {
-                for (Block* b = workers[t].head[h]; b; b = b->next)
+                for (Block* b = workers[t].head[h]; b; madvise(std::exchange(b, b->next), sizeof(Block), MADV_DONTNEED))
                     for (u32 i = 0; i < b->n; ++i)
                         lat[cursor[rank[t][b->rec[i] & ID_MASK]]++] = b->rec[i] >> KEY_BITS;
                 for (auto [l, key] : workers[t].big[h]) lat[cursor[rank[t][key & ID_MASK]]++] = l;

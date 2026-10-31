@@ -731,6 +731,7 @@ int main() {
     prctl(PR_SET_THP_DISABLE, 1, 0, 0, 0);
     // Large blocks always come from mmap and go back to the kernel when freed
     // (glibc otherwise raises this threshold after the first free and keeps them).
+    mallopt(M_ARENA_MAX, 1);
     mallopt(M_MMAP_THRESHOLD, 1 << 16);
     const int nthreads = 12;
     File qf = map_file("/data/queries.txt");
