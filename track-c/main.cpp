@@ -46,12 +46,6 @@ inline u64 load8(const char* p) {
     return v;
 }
 
-inline u32 match32(const char* p, char c) {
-    __m256i v = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(p));
-    return _mm256_movemask_epi8(_mm256_cmpeq_epi8(v, _mm256_set1_epi8(c)));
-}
-
-inline u64 match64(const char* p, char c) { return match32(p, c) | u64(match32(p + 32, c)) << 32; }
 
 inline u64 digits(const char* s, const char* e) {
     u64 v = load8(e - 8) & 0x0F0F0F0F0F0F0F0F & ~u64(0) << 8 * (8 - (e - s));
@@ -120,8 +114,8 @@ public:
     Probe probe(const char* s, u32 len) const {
         u64 h = len;
         for (u32 i = 0; i < len; i += 8) {
-            u64 w = load8(s + i);
-            if (len - i < 8) w &= (u64(1) << 8 * (len - i)) - 1;
+            u64 w = 0;
+            memcpy(&w, s + i, std::min<u32>(8, len - i));
             h = (h ^ w) * 0x9E3779B97F4A7C15ull;
         }
         Probe p{u32(h >> 20) & (SLOTS - 1), u16(1 + (h >> 48) % (BUSY - 1))};
@@ -163,11 +157,7 @@ private:
     };
 
     static bool same_head(const Slot& slot, const char* s, u32 len) {
-        __m256i a = _mm256_load_si256(reinterpret_cast<const __m256i*>(&slot));
-        __m256i b = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(s - 8));
-        u32 equal = _mm256_movemask_epi8(_mm256_cmpeq_epi8(a, b));
-        u32 want = ((u64(1) << std::min(len, HEAD)) - 1) << 8;
-        return (equal & want) == want;
+        return memcmp(slot.head, s, std::min(len, HEAD)) == 0;
     }
     std::atomic<u16>* tags_ = zeroed<std::atomic<u16>>(SLOTS);
     Slot* slots_ = zeroed<Slot>(SLOTS);
