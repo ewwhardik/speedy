@@ -324,10 +324,7 @@ int main(void) {
   off = calloc(n + 2, 4);
   has_in = calloc(n + 1, 1);
 
-  cpu_set_t cpus;
-  nth = sched_getaffinity(0, sizeof cpus, &cpus) ? 1 : CPU_COUNT(&cpus);
-  if (nth > 12) nth = 12;
-  if (nth < 1) nth = 1;
+  nth = 12;
   th = calloc(nth, sizeof(Th));
   th[0].beg = body;
   for (int i = 1; i < nth; i++) {

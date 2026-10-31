@@ -41,6 +41,12 @@ const char* find(const char* s, char c) {
 }
 
 inline u32 parse_digits(const char* end, u32 len) {
+    if (__builtin_expect(len <= 4, 1)) {
+        u32 v = 0;
+        const char* s = end - len;
+        for (u32 i = 0; i < len; ++i) v = v * 10 + (s[i] - '0');
+        return v;
+    }
     __m128i v = _mm_loadu_si128(reinterpret_cast<const __m128i*>(end - 16));
     v = _mm_subs_epu8(v, _mm_set1_epi8('0'));
     __m128i lane = _mm_setr_epi8(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15);
@@ -95,8 +101,8 @@ struct Worker {
         const size_t reserve = ((end - p) / 40 / Block::CAP + 1 + HOURS) * sizeof(Block);
         region = static_cast<char*>(mmap(nullptr, reserve, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0));
         while (p < end) {
-            int day = (p[6] == '0' ? (p[8] - '0') * 10 + p[9] - '0' - 30 : (p[8] - '0') * 10 + p[9] - '0' + 1);
-            int hour = (p[11] - '0') * 10 + p[12] - '0';
+            int day = (p[6] == '0' ? p[9] - '0' : p[9] - '0' + 1);
+            int hour = p[11] * 10 + p[12] - 528;
             int h = day * 24 + hour - 18;
 
             const char* m = p + 28;
@@ -146,7 +152,7 @@ void hour_label(int h, char out[22]) {
 int main() {
     prctl(PR_SET_THP_DISABLE, 1, 0, 0, 0);
     mallopt(M_MMAP_THRESHOLD, 1 << 16);
-    const int nthreads = std::clamp<int>(std::thread::hardware_concurrency(), 1, 12);
+    const int nthreads = 12;
     int fd = open("/data/requests.log", O_RDONLY);
     FILE* out = fopen("/out/summary.txt", "wb");
     if (fd < 0 || !out) return 1;
@@ -208,7 +214,7 @@ int main() {
             cursor.assign(count.begin(), count.end() - 1);
             lat.resize(count[ne]);
             for (int t = 0; t < nthreads; ++t) {
-                for (Block* b = workers[t].head[h]; b; madvise(std::exchange(b, b->next), sizeof(Block), MADV_DONTNEED))
+                for (Block* b = workers[t].head[h]; b; b = b->next)
                     for (u32 i = 0; i < b->n; ++i)
                         lat[cursor[rank[t][b->rec[i] & ID_MASK]]++] = b->rec[i] >> KEY_BITS;
                 for (auto [l, key] : workers[t].big[h]) lat[cursor[rank[t][key & ID_MASK]]++] = l;

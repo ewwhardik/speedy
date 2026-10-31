@@ -276,9 +276,10 @@ struct Index {
     // segment holds doc - first[t] as 16 bits (a thread covers far fewer than
     // 65,536 documents), so each posting takes two bytes.
     int threads = 0;
+    u32 nterms = 0;
     std::vector<u32> first;            // per thread: its first doc id
     std::vector<u32> start;            // per term, offset into post; start[n] is the total
-    std::vector<std::vector<u32>> seg_end;  // per thread, per term: where its segment ends
+    std::unique_ptr<uint16_t[]> seg_len;  // per thread, per term: length of its segment
     std::unique_ptr<uint16_t[]> post;  // doc offsets, ascending within each segment
     std::vector<u32> text;             // per doc: offset of its text, then of its end (2 per doc)
 };
@@ -305,6 +306,8 @@ Index build_index(const File& f, TermTable& terms, std::vector<u32>& query_terms
         ix.docs = parse_id(base + last) + 1;
     }
     ix.threads = nthreads;
+    ix.nterms = nterms;
+    ix.seg_len.reset(new uint16_t[size_t(nthreads) * nterms]());
     ix.first.resize(nthreads);
     ix.text.resize(2 * size_t(ix.docs));
     ix.words = (ix.docs + 63) / 64;
@@ -332,7 +335,7 @@ Index build_index(const File& f, TermTable& terms, std::vector<u32>& query_terms
         u32 ndense = 0;
         for (u32 rank = 0; rank < nterms; ++rank) {
             new_id[order[rank]] = rank;
-            if (df[order[rank]] * 10 > ix.docs) ix.dense[rank] = ndense++;
+            if (df[order[rank]] * 16 > ix.docs) ix.dense[rank] = ndense++;
         }
         terms.renumber(new_id);
         for (u32& id : query_terms) id = new_id[id];
@@ -352,11 +355,15 @@ Index build_index(const File& f, TermTable& terms, std::vector<u32>& query_terms
             if (ix.dense[rank] == NONE) {
                 for (int t = 0; t < nthreads; ++t) {
                     u32 c = count[t][rank];
+                    ix.seg_len[t * nterms + rank] = static_cast<uint16_t>(c);
                     count[t][rank] = total;
                     total += c;
                 }
             } else {
-                for (int t = 0; t < nthreads; ++t) count[t][rank] = 0;
+                for (int t = 0; t < nthreads; ++t) {
+                    ix.seg_len[t * nterms + rank] = 0;
+                    count[t][rank] = 0;
+                }
             }
         }
         ix.start[nterms] = total;
@@ -413,9 +420,9 @@ Index build_index(const File& f, TermTable& terms, std::vector<u32>& query_terms
     for (auto& th : pool) th.join();
     munmap(scratch, scratch_bytes);
 
+    std::vector<std::vector<u32>>().swap(count);
     madvise(const_cast<uint8_t*>(base), size, MADV_DONTNEED);
     malloc_trim(0);
-    ix.seg_end = std::move(count);
 
     ix.df.resize(nterms);
     for (u32 id = 0; id < nterms; ++id) {
@@ -516,7 +523,13 @@ inline u64 position_sum(u64 m) {
 class Solver {
 public:
     Solver(const Index& ix, const TermTable& terms, const File& docs)
-        : ix_(ix), terms_(terms), docs_(docs) {}
+        : ix_(ix), terms_(terms), docs_(docs) {
+        cur_.reserve(25000);
+        tmp_.reserve(25000);
+        list_.reserve(25000);
+        order_.reserve(64);
+        bm_.reserve(ix.words);
+    }
 
     // Writes one result line (with its LF) to out, returns its length.
     int answer(const Query& q, char* out) {
@@ -532,8 +545,11 @@ private:
         if (u32 d = ix_.dense[id]; d != NONE) return {nullptr, ix_.df[id], &ix_.bits[d * ix_.words], ix_.words};
         list_.resize(ix_.df[id]);
         u32 i = ix_.start[id], n = 0;
-        for (int t = 0; t < ix_.threads; ++t)
-            for (u32 e = ix_.seg_end[t][id]; i < e; ++i) list_[n++] = ix_.first[t] + ix_.post[i];
+        for (int t = 0; t < ix_.threads; ++t) {
+            u32 len = ix_.seg_len[t * ix_.nterms + id];
+            u32 base_doc = ix_.first[t];
+            for (u32 k = 0; k < len; ++k) list_[n++] = base_doc + ix_.post[i++];
+        }
         return {list_.data(), n, nullptr, ix_.words};
     }
 
@@ -715,9 +731,8 @@ int main() {
     prctl(PR_SET_THP_DISABLE, 1, 0, 0, 0);
     // Large blocks always come from mmap and go back to the kernel when freed
     // (glibc otherwise raises this threshold after the first free and keeps them).
-    mallopt(M_ARENA_MAX, 1);
     mallopt(M_MMAP_THRESHOLD, 1 << 16);
-    const int nthreads = std::max(1u, std::min(12u, std::thread::hardware_concurrency()));
+    const int nthreads = 12;
     File qf = map_file("/data/queries.txt");
     File df = map_file("/data/docs.txt");
 

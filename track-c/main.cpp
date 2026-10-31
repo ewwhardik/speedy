@@ -74,11 +74,29 @@ public:
             block_ += 64;
             if (block_ >= end_) return {end_, before_ + __builtin_popcountll(q_)};
             before_ += __builtin_popcountll(q_);
-            q_ = match64(block_, '"');
+#if defined(__AVX512F__) && defined(__AVX512BW__)
+            __m512i v512 = _mm512_loadu_si512(reinterpret_cast<const void*>(block_));
+            q_ = _mm512_cmpeq_epi8_mask(v512, _mm512_set1_epi8('"'));
             __m128i x = _mm_clmulepi64_si128(_mm_cvtsi64_si128(q_), _mm_set1_epi8(-1), 0);
             u64 inside = u64(_mm_cvtsi128_si64(x)) ^ carry_;
             carry_ = u64(i64(inside) >> 63);
-            bits_ = (match64(block_, ',') | match64(block_, '\n')) & ~inside;
+            u64 seps = _mm512_cmpeq_epi8_mask(v512, _mm512_set1_epi8(',')) |
+                       _mm512_cmpeq_epi8_mask(v512, _mm512_set1_epi8('\n'));
+            bits_ = seps & ~inside;
+#else
+            __m256i v0 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(block_));
+            __m256i v1 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(block_ + 32));
+            q_ = _mm256_movemask_epi8(_mm256_cmpeq_epi8(v0, _mm256_set1_epi8('"'))) |
+                 (u64(_mm256_movemask_epi8(_mm256_cmpeq_epi8(v1, _mm256_set1_epi8('"')))) << 32);
+            __m128i x = _mm_clmulepi64_si128(_mm_cvtsi64_si128(q_), _mm_set1_epi8(-1), 0);
+            u64 inside = u64(_mm_cvtsi128_si64(x)) ^ carry_;
+            carry_ = u64(i64(inside) >> 63);
+            u64 commas = _mm256_movemask_epi8(_mm256_cmpeq_epi8(v0, _mm256_set1_epi8(','))) |
+                         (u64(_mm256_movemask_epi8(_mm256_cmpeq_epi8(v1, _mm256_set1_epi8(',')))) << 32);
+            u64 newlines = _mm256_movemask_epi8(_mm256_cmpeq_epi8(v0, _mm256_set1_epi8('\n'))) |
+                           (u64(_mm256_movemask_epi8(_mm256_cmpeq_epi8(v1, _mm256_set1_epi8('\n')))) << 32);
+            bits_ = (commas | newlines) & ~inside;
+#endif
         }
         u32 i = __builtin_ctzll(bits_);
         bits_ &= bits_ - 1;
@@ -267,7 +285,7 @@ void put_money(std::string& out, i64 cents) {
 
 int main() {
     prctl(PR_SET_THP_DISABLE, 1, 0, 0, 0);
-        const int nthreads = std::clamp<int>(std::thread::hardware_concurrency(), 1, 12);
+    const int nthreads = 12;
     size_t rsize, size;
     const char* regions = map_file("/data/regions.csv", rsize);
     const char* records = map_file("/data/records.csv", size);
