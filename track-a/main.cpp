@@ -41,12 +41,6 @@ const char* find(const char* s, char c) {
 }
 
 inline u32 parse_digits(const char* end, u32 len) {
-    if (__builtin_expect(len <= 4, 1)) {
-        u32 v = 0;
-        const char* s = end - len;
-        for (u32 i = 0; i < len; ++i) v = v * 10 + (s[i] - '0');
-        return v;
-    }
     __m128i v = _mm_loadu_si128(reinterpret_cast<const __m128i*>(end - 16));
     v = _mm_subs_epu8(v, _mm_set1_epi8('0'));
     __m128i lane = _mm_setr_epi8(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15);
@@ -106,14 +100,12 @@ struct Worker {
             int h = day * 24 + hour - 18;
 
             const char* m = p + 28;
-#if defined(__AVX512F__) && defined(__AVX512BW__)
-            __m512i v512 = _mm512_loadu_si512(reinterpret_cast<const void*>(m));
-            u64 sp = _mm512_cmpeq_epi8_mask(v512, _mm512_set1_epi8(' '));
-            u64 nl = _mm512_cmpeq_epi8_mask(v512, _mm512_set1_epi8('\n'));
-#else
-            u64 sp = match32(m, ' ') | u64(match32(m + 32, ' ')) << 32;
-            u64 nl = match32(m, '\n') | u64(match32(m + 32, '\n')) << 32;
-#endif
+            __m256i v0 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(m));
+            __m256i v1 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(m + 32));
+            u64 sp = _mm256_movemask_epi8(_mm256_cmpeq_epi8(v0, _mm256_set1_epi8(' '))) |
+                     (u64(_mm256_movemask_epi8(_mm256_cmpeq_epi8(v1, _mm256_set1_epi8(' ')))) << 32);
+            u64 nl = _mm256_movemask_epi8(_mm256_cmpeq_epi8(v0, _mm256_set1_epi8('\n'))) |
+                     (u64(_mm256_movemask_epi8(_mm256_cmpeq_epi8(v1, _mm256_set1_epi8('\n')))) << 32);
             const char* ep = m + __builtin_ctzll(sp) + 1;
             const char* ee = nl ? m + __builtin_ctzll(sp & (sp - 1)) : find(ep, ' ');
             const char* eol = nl ? m + __builtin_ctzll(nl) : find(ee + 5, '\n');
@@ -227,7 +219,7 @@ int main() {
                 u32 n = count[e + 1] - count[e];
                 if (n == 0) continue;
                 u32 v[6] = {n, 0, 0, 0, errors[e], u32(u64(errors[e]) * 1000000 / n)};
-                if (n <= 256) {
+                if (n <= 128) {
                     std::sort(a, a + n);
                     v[1] = a[(50u * n + 99) / 100 - 1];
                     v[2] = a[(95u * n + 99) / 100 - 1];

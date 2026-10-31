@@ -745,37 +745,36 @@ int main() {
 
     // Answer queries in parallel; each result goes to its own fixed-size slot
     // (the longest line is 6 + 12 + 10 * 7 digits and spaces, well under 128).
+    constexpr int SLOT = 128;
     const size_t nq = queries.size();
-    std::vector<std::string> chunks(nthreads);
+    std::vector<char> slots(nq * SLOT);
+    std::vector<uint8_t> lens(nq);
+    std::atomic<size_t> next{0};
     std::vector<std::thread> pool;
     for (int t = 0; t < nthreads; ++t) {
-        pool.emplace_back([&, t] {
+        pool.emplace_back([&] {
             Solver solver(ix, terms, df);
-            std::string& out = chunks[t];
-            const size_t q_start = t * nq / nthreads;
-            const size_t q_end = (t + 1) * nq / nthreads;
-            out.reserve((q_end - q_start) * 48);
-            char line[256];
-            for (size_t k = q_start; k < q_end; ++k) {
-                int len = solver.answer(queries[k], line);
-                out.append(line, len);
-            }
+            for (size_t i; (i = next.fetch_add(16)) < nq;)
+                for (size_t j = i; j < std::min(nq, i + 16); ++j)
+                    lens[j] = solver.answer(queries[j], &slots[j * SLOT]);
         });
     }
     for (auto& th : pool) th.join();
 
     int out_fd = open("/out/results.txt", O_WRONLY | O_CREAT | O_TRUNC, 0666);
     if (out_fd < 0) { perror("open out"); _exit(1); }
-    for (int t = 0; t < nthreads; ++t) {
-        const char* p = chunks[t].data();
-        size_t rem = chunks[t].size();
-        while (rem) {
-            ssize_t w = write(out_fd, p, rem);
-            if (w <= 0) { perror("write"); _exit(1); }
-            p += w;
-            rem -= w;
+    char buf[65536];
+    size_t bp = 0;
+    for (size_t i = 0; i < nq; ++i) {
+        uint8_t len = lens[i];
+        if (bp + len > sizeof(buf)) {
+            if (write(out_fd, buf, bp) <= 0) { perror("write"); _exit(1); }
+            bp = 0;
         }
+        memcpy(buf + bp, &slots[i * SLOT], len);
+        bp += len;
     }
+    if (bp && write(out_fd, buf, bp) <= 0) { perror("write"); _exit(1); }
     close(out_fd);
     _exit(0);
 }
