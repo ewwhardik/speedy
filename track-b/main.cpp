@@ -290,7 +290,7 @@ struct Index {
 // as it has been read, so the memory really goes back; malloc would keep it.
 class BlockList {
 public:
-    static constexpr size_t BLOCK = 1 << 14;          // entries per block
+    static constexpr size_t BLOCK = 1 << 12;          // entries per block
     static constexpr size_t BYTES = 3 * BLOCK + 1;    // a 4-byte store at the last entry spills one byte
     ~BlockList() { for (uint8_t* b : blocks_) munmap(b, BYTES); }
 
@@ -467,6 +467,7 @@ Index build_index(const File& f, TermTable& terms, std::vector<u32>& query_terms
     }
     for (auto& th : pool) th.join();
     ix.seg_end = std::move(count);
+    malloc_trim(0);
 
     ix.df.resize(nterms);
     for (u32 id = 0; id < nterms; ++id) {
@@ -775,6 +776,7 @@ int main() {
     TermTable terms;
     Queries queries = parse_queries(qf, terms);
     Index ix = build_index(df, terms, queries.terms, nthreads);
+    malloc_trim(0);
 
     // Answer queries in parallel; each result goes to its own fixed-size slot
     // (the longest line is 6 + 12 + 10 * 7 digits and spaces, well under 128).
