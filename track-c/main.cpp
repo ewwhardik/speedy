@@ -35,8 +35,7 @@ const char* map_file(const char* path, size_t& size) {
     if (fd < 0) _exit(1);
     size = lseek(fd, 0, SEEK_END);
     auto* p = static_cast<char*>(mmap(nullptr, size + 4096, PROT_READ, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0));
-    if (size && mmap(p, size, PROT_READ, MAP_PRIVATE | MAP_FIXED | MAP_POPULATE, fd, 0) == MAP_FAILED) _exit(1);
-    madvise(p, size, MADV_WILLNEED | MADV_HUGEPAGE);
+    if (size && mmap(p, size, PROT_READ, MAP_PRIVATE | MAP_FIXED, fd, 0) == MAP_FAILED) _exit(1);
     close(fd);
     return p;
 }

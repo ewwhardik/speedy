@@ -72,25 +72,31 @@ public:
         u32 h = _mm_crc32_u64(_mm_crc32_u64(len, a), b);
         u64 tag = (u64(h) << 32) | (u64(len) << 16);
         for (u32 i = h;; ++i) {
-            u64& slot = slots_[i & (SLOTS - 1)];
+            u32 idx = i & (SLOTS - 1);
+            u64& slot = slots_[idx];
             if (__builtin_expect((slot & 0xFFFF) == 0, 0)) {
                 if (names.size() == MAX) _exit(1);
                 u32 id = names.size();
                 names.emplace_back(s, len);
                 slot = tag | (id + 1);
+                heads_[idx] = a;
+                tails_[idx] = b;
                 return id;
             }
             if (__builtin_expect((slot & 0xFFFFFFFFFFFF0000ull) == tag, 1)) {
-                u32 id = u32(slot & 0xFFFF) - 1;
-                std::string_view name = names[id];
-                if (__builtin_expect(memcmp(name.data(), s, len) == 0, 1))
-                    return id;
+                if (__builtin_expect(heads_[idx] == a && tails_[idx] == b, 1)) {
+                    u32 id = u32(slot & 0xFFFF) - 1;
+                    if (__builtin_expect(len <= 16 || memcmp(names[id].data(), s, len) == 0, 1))
+                        return id;
+                }
             }
         }
     }
 
 private:
     std::array<u64, SLOTS> slots_{};
+    std::array<u64, SLOTS> heads_{};
+    std::array<u64, SLOTS> tails_{};
 };
 
 struct Block {
@@ -167,8 +173,7 @@ int main() {
 
     size_t size = lseek(fd, 0, SEEK_END);
     auto* data = static_cast<char*>(mmap(nullptr, size + 4096, PROT_READ, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0));
-    if (size && mmap(data, size, PROT_READ, MAP_PRIVATE | MAP_FIXED | MAP_POPULATE, fd, 0) == MAP_FAILED) return 1;
-    madvise(data, size, MADV_WILLNEED | MADV_HUGEPAGE);
+    if (size && mmap(data, size, PROT_READ, MAP_PRIVATE | MAP_FIXED, fd, 0) == MAP_FAILED) return 1;
 
     std::vector<size_t> cut(nthreads + 1, size);
     cut[0] = 0;
