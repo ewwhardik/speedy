@@ -99,12 +99,18 @@ struct Worker {
             int hour = (p[11] - '0') * 10 + p[12] - '0';
             int h = day * 24 + hour - 18;
 
-            const char* ep = p + (p[31] == ' ' ? 32 : (p[32] == ' ' ? 33 : (p[34] == ' ' ? 35 : (p[35] == ' ' ? 36 : 34))));
-            __m256i v = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(ep));
-            u32 m = _mm256_movemask_epi8(_mm256_cmpeq_epi8(v, _mm256_set1_epi8(' ')));
-            const char* ee = m ? ep + __builtin_ctz(m) : find(ep + 32, ' ');
-            __m128i v16 = _mm_loadu_si128(reinterpret_cast<const __m128i*>(ee + 5));
-            const char* eol = ee + 5 + __builtin_ctz(_mm_movemask_epi8(_mm_cmpeq_epi8(v16, _mm_set1_epi8('\n'))));
+            const char* m = p + 28;
+#if defined(__AVX512F__) && defined(__AVX512BW__)
+            __m512i v512 = _mm512_loadu_si512(reinterpret_cast<const void*>(m));
+            u64 sp = _mm512_cmpeq_epi8_mask(v512, _mm512_set1_epi8(' '));
+            u64 nl = _mm512_cmpeq_epi8_mask(v512, _mm512_set1_epi8('\n'));
+#else
+            u64 sp = match32(m, ' ') | u64(match32(m + 32, ' ')) << 32;
+            u64 nl = match32(m, '\n') | u64(match32(m + 32, '\n')) << 32;
+#endif
+            const char* ep = m + __builtin_ctzll(sp) + 1;
+            const char* ee = nl ? m + __builtin_ctzll(sp & (sp - 1)) : find(ep, ' ');
+            const char* eol = nl ? m + __builtin_ctzll(nl) : find(ee + 5, '\n');
             const u32 key = endpoints.intern(ep, ee - ep) | (ee[1] == '5' ? ERR_BIT : 0);
             const u32 lat = parse_digits(eol, eol - (ee + 5));
             p = eol + 1;
