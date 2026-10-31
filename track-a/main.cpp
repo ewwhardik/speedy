@@ -180,14 +180,14 @@ int main() {
     });
 
     std::atomic<int> next{0};
-    std::barrier sync(nthreads);
+    std::atomic<int> arrived{0};
+    std::atomic<int> stage{0};
 
     std::vector<std::thread> pool;
     for (int t = 0; t < nthreads; ++t) {
         pool.emplace_back([&, t] {
             workers[t].parse(data + cut[t], data + cut[t + 1]);
-            sync.arrive_and_wait();
-            if (t == 0) {
+            if (arrived.fetch_add(1, std::memory_order_acq_rel) == nthreads - 1) {
                 for (int i = 0; i < nthreads; ++i)
                     for (std::string_view n : workers[i].endpoints.names)
                         rank[i].push_back(global.intern(n.data(), n.size()));
@@ -198,8 +198,12 @@ int main() {
                     rank_of[global.intern(names[i].data(), names[i].size())] = i;
                 for (auto& r : rank)
                     for (u32& id : r) id = rank_of[id];
+                stage.store(1, std::memory_order_release);
+            } else {
+                while (stage.load(std::memory_order_acquire) == 0) {
+                    _mm_pause();
+                }
             }
-            sync.arrive_and_wait();
 
             const u32 ne = names.size();
             std::vector<u32> count, errors, cursor, lat;

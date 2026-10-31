@@ -776,6 +776,8 @@ int main() {
     TermTable terms;
     Queries queries = parse_queries(qf, terms);
     Index ix = build_index(df, terms, queries.terms, nthreads);
+    madvise(const_cast<uint8_t*>(qf.data), qf.size, MADV_DONTNEED);
+    madvise(const_cast<uint8_t*>(df.data), df.size, MADV_DONTNEED);
     malloc_trim(0);
 
     // Answer queries in parallel; each result goes to its own fixed-size slot
