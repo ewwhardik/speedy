@@ -89,6 +89,7 @@ public:
     u32 size() const { return keys_.size(); }
     const uint8_t* bytes(u32 id) const { return reinterpret_cast<const uint8_t*>(keys_[id].w); }
     size_t length(u32 id) const { return lens_[id]; }
+    void drop_hash_table() { std::vector<u64>().swap(slots_); }
 
     u32 insert(const Key& k) {
         // Keep the load at or under 1/2 so probe chains stay short.
@@ -316,6 +317,9 @@ Index build_index(const File& f, TermTable& terms, std::vector<u32>& query_terms
         cut[t] = c;
     }
 
+    const size_t scratch_bytes = size_t(nthreads) * nterms * sizeof(u32);
+    auto* scratch = static_cast<u32*>(mmap(nullptr, scratch_bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0));
+
     std::vector<std::vector<u32>> count(nthreads);
     std::barrier sync(nthreads, [&]() noexcept {
         std::vector<u64> df(nterms);
@@ -335,10 +339,10 @@ Index build_index(const File& f, TermTable& terms, std::vector<u32>& query_terms
         ix.bits.assign(ndense * ix.words, 0);
 
         for (int t = 0; t < nthreads; ++t) {
-            std::vector<u32> remapped(nterms);
+            u32* rem = scratch + t * nterms;
             for (u32 old_id = 0; old_id < nterms; ++old_id)
-                remapped[new_id[old_id]] = count[t][old_id];
-            count[t] = std::move(remapped);
+                rem[new_id[old_id]] = count[t][old_id];
+            memcpy(count[t].data(), rem, nterms * sizeof(u32));
         }
 
         ix.start.resize(nterms + 1);
@@ -358,9 +362,6 @@ Index build_index(const File& f, TermTable& terms, std::vector<u32>& query_terms
         ix.start[nterms] = total;
         ix.post.reset(new uint16_t[total]);
     });
-
-    const size_t scratch_bytes = size_t(nthreads) * nterms * sizeof(u32);
-    auto* scratch = static_cast<u32*>(mmap(nullptr, scratch_bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0));
 
     std::vector<std::thread> pool;
     for (int t = 0; t < nthreads; ++t) {
@@ -723,6 +724,8 @@ int main() {
     TermTable terms;
     Queries queries = parse_queries(qf, terms);
     Index ix = build_index(df, terms, queries.terms, nthreads);
+    terms.drop_hash_table();
+    malloc_trim(0);
 
     // Answer queries in parallel; each result goes to its own fixed-size slot
     // (the longest line is 6 + 12 + 10 * 7 digits and spaces, well under 128).

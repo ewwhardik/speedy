@@ -107,15 +107,15 @@ public:
             if (len - i < 8) w &= (u64(1) << 8 * (len - i)) - 1;
             h = (h ^ w) * 0x9E3779B97F4A7C15ull;
         }
-        Probe p{u32(h >> 20) % SLOTS, u16(1 + (h >> 48) % (BUSY - 1))};
+        Probe p{u32(h >> 20) & (SLOTS - 1), u16(1 + (h >> 48) % (BUSY - 1))};
         for (u16 t; (t = tags_[p.slot].load(std::memory_order_relaxed)) && t != p.tag && t != BUSY;)
-            p.slot = (p.slot + 1) % SLOTS;
+            p.slot = (p.slot + 1) & (SLOTS - 1);
         _mm_prefetch(reinterpret_cast<const char*>(&slots_[p.slot]), _MM_HINT_T0);
         return p;
     }
 
     u32 id(const char* s, u32 len, Probe p) {
-        for (u32 i = p.slot;; i = (i + 1) % SLOTS) {
+        for (u32 i = p.slot;; i = (i + 1) & (SLOTS - 1)) {
             u16 t = tags_[i].load(std::memory_order_acquire);
             if (t == 0 && tags_[i].compare_exchange_strong(t, BUSY, std::memory_order_acquire)) {
                 Slot& slot = slots_[i];
