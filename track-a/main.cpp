@@ -96,10 +96,18 @@ struct Worker {
     void parse(const char* p, const char* end) {
         const size_t reserve = ((end - p) / 40 / Block::CAP + 1 + HOURS) * sizeof(Block);
         region = static_cast<char*>(mmap(nullptr, reserve, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0));
+        u64 last_ts = 0;
+        int h = 0;
+        Block* cur_b = nullptr;
         while (p < end) {
-            int day = (p[9] - '0') + (p[6] - '0');
-            int hour = p[11] * 10 + p[12] - 528;
-            int h = day * 24 + hour - 18;
+            u64 ts = load8(p + 8);
+            if (__builtin_expect(ts != last_ts, 0)) {
+                last_ts = ts;
+                int day = (p[9] - '0') + (p[6] - '0');
+                int hour = p[11] * 10 + p[12] - 528;
+                h = day * 24 + hour - 18;
+                cur_b = head[h];
+            }
 
             const char* m = p + 28;
             __m256i v0 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(m));
@@ -114,18 +122,17 @@ struct Worker {
             const u32 key = endpoints.intern(ep, ee - ep) | (ee[1] == '5' ? ERR_BIT : 0);
             const u32 lat = parse_digits(eol, eol - (ee + 5));
             p = eol + 1;
-            if (lat >= BIG) {
+            if (__builtin_expect(lat >= BIG, 0)) {
                 big[h].push_back({lat, key});
                 continue;
             }
-            Block*& b = head[h];
-            if (!b || b->n == Block::CAP) {
+            if (__builtin_expect(!cur_b || cur_b->n == Block::CAP, 0)) {
                 auto* fresh = reinterpret_cast<Block*>(region + used);
                 used += sizeof(Block);
-                fresh->next = b;
-                b = fresh;
+                fresh->next = cur_b;
+                head[h] = cur_b = fresh;
             }
-            b->rec[b->n++] = lat << KEY_BITS | key;
+            cur_b->rec[cur_b->n++] = lat << KEY_BITS | key;
         }
     }
 };
@@ -208,7 +215,7 @@ int main() {
             cursor.assign(count.begin(), count.end() - 1);
             lat.resize(count[ne]);
             for (int t = 0; t < nthreads; ++t) {
-                for (Block* b = workers[t].head[h]; b; b = b->next)
+                for (Block* b = workers[t].head[h]; b; madvise(std::exchange(b, b->next), sizeof(Block), MADV_DONTNEED))
                     for (u32 i = 0; i < b->n; ++i)
                         lat[cursor[rank[t][b->rec[i] & ID_MASK]]++] = b->rec[i] >> KEY_BITS;
                 for (auto [l, key] : workers[t].big[h]) lat[cursor[rank[t][key & ID_MASK]]++] = l;
