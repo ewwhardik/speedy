@@ -93,8 +93,6 @@ struct Worker {
     std::vector<std::pair<u32, u32>> big[HOURS];
     char* region = nullptr;
     size_t used = 0;
-    u32 counts[HOURS][256] = {};
-    u32 errors[HOURS][256] = {};
 
     void parse(const char* p, const char* end) {
         const size_t reserve = ((end - p) / 40 / Block::CAP + 1 + HOURS) * sizeof(Block);
@@ -125,11 +123,6 @@ struct Worker {
             const u32 key = endpoints.intern(ep, ee - ep) | (ee[1] == '5' ? ERR_BIT : 0);
             const u32 lat = parse_digits(eol, eol - (ee + 5));
             p = eol + 1;
-            u32 lid = key & ID_MASK;
-            if (__builtin_expect(lid < 256, 1)) {
-                ++counts[h][lid];
-                if (key & ERR_BIT) ++errors[h][lid];
-            }
             if (__builtin_expect(lat >= BIG, 0)) {
                 big[h].push_back({lat, key});
                 continue;
@@ -214,11 +207,14 @@ int main() {
                 count.assign(ne + 1, 0);
                 errors.assign(ne, 0);
                 for (int i = 0; i < nthreads; ++i) {
-                    for (u32 l = 0; l < workers[i].endpoints.names.size(); ++l) {
-                        u32 g = rank[i][l];
-                        count[g + 1] += workers[i].counts[h][l];
-                        errors[g] += workers[i].errors[h][l];
-                    }
+                    auto tally = [&](u32 key) {
+                        u32 e = rank[i][key & ID_MASK];
+                        ++count[e + 1];
+                        errors[e] += (key & ERR_BIT) != 0;
+                    };
+                    for (Block* b = workers[i].head[h]; b; b = b->next)
+                        for (u32 j = 0; j < b->n; ++j) tally(b->rec[j]);
+                    for (auto [l, key] : workers[i].big[h]) tally(key);
                 }
                 for (u32 e = 0; e < ne; ++e) count[e + 1] += count[e];
                 cursor.assign(count.begin(), count.end() - 1);
