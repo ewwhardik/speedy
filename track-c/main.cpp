@@ -54,10 +54,9 @@ inline u32 match32(const char* p, char c) {
 inline u64 match64(const char* p, char c) { return match32(p, c) | u64(match32(p + 32, c)) << 32; }
 
 inline u64 digits(const char* s, const char* e) {
-    u64 v = load8(e - 8) & 0x0F0F0F0F0F0F0F0F & ~u64(0) << 8 * (8 - (e - s));
-    v = (v * 10 + (v >> 8)) & 0x00FF00FF00FF00FF;
-    v = (v * 100 + (v >> 16)) & 0x0000FFFF0000FFFF;
-    return (v * 10000 + (v >> 32)) & 0xFFFFFFFF;
+    u64 v = 0;
+    while (s < e) v = v * 10 + (*s++ - '0');
+    return v;
 }
 
 class Structure {
@@ -68,6 +67,38 @@ public:
     };
 
     Structure(const char* p, const char* file_end) : block_(p - 64), end_(file_end) {}
+
+    inline bool extract_5(const char*& f1, const char*& f2, const char*& f3, const char*& f4, const char*& eol) {
+        if (bits_ == 0) {
+            block_ += 64;
+            if (block_ >= end_) return false;
+            before_ += __builtin_popcountll(q_);
+            q_ = match64(block_, '"');
+            if (q_ == 0 && carry_ == 0) {
+                bits_ = match64(block_, ',') | match64(block_, '\n');
+            } else {
+                __m128i x = _mm_clmulepi64_si128(_mm_cvtsi64_si128(q_), _mm_set1_epi8(-1), 0);
+                u64 inside = u64(_mm_cvtsi128_si64(x)) ^ carry_;
+                carry_ = u64(i64(inside) >> 63);
+                bits_ = (match64(block_, ',') | match64(block_, '\n')) & ~inside;
+                return false;
+            }
+        }
+        if (q_ == 0 && carry_ == 0 && __builtin_popcountll(bits_) >= 5) {
+            u32 i1 = __builtin_ctzll(bits_); bits_ &= bits_ - 1;
+            u32 i2 = __builtin_ctzll(bits_); bits_ &= bits_ - 1;
+            u32 i3 = __builtin_ctzll(bits_); bits_ &= bits_ - 1;
+            u32 i4 = __builtin_ctzll(bits_); bits_ &= bits_ - 1;
+            u32 i5 = __builtin_ctzll(bits_); bits_ &= bits_ - 1;
+            f1 = block_ + i1;
+            f2 = block_ + i2;
+            f3 = block_ + i3;
+            f4 = block_ + i4;
+            eol = block_ + i5;
+            return true;
+        }
+        return false;
+    }
 
     Separator next() {
         while (bits_ == 0) {
@@ -106,15 +137,14 @@ public:
     };
 
     Probe probe(const char* s, u32 len) const {
-        u64 h = len;
-        for (u32 i = 0; i < len; i += 8) {
-            u64 w = load8(s + i);
-            if (len - i < 8) w &= (u64(1) << 8 * (len - i)) - 1;
-            h = (h ^ w) * 0x9E3779B97F4A7C15ull;
-        }
-        u16 tag = u16(h >> 48);
+        u64 a = load8(s);
+        u64 b = len >= 8 ? load8(s + len - 8) : 0;
+        if (len < 8) a &= (u64(1) << (8 * len)) - 1;
+        u64 h = _mm_crc32_u64(_mm_crc32_u64(len, a), b);
+        if (len > 16) h = _mm_crc32_u64(h, load8(s + 8));
+        u16 tag = u16(h >> 32);
         if (tag == 0 || tag == BUSY) tag = 1;
-        Probe p{u32(h >> 20) & (SLOTS - 1), tag};
+        Probe p{u32(h) & (SLOTS - 1), tag};
         for (u16 t; (t = tags_[p.slot].load(std::memory_order_relaxed)) && t != p.tag && t != BUSY;)
             p.slot = (p.slot + 1) & (SLOTS - 1);
         _mm_prefetch(reinterpret_cast<const char*>(&slots_[p.slot]), _MM_HINT_T0);
@@ -124,24 +154,33 @@ public:
     u32 id(const char* s, u32 len, Probe p) {
         for (u32 i = p.slot;; i = (i + 1) & (SLOTS - 1)) {
             u16 t = tags_[i].load(std::memory_order_acquire);
-            if (t == 0 && tags_[i].compare_exchange_strong(t, BUSY, std::memory_order_acquire)) {
-                Slot& slot = slots_[i];
-                slot.id = next_id_++;
-                slot.len = len;
-                if (slot.id >= IDS) _exit(1);
-                memcpy(slot.head, s, std::min(len, HEAD));
-                if (len > HEAD) {
-                    overflow_[i] = used_.fetch_add(len - HEAD);
-                    memcpy(arena_ + overflow_[i], s + HEAD, len - HEAD);
+            if (t == p.tag) {
+                const Slot& slot = slots_[i];
+                if (slot.len == len && same_head(slot, s, len) &&
+                    (len <= HEAD || memcmp(arena_ + overflow_[i], s + HEAD, len - HEAD) == 0))
+                    return slot.id;
+            } else if (t == 0) {
+                if (tags_[i].compare_exchange_strong(t, BUSY, std::memory_order_acquire)) {
+                    Slot& slot = slots_[i];
+                    slot.id = next_id_++;
+                    slot.len = len;
+                    if (slot.id >= IDS) _exit(1);
+                    slot.head0 = len >= 8 ? load8(s) : (load8(s) & ((u64(1) << (8 * len)) - 1));
+                    slot.head1 = len >= 16 ? load8(s + 8) : (len > 8 ? load8(s + len - 8) : 0);
+                    slot.head2 = len >= 24 ? load8(s + 16) : (len > 16 ? load8(s + len - 8) : 0);
+                    if (len > HEAD) {
+                        overflow_[i] = used_.fetch_add(len - HEAD, std::memory_order_relaxed);
+                        memcpy(arena_ + overflow_[i], s + HEAD, len - HEAD);
+                    }
+                    tags_[i].store(p.tag, std::memory_order_release);
+                    return slot.id;
                 }
-                tags_[i].store(p.tag, std::memory_order_release);
-                return slot.id;
+                --i;
             }
-            while (t == BUSY) t = tags_[i].load(std::memory_order_acquire);
-            const Slot& slot = slots_[i];
-            if (t == p.tag && slot.len == len && same_head(slot, s, len) &&
-                (len <= HEAD || memcmp(arena_ + overflow_[i], s + HEAD, len - HEAD) == 0))
-                return slot.id;
+            while (t == BUSY) {
+                _mm_pause();
+                t = tags_[i].load(std::memory_order_acquire);
+            }
         }
     }
 
@@ -149,16 +188,25 @@ private:
     static constexpr u16 BUSY = 0xFFFF;
     struct alignas(32) Slot {
         u32 id, len;
-        char head[HEAD];
+        u64 head0, head1, head2;
     };
 
-    static bool same_head(const Slot& slot, const char* s, u32 len) {
-        __m256i a = _mm256_load_si256(reinterpret_cast<const __m256i*>(&slot));
-        __m256i b = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(s - 8));
-        u32 equal = _mm256_movemask_epi8(_mm256_cmpeq_epi8(a, b));
-        u32 want = ((u64(1) << std::min(len, HEAD)) - 1) << 8;
-        return (equal & want) == want;
+    static inline bool same_head(const Slot& slot, const char* s, u32 len) {
+        if (len <= 8) {
+            u64 m = len == 8 ? ~0ull : (u64(1) << (8 * len)) - 1;
+            return ((slot.head0 ^ load8(s)) & m) == 0;
+        }
+        if (slot.head0 != load8(s)) return false;
+        if (len <= 16) {
+            return slot.head1 == load8(s + len - 8);
+        }
+        if (slot.head1 != load8(s + 8)) return false;
+        if (len <= 24) {
+            return slot.head2 == load8(s + len - 8);
+        }
+        return slot.head2 == load8(s + 16);
     }
+
     std::atomic<u16>* tags_ = zeroed<std::atomic<u16>>(SLOTS);
     Slot* slots_ = zeroed<Slot>(SLOTS);
     u32* overflow_ = zeroed<u32>(SLOTS);
@@ -218,18 +266,25 @@ void parse_records(const char* p, const char* end, const char* file_end, const u
 
     Structure sep(p, file_end);
     while (p < end) {
-        auto [f1, q1] = sep.next();
-        auto [f2, q2] = sep.next();
-        auto [f3, q3] = sep.next();
-        const char* f4 = sep.next().at;
-        const char* eol = sep.next().at;
+        const char *f1, *f2, *f3, *f4, *eol;
+        u32 name_quotes = 0, note_quotes = 0;
+        if (!sep.extract_5(f1, f2, f3, f4, eol)) {
+            auto [p1, q1] = sep.next();
+            auto [p2, q2] = sep.next();
+            auto [p3, q3] = sep.next();
+            f1 = p1; f2 = p2; f3 = p3;
+            f4 = sep.next().at;
+            eol = sep.next().at;
+            name_quotes = q2 - q1;
+            note_quotes = q3 - q2;
+        }
         if (u8(*p) == 0xEF) p += 3;
         u64 id = digits(p, f1);
         u64 region = digits(f3 + 1, f4);
         const char* amount = f4 + 1;
         const char* amount_end = eol - (eol[-1] == '\r');
         bool negative = *amount == '-';
-        i64 cents = digits(amount + negative, amount_end - 3) * 100 + digits(amount_end - 2, amount_end);
+        i64 cents = digits(amount + negative, amount_end - 3) * 100 + ((amount_end[-2] - '0') * 10 + (amount_end[-1] - '0'));
         if (negative) cents = -cents;
 
         u32 c = region < regions ? country_of[region] : 0;
@@ -239,9 +294,8 @@ void parse_records(const char* p, const char* end, const char* file_end, const u
         t.amount_sum += cents;
         t.amount_min = std::min(t.amount_min, cents);
         t.amount_max = std::max(t.amount_max, cents);
-        u32 name_quotes = q2 - q1;
         t.name_bytes += text_length(f1 + 1, f2, name_quotes);
-        t.note_bytes += text_length(f2 + 1, f3, q3 - q2);
+        t.note_bytes += text_length(f2 + 1, f3, note_quotes);
         bool quoted = name_quotes != 0;
         advance();
         Pending& next = pending[n++ % LAG];
@@ -274,7 +328,7 @@ void put_money(std::string& out, i64 cents) {
 
 int main() {
     prctl(PR_SET_THP_DISABLE, 1, 0, 0, 0);
-        const int nthreads = 12;
+    const int nthreads = 12;
     size_t rsize, size;
     const char* regions = map_file("/data/regions.csv", rsize);
     const char* records = map_file("/data/records.csv", size);
