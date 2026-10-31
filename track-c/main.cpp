@@ -124,24 +124,31 @@ public:
     u32 id(const char* s, u32 len, Probe p) {
         for (u32 i = p.slot;; i = (i + 1) & (SLOTS - 1)) {
             u16 t = tags_[i].load(std::memory_order_acquire);
-            if (t == 0 && tags_[i].compare_exchange_strong(t, BUSY, std::memory_order_acquire)) {
-                Slot& slot = slots_[i];
-                slot.id = next_id_++;
-                slot.len = len;
-                if (slot.id >= IDS) _exit(1);
-                memcpy(slot.head, s, std::min(len, HEAD));
-                if (len > HEAD) {
-                    overflow_[i] = used_.fetch_add(len - HEAD);
-                    memcpy(arena_ + overflow_[i], s + HEAD, len - HEAD);
-                }
-                tags_[i].store(p.tag, std::memory_order_release);
-                return slot.id;
+            while (t == BUSY) {
+                _mm_pause();
+                t = tags_[i].load(std::memory_order_acquire);
             }
-            while (t == BUSY) t = tags_[i].load(std::memory_order_acquire);
-            const Slot& slot = slots_[i];
-            if (t == p.tag && slot.len == len && same_head(slot, s, len) &&
-                (len <= HEAD || memcmp(arena_ + overflow_[i], s + HEAD, len - HEAD) == 0))
-                return slot.id;
+            if (t == p.tag) {
+                const Slot& slot = slots_[i];
+                if (slot.len == len && same_head(slot, s, len) &&
+                    (len <= HEAD || memcmp(arena_ + overflow_[i], s + HEAD, len - HEAD) == 0))
+                    return slot.id;
+            } else if (t == 0) {
+                if (tags_[i].compare_exchange_strong(t, BUSY, std::memory_order_acquire)) {
+                    Slot& slot = slots_[i];
+                    slot.id = next_id_++;
+                    slot.len = len;
+                    if (slot.id >= IDS) _exit(1);
+                    memcpy(slot.head, s, std::min(len, HEAD));
+                    if (len > HEAD) {
+                        overflow_[i] = used_.fetch_add(len - HEAD, std::memory_order_relaxed);
+                        memcpy(arena_ + overflow_[i], s + HEAD, len - HEAD);
+                    }
+                    tags_[i].store(p.tag, std::memory_order_release);
+                    return slot.id;
+                }
+                --i;
+            }
         }
     }
 
@@ -152,12 +159,21 @@ private:
         char head[HEAD];
     };
 
-    static bool same_head(const Slot& slot, const char* s, u32 len) {
-        __m256i a = _mm256_load_si256(reinterpret_cast<const __m256i*>(&slot));
-        __m256i b = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(s - 8));
-        u32 equal = _mm256_movemask_epi8(_mm256_cmpeq_epi8(a, b));
-        u32 want = ((u64(1) << std::min(len, HEAD)) - 1) << 8;
-        return (equal & want) == want;
+    static inline bool same_head(const Slot& slot, const char* s, u32 len) {
+        u64 a, b;
+        memcpy(&a, slot.head, 8);
+        memcpy(&b, s, 8);
+        if (len < 8) {
+            u64 m = (1ull << (8 * len)) - 1;
+            return ((a ^ b) & m) == 0;
+        }
+        if (a != b) return false;
+        if (len <= 16) {
+            memcpy(&a, slot.head + len - 8, 8);
+            memcpy(&b, s + len - 8, 8);
+            return a == b;
+        }
+        return memcmp(slot.head + 8, s + 8, std::min(len, HEAD) - 8) == 0;
     }
     std::atomic<u16>* tags_ = zeroed<std::atomic<u16>>(SLOTS);
     Slot* slots_ = zeroed<Slot>(SLOTS);
