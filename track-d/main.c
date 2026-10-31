@@ -12,7 +12,6 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
-#define BUFSZ (1 << 16)
 #define INF32 UINT32_MAX
 
 typedef struct {
@@ -32,7 +31,6 @@ typedef struct {
 } Bucket;
 typedef struct {
   long beg, end;
-  char *buf;
   uint32_t *d32, *touched;
   uint64_t *d64;
   Item *heap;
@@ -42,6 +40,7 @@ typedef struct {
 } Th;
 
 static int fd, nth, pass, next_q;
+static const char *graph_base;
 static Th *th;
 static uint32_t n, nq, *off, *cur, *qs, *qt;
 static uint8_t *has_in, *has_in2;
@@ -60,20 +59,24 @@ static void die(const char *m) {
 static void edge_lines(const char *p, const char *lim) {
   while (p < lim) {
     uint32_t u = 0, v = 0;
-    uint64_t w = 0;
     for (; *p != ' '; p++)
       u = u * 10 + (*p - '0');
     for (p++; *p != ' '; p++)
       v = v * 10 + (*p - '0');
-    for (p++; *p != '\n'; p++)
-      w = w * 10 + (*p - '0');
-    p++;
-    if (u == v || u >= n || v >= n)
-      continue;
     if (pass == 1) {
+      while (*p != '\n') p++;
+      p++;
+      if (u == v || u >= n || v >= n)
+        continue;
       __atomic_fetch_add(&off[u + 1], 1, __ATOMIC_RELAXED);
       __atomic_store_n(&has_in[v], 1, __ATOMIC_RELAXED);
     } else {
+      uint64_t w = 0;
+      for (p++; *p != '\n'; p++)
+        w = w * 10 + (*p - '0');
+      p++;
+      if (u == v || u >= n || v >= n)
+        continue;
       edges[__atomic_fetch_add(&cur[u], 1, __ATOMIC_RELAXED)] = (Edge){v, (uint32_t)w};
     }
   }
@@ -81,21 +84,7 @@ static void edge_lines(const char *p, const char *lim) {
 
 static void *scan(void *arg) {
   Th *t = arg;
-  size_t have = 0;
-  for (long o = t->beg; o < t->end;) {
-    long want = t->end - o < (long)(BUFSZ - have) ? t->end - o : (long)(BUFSZ - have);
-    ssize_t k = pread(fd, t->buf + have, want, o);
-    if (k <= 0)
-      die("read failed");
-    o += k;
-    have += k;
-    char *last = memrchr(t->buf, '\n', have);
-    if (!last)
-      continue;
-    edge_lines(t->buf, last + 1);
-    have -= last + 1 - t->buf;
-    memmove(t->buf, last + 1, have);
-  }
+  edge_lines(graph_base + t->beg, graph_base + t->end);
   return NULL;
 }
 
@@ -147,11 +136,12 @@ static void *dist_array(size_t bytes) {
 }
 
 static int64_t search(Th *t, uint32_t s, uint32_t tg) {
-  size_t hn = 0;
+  size_t hn = 0, nt = 0;
   int64_t res = -1;
   if (!t->d64)
     t->d64 = dist_array(n * 8ull);
   t->d64[s] = ~0ull;
+  t->touched[nt++] = s;
   push(t, &hn, 0, s);
   while (hn) {
     Item it = pop(t, &hn);
@@ -166,12 +156,18 @@ static int64_t search(Th *t, uint32_t s, uint32_t tg) {
       edge_at(it.u, e, &v, &w);
       uint64_t nd = it.d + w;
       if (nd < ~t->d64[v]) {
+        if (!t->d64[v]) {
+          if (nt == t->tcap)
+            t->touched = realloc(t->touched, (t->tcap *= 2) * 4);
+          t->touched[nt++] = v;
+        }
         t->d64[v] = ~nd;
         push(t, &hn, nd, v);
       }
     }
   }
-  madvise(t->d64, n * 8ull, MADV_DONTNEED);
+  for (size_t i = 0; i < nt; i++)
+    t->d64[t->touched[i]] = 0;
   return res;
 }
 
@@ -307,17 +303,15 @@ int main(void) {
   fd = open("/data/graph.txt", O_RDONLY);
   if (fd < 0 || fstat(fd, &st))
     die("cannot open /data/graph.txt");
-  long size = st.st_size, body;
-  {
-    char c[64];
-    ssize_t k = pread(fd, c, sizeof c - 1, 0);
-    c[k > 0 ? k : 0] = 0;
-    n = strtoul(c, NULL, 10);
-    char *nl = strchr(c, '\n');
-    if (!nl)
-      die("bad graph.txt header");
-    body = nl - c + 1;
-  }
+  long size = st.st_size;
+  graph_base = (const char *)mmap(NULL, size, PROT_READ, MAP_SHARED, fd, 0);
+  if (graph_base == MAP_FAILED)
+    die("cannot mmap /data/graph.txt");
+  n = strtoul(graph_base, NULL, 10);
+  const char *nl = strchr(graph_base, '\n');
+  if (!nl)
+    die("bad graph.txt header");
+  long body = nl - graph_base + 1;
   for (uint32_t i = 0; i < nq; i++)
     if (qs[i] >= n || qt[i] >= n)
       die("query node out of range");
@@ -332,16 +326,11 @@ int main(void) {
   th[0].beg = body;
   for (int i = 1; i < nth; i++) {
     long b = body + (size - body) * i / nth;
-    char c[64];
-    ssize_t k = pread(fd, c, sizeof c, b - 1);
-    char *nl = k > 0 ? memchr(c, '\n', k) : NULL;
-    b = nl ? b + (nl - c) : size;
-    th[i].beg = b < th[i - 1].beg ? th[i - 1].beg : b;
-    th[i - 1].end = th[i].beg;
+    while (b < size && graph_base[b - 1] != '\n') b++;
+    th[i].beg = b;
+    th[i - 1].end = b;
   }
   th[nth - 1].end = size;
-  for (int i = 0; i < nth; i++)
-    th[i].buf = malloc(BUFSZ);
   pass = 1;
   run_threads(scan);
   for (uint32_t u = 0; u < n; u++)
@@ -352,8 +341,8 @@ int main(void) {
   pass = 2;
   run_threads(scan);
   free(cur);
-  for (int i = 0; i < nth; i++)
-    free(th[i].buf);
+  munmap((void *)graph_base, size);
+  close(fd);
 
   order = malloc(n * 4ull), perm = malloc(n * 4ull);
   uint32_t tail = 0;

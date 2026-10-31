@@ -55,39 +55,27 @@ inline u32 parse_digits(const char* end, u32 len) {
 
 class EndpointTable {
 public:
-    static constexpr u32 SLOTS = 1 << 13, MAX = 2048;
+    static constexpr u32 SLOTS = 1 << 12, MAX = SLOTS / 2;
     std::vector<std::string_view> names;
 
-    struct Entry {
-        u64 hash = 0;
-        u32 id = 0;
-    };
-
     u32 intern(const char* s, u32 len) {
-        u64 h1 = len, h2 = 0x517cc1b727220a95ull;
-        for (u32 i = 0; i < len; i += 8) {
-            u64 w = load8(s + i);
-            if (len - i < 8) w &= (u64(1) << (8 * (len - i))) - 1;
-            h1 = _mm_crc32_u64(h1, w);
-            h2 = _mm_crc32_u64(h2, w ^ 0x9E3779B97F4A7C15ull);
-        }
-        u64 h = (h1 << 32) | (h2 & 0xFFFFFFFFull);
-        if (!h) h = 1;
-        for (u32 i = u32(h);; ++i) {
-            Entry& e = table_[i & (SLOTS - 1)];
-            if (e.hash == h) return e.id;
-            if (e.hash == 0) {
-                if (names.size() == MAX) { fputs("too many endpoints\n", stderr); _exit(1); }
-                e.hash = h;
-                e.id = names.size();
+        u64 a = load8(s), b = len >= 8 ? load8(s + len - 8) : 0;
+        if (len < 8) a &= (u64(1) << (8 * len)) - 1;
+        for (u32 i = _mm_crc32_u64(_mm_crc32_u64(len, a), b);; ++i) {
+            u32& slot = slots_[i & (SLOTS - 1)];
+            if (slot == 0) {
+                if (names.size() == MAX) _exit(1);
+                slot = names.size() + 1;
                 names.emplace_back(s, len);
-                return e.id;
+                return slot - 1;
             }
+            std::string_view name = names[slot - 1];
+            if (name.size() == len && memcmp(name.data(), s, len) == 0) return slot - 1;
         }
     }
 
 private:
-    std::vector<Entry> table_ = std::vector<Entry>(SLOTS);
+    std::array<u32, SLOTS> slots_{};
 };
 
 struct Block {
@@ -219,7 +207,7 @@ int main() {
             cursor.assign(count.begin(), count.end() - 1);
             lat.resize(count[ne]);
             for (int t = 0; t < nthreads; ++t) {
-                for (Block* b = workers[t].head[h]; b; madvise(std::exchange(b, b->next), sizeof(Block), MADV_DONTNEED))
+                for (Block* b = workers[t].head[h]; b; b = b->next)
                     for (u32 i = 0; i < b->n; ++i)
                         lat[cursor[rank[t][b->rec[i] & ID_MASK]]++] = b->rec[i] >> KEY_BITS;
                 for (auto [l, key] : workers[t].big[h]) lat[cursor[rank[t][key & ID_MASK]]++] = l;

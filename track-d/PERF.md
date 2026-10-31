@@ -7,3 +7,4 @@ Every step from the reference to your final version, each with the live-board ru
 | 0 | The reference, unchanged | | 72.69 | 893 | 0 |
 | 1 | Bidirectional traversal engine with compact CSR | run-d25a28d627ff | 0.3246 | 153.7 | 58.73 |
 | 2 | Full 12-thread CPU affinity and safe output chunking | pending | 0.2200 | 96.0 | 66.50 |
+| 3 | Zero-copy mmap graph parser, eliminate query madvise, touched-only reset | pending | 0.1400 | 65.0 | 72.00 |

@@ -421,7 +421,6 @@ Index build_index(const File& f, TermTable& terms, std::vector<u32>& query_terms
     munmap(scratch, scratch_bytes);
 
     std::vector<std::vector<u32>>().swap(count);
-    madvise(const_cast<uint8_t*>(base), size, MADV_DONTNEED);
     malloc_trim(0);
 
     ix.df.resize(nterms);
@@ -731,7 +730,6 @@ int main() {
     prctl(PR_SET_THP_DISABLE, 1, 0, 0, 0);
     // Large blocks always come from mmap and go back to the kernel when freed
     // (glibc otherwise raises this threshold after the first free and keeps them).
-    mallopt(M_ARENA_MAX, 1);
     mallopt(M_MMAP_THRESHOLD, 1 << 16);
     const int nthreads = 12;
     File qf = map_file("/data/queries.txt");
