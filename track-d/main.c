@@ -1,6 +1,7 @@
+// Speed Demon 2026, Track D (Traverse): exact shortest-path distances for each
+// query in a directed graph with non-negative uint32 weights. See specs/d-traverse.md.
 #define _GNU_SOURCE
 #include <fcntl.h>
-#include <malloc.h>
 #include <pthread.h>
 #include <sched.h>
 #include <stdint.h>
@@ -8,11 +9,13 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
-#include <sys/prctl.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
+#define BUFSZ (1 << 16)
 #define INF32 UINT32_MAX
+#define ESC 0xFFFF
+#define RING 4096
 
 typedef struct {
   uint32_t v, w;
@@ -20,17 +23,16 @@ typedef struct {
 typedef struct {
   uint32_t e, v, w;
 } Esc;
-#define ESC 0xFFFF
 typedef struct {
   uint64_t d;
   uint32_t u;
 } Item;
-#define RING 4096
 typedef struct {
   uint32_t *v, n, cap;
 } Bucket;
 typedef struct {
   long beg, end;
+  char *buf;
   uint32_t *d32, *touched;
   uint64_t *d64;
   Item *heap;
@@ -40,7 +42,6 @@ typedef struct {
 } Th;
 
 static int fd, nth, pass, next_q;
-static const char *graph_base;
 static Th *th;
 static uint32_t n, nq, *off, *cur, *qs, *qt;
 static uint8_t *has_in, *has_in2;
@@ -59,24 +60,20 @@ static void die(const char *m) {
 static void edge_lines(const char *p, const char *lim) {
   while (p < lim) {
     uint32_t u = 0, v = 0;
+    uint64_t w = 0;
     for (; *p != ' '; p++)
       u = u * 10 + (*p - '0');
     for (p++; *p != ' '; p++)
       v = v * 10 + (*p - '0');
+    for (p++; *p != '\n'; p++)
+      w = w * 10 + (*p - '0');
+    p++;
+    if (u == v || u >= n || v >= n)
+      continue;
     if (pass == 1) {
-      while (*p != '\n') p++;
-      p++;
-      if (u == v || u >= n || v >= n)
-        continue;
       __atomic_fetch_add(&off[u + 1], 1, __ATOMIC_RELAXED);
       __atomic_store_n(&has_in[v], 1, __ATOMIC_RELAXED);
     } else {
-      uint64_t w = 0;
-      for (p++; *p != '\n'; p++)
-        w = w * 10 + (*p - '0');
-      p++;
-      if (u == v || u >= n || v >= n)
-        continue;
       edges[__atomic_fetch_add(&cur[u], 1, __ATOMIC_RELAXED)] = (Edge){v, (uint32_t)w};
     }
   }
@@ -84,7 +81,21 @@ static void edge_lines(const char *p, const char *lim) {
 
 static void *scan(void *arg) {
   Th *t = arg;
-  edge_lines(graph_base + t->beg, graph_base + t->end);
+  size_t have = 0;
+  for (long o = t->beg; o < t->end;) {
+    long want = t->end - o < (long)(BUFSZ - have) ? t->end - o : (long)(BUFSZ - have);
+    ssize_t k = pread(fd, t->buf + have, want, o);
+    if (k <= 0)
+      die("read failed");
+    o += k;
+    have += k;
+    char *last = memrchr(t->buf, '\n', have);
+    if (!last)
+      continue;
+    edge_lines(t->buf, last + 1);
+    have -= last + 1 - t->buf;
+    memmove(t->buf, last + 1, have);
+  }
   return NULL;
 }
 
@@ -114,18 +125,30 @@ static Item pop(Th *t, size_t *hn) {
   return top;
 }
 
-static void edge_at(uint32_t u, uint32_t e, uint32_t *v, uint32_t *w) {
+static inline void edge_at(uint32_t u, uint32_t e, uint32_t *v, uint32_t *w) {
   uint32_t x = pk[e];
   if ((x & 0xFFFF) != ESC) {
-    *v = u + (int16_t)(x >> 16), *w = x & 0xFFFF;
+    *v = u + (int16_t)(x >> 16);
+    *w = x & 0xFFFF;
     return;
   }
-  size_t lo = 0, hi = nesc;
-  while (esc[lo].e != e) {
-    size_t mid = (lo + hi) / 2;
-    *(esc[mid].e <= e ? &lo : &hi) = mid;
+  if (!nesc) { *v = 0; *w = 0; return; }
+  size_t lo = 0, hi = nesc - 1;
+  while (lo <= hi) {
+    size_t mid = lo + (hi - lo) / 2;
+    if (esc[mid].e == e) {
+      *v = esc[mid].v;
+      *w = esc[mid].w;
+      return;
+    }
+    if (esc[mid].e < e) {
+      lo = mid + 1;
+    } else {
+      if (mid == 0) break;
+      hi = mid - 1;
+    }
   }
-  *v = esc[lo].v, *w = esc[lo].w;
+  *v = 0; *w = 0;
 }
 
 static void *dist_array(size_t bytes) {
@@ -171,7 +194,7 @@ static int64_t search(Th *t, uint32_t s, uint32_t tg) {
   return res;
 }
 
-static void bpush(Bucket *b, uint32_t v) {
+static inline void bpush(Bucket *b, uint32_t v) {
   if (b->n == b->cap)
     b->v = realloc(b->v, (b->cap = b->cap ? b->cap * 2 : 64) * 4ull);
   b->v[b->n++] = v;
@@ -180,7 +203,7 @@ static void bpush(Bucket *b, uint32_t v) {
 static int64_t dial(Th *t, uint32_t s, uint32_t tg) {
   size_t live = 1, nt = 0;
   int64_t res = -1;
-  t->d32[s] = 1;
+  t->d32[s] = 0;
   t->touched[nt++] = s;
   bpush(&t->ring[0], s);
   for (uint32_t d = 0; live && res == -1; d++) {
@@ -188,7 +211,7 @@ static int64_t dial(Th *t, uint32_t s, uint32_t tg) {
     for (uint32_t k = 0; k < b->n && res == -1; k++) {
       uint32_t u = b->v[k];
       live--;
-      if (t->d32[u] != d + 1)
+      if (t->d32[u] != d)
         continue;
       if (u == tg)
         res = d;
@@ -196,15 +219,15 @@ static int64_t dial(Th *t, uint32_t s, uint32_t tg) {
         uint32_t v, w;
         edge_at(u, e, &v, &w);
         uint64_t nd = (uint64_t)d + w;
-        if (w >= RING || nd + 1 >= INF32)
+        if (w >= RING || nd >= INF32)
           res = -2;
-        else if (!t->d32[v] || nd + 1 < t->d32[v]) {
-          if (!t->d32[v]) {
+        else if (nd < t->d32[v]) {
+          if (t->d32[v] == INF32) {
             if (nt == t->tcap)
               t->touched = realloc(t->touched, (t->tcap *= 2) * 4);
             t->touched[nt++] = v;
           }
-          t->d32[v] = nd + 1;
+          t->d32[v] = nd;
           bpush(&t->ring[nd & (RING - 1)], v);
           live++;
         }
@@ -215,13 +238,14 @@ static int64_t dial(Th *t, uint32_t s, uint32_t tg) {
   for (int i = 0; i < RING; i++)
     t->ring[i].n = 0;
   for (size_t i = 0; i < nt; i++)
-    t->d32[t->touched[i]] = 0;
+    t->d32[t->touched[i]] = INF32;
   return res;
 }
 
 static void *answer(void *arg) {
   Th *t = arg;
-  t->d32 = dist_array(n * 4ull);
+  t->d32 = malloc(n * 4ull);
+  memset(t->d32, 0xff, n * 4ull);
   t->tcap = 1 << 16;
   t->touched = malloc(t->tcap * 4);
   t->hcap = 1 << 16;
@@ -239,7 +263,8 @@ static void *answer(void *arg) {
 }
 
 static void share(Th *t, uint32_t *lo, uint32_t *hi) {
-  *lo = (uint64_t)n * (t - th) / nth, *hi = (uint64_t)n * (t - th + 1) / nth;
+  *lo = (uint64_t)n * (t - th) / nth;
+  *hi = (uint64_t)n * (t - th + 1) / nth;
 }
 
 static void *degrees(void *arg) {
@@ -283,19 +308,20 @@ static void run_threads(void *(*f)(void *)) {
 }
 
 int main(void) {
-  prctl(PR_SET_THP_DISABLE, 1, 0, 0, 0);
-
   FILE *qf = fopen("/data/queries.txt", "r");
   if (!qf)
     die("cannot open /data/queries.txt");
   size_t qcap = 1024;
-  qs = malloc(qcap * 4), qt = malloc(qcap * 4);
+  qs = malloc(qcap * 4);
+  qt = malloc(qcap * 4);
   for (uint32_t s, t; fscanf(qf, "%u %u", &s, &t) == 2; nq++) {
     if (nq == qcap) {
       qcap *= 2;
-      qs = realloc(qs, qcap * 4), qt = realloc(qt, qcap * 4);
+      qs = realloc(qs, qcap * 4);
+      qt = realloc(qt, qcap * 4);
     }
-    qs[nq] = s, qt[nq] = t;
+    qs[nq] = s;
+    qt[nq] = t;
   }
   fclose(qf);
 
@@ -303,15 +329,17 @@ int main(void) {
   fd = open("/data/graph.txt", O_RDONLY);
   if (fd < 0 || fstat(fd, &st))
     die("cannot open /data/graph.txt");
-  long size = st.st_size;
-  graph_base = (const char *)mmap(NULL, size, PROT_READ, MAP_SHARED, fd, 0);
-  if (graph_base == MAP_FAILED)
-    die("cannot mmap /data/graph.txt");
-  n = strtoul(graph_base, NULL, 10);
-  const char *nl = strchr(graph_base, '\n');
-  if (!nl)
-    die("bad graph.txt header");
-  long body = nl - graph_base + 1;
+  long size = st.st_size, body;
+  {
+    char c[64];
+    ssize_t k = pread(fd, c, sizeof c - 1, 0);
+    c[k > 0 ? k : 0] = 0;
+    n = strtoul(c, NULL, 10);
+    char *nl = strchr(c, '\n');
+    if (!nl)
+      die("bad graph.txt header");
+    body = nl - c + 1;
+  }
   for (uint32_t i = 0; i < nq; i++)
     if (qs[i] >= n || qt[i] >= n)
       die("query node out of range");
@@ -319,18 +347,22 @@ int main(void) {
   has_in = calloc(n + 1, 1);
 
   cpu_set_t cpus;
-  nth = sched_getaffinity(0, sizeof cpus, &cpus) ? 12 : CPU_COUNT(&cpus);
-  if (nth > 12) nth = 12;
-  if (nth < 1) nth = 1;
+  nth = sched_getaffinity(0, sizeof cpus, &cpus) ? 1 : CPU_COUNT(&cpus);
+  nth = nth < 1 ? 1 : nth > 64 ? 64 : nth;
   th = calloc(nth, sizeof(Th));
   th[0].beg = body;
   for (int i = 1; i < nth; i++) {
     long b = body + (size - body) * i / nth;
-    while (b < size && graph_base[b - 1] != '\n') b++;
-    th[i].beg = b;
-    th[i - 1].end = b;
+    char c[64];
+    ssize_t k = pread(fd, c, sizeof c, b - 1);
+    char *nl = k > 0 ? memchr(c, '\n', k) : NULL;
+    b = nl ? b + (nl - c) : size;
+    th[i].beg = b < th[i - 1].beg ? th[i - 1].beg : b;
+    th[i - 1].end = th[i].beg;
   }
   th[nth - 1].end = size;
+  for (int i = 0; i < nth; i++)
+    th[i].buf = malloc(BUFSZ);
   pass = 1;
   run_threads(scan);
   for (uint32_t u = 0; u < n; u++)
@@ -341,16 +373,18 @@ int main(void) {
   pass = 2;
   run_threads(scan);
   free(cur);
-  munmap((void *)graph_base, size);
-  close(fd);
+  for (int i = 0; i < nth; i++)
+    free(th[i].buf);
 
-  order = malloc(n * 4ull), perm = malloc(n * 4ull);
+  order = malloc(n * 4ull);
+  perm = malloc(n * 4ull);
   uint32_t tail = 0;
   memset(perm, 0xff, n * 4ull);
   for (uint32_t r = 0; r < n; r++) {
     if (perm[r] != INF32)
       continue;
-    perm[r] = tail, order[tail++] = r;
+    perm[r] = tail;
+    order[tail++] = r;
     for (uint32_t h = tail - 1; h < tail; h++) {
       if (h + 16 < tail)
         __builtin_prefetch(&off[order[h + 16]]);
@@ -359,59 +393,47 @@ int main(void) {
       for (uint32_t e = h + 4 < tail ? off[order[h + 4]] : 0; h + 4 < tail && e < off[order[h + 4] + 1]; e++)
         __builtin_prefetch(&perm[edges[e].v]);
       for (uint32_t e = off[order[h]]; e < off[order[h] + 1]; e++)
-        if (perm[edges[e].v] == INF32)
-          perm[edges[e].v] = tail, order[tail++] = edges[e].v;
+        if (perm[edges[e].v] == INF32) {
+          perm[edges[e].v] = tail;
+          order[tail++] = edges[e].v;
+        }
     }
   }
 
-  off2 = malloc((n + 2) * 4ull), pk = malloc((off[n] + 1ull) * 4);
+  off2 = malloc((n + 2) * 4ull);
+  pk = malloc((off[n] + 1ull) * 4);
   has_in2 = malloc(n + 1ull);
   off2[0] = 0;
   run_threads(degrees);
   for (uint32_t i = 0; i < n; i++)
     off2[i + 1] += off2[i];
   run_threads(remap);
-  free(edges), free(off), free(has_in), free(order);
-  off = off2, has_in = has_in2;
+  free(edges);
+  free(off);
+  free(has_in);
+  free(order);
+  off = off2;
+  has_in = has_in2;
   for (int i = 0; i < nth; i++)
     nesc += th[i].nesc;
   esc = malloc((nesc + 1) * sizeof(Esc));
   for (int i = 0, k = 0; i < nth; k += th[i].nesc, i++)
     if (th[i].nesc)
       memcpy(esc + k, th[i].esc, th[i].nesc * sizeof(Esc));
-  for (uint32_t i = 0; i < nq; i++)
-    qs[i] = perm[qs[i]], qt[i] = perm[qt[i]];
+  for (uint32_t i = 0; i < nq; i++) {
+    qs[i] = perm[qs[i]];
+    qt[i] = perm[qt[i]];
+  }
   free(perm);
-
-  malloc_trim(0);
 
   ans = malloc((nq + 1) * sizeof *ans);
   run_threads(answer);
-
-  int out_fd = open("/out/distances.txt", O_WRONLY | O_CREAT | O_TRUNC, 0666);
-  if (out_fd < 0) die("cannot create /out/distances.txt");
-  char out_buf[65536];
-  char *op = out_buf;
-  for (uint32_t i = 0; i < nq; i++) {
-    if (op - out_buf > 60000) {
-      if (write(out_fd, out_buf, op - out_buf) != (ssize_t)(op - out_buf)) die("write failed");
-      op = out_buf;
-    }
-    int64_t a = ans[i];
-    if (a < 0) {
-      *op++ = '-'; *op++ = '1'; *op++ = '\n';
-    } else {
-      char b[24];
-      int bi = 24;
-      b[--bi] = '\n';
-      uint64_t x = (uint64_t)a;
-      do { b[--bi] = '0' + (x % 10); x /= 10; } while (x);
-      while (bi < 24) *op++ = b[bi++];
-    }
-  }
-  if (op > out_buf) {
-    if (write(out_fd, out_buf, op - out_buf) != (ssize_t)(op - out_buf)) die("write failed");
-  }
-  close(out_fd);
-  _exit(0);
+  FILE *out = fopen("/out/distances.txt", "w");
+  if (!out)
+    die("cannot create /out/distances.txt");
+  for (uint32_t i = 0; i < nq; i++)
+    fprintf(out, "%lld\n", (long long)ans[i]);
+  if (fclose(out))
+    die("write failed");
+  return 0;
 }

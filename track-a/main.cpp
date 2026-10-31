@@ -1,5 +1,6 @@
 // Speed Demon 2026, Track A (Ingest).
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <charconv>
 #include <cstdint>
