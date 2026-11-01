@@ -84,12 +84,12 @@ impl Run {
         let hash = name_hash(name, len);
         let mut i = (hash >> (64 - SLOTS.trailing_zeros())) as usize;
         loop {
-            let slot = self.slots[i].load(Relaxed);
+            let slot = self.slots[i].load(Acquire);
             if slot >> ID_BITS == hash >> ID_BITS {
                 return (slot & ID_MASK) as usize - 1;
             } else if slot == 0 {
                 let mut names = self.names.lock().unwrap();
-                if self.slots[i].load(Relaxed) == 0 {
+                if self.slots[i].load(Acquire) == 0 {
                     let id = names.len();
                     assert!(id < ID_MASK as usize);
                     names.push(std::slice::from_raw_parts(name, len).to_vec().leak());
@@ -145,7 +145,6 @@ impl Run {
                 for &end in &ends[..count] {
                     let end = input.add(end as usize);
                     _mm_prefetch(end.add(BLOCK).cast(), _MM_HINT_T0);
-                    _mm_prefetch(end.cast(), _MM_HINT_T0);
                     let clock = read(line.add(8));
                     if clock << 24 != key {
                         cursors[hour] = cursor;

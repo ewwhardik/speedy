@@ -16,4 +16,4 @@ Every step from the reference to your final version, each with the live-board ru
 | 9 | 4KB small-page postings/bitmaps (huge=false), zero-heap-alloc build_shard, pre-reserved union | run-b9cc8b4d3255 | 0.0969 | 43.1 | 78.25 |
 | 10 | Iterator-free Tally (direct indexing, trailing_zeros bit extraction), 8MB workspace | run-2821b0dc5fc1 | 0.1040 | 42.8 | 77.44 |
 | 11 | Restored 2MB hugepage TLB mappings with zero-alloc build_shard | run-9ad14c995ef9 | 0.0963 | 43.1 | 78.32 |
-| 12 | Branchless two-pointer sorted list filter_by, early-exit Tally bit extraction, 4MB BufWriter | pending | - | - | - |
+| 12 | 4-phase corpus division (PHASE_CLAIMS=248) reducing query answering passes by 20% | pending | - | - | - |

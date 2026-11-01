@@ -66,8 +66,6 @@ const BIAS: i64 = 1 << 40;
 
 // Counters that hand out work: region claims, record claims, huge pages to zero, name numbers.
 static NEXT: [AtomicUsize; 4] = [const { AtomicUsize::new(0) }; 4];
-static NEXT_POP: AtomicUsize = AtomicUsize::new(0);
-static DISTINCT: [AtomicU32; GROUPS] = [const { AtomicU32::new(0) }; GROUPS];
 // Region id to group, and country code (as base-26 digits) to group. Both start zeroed.
 static REGION_GROUP: [AtomicU8; REGION_IDS + 1] = [const { AtomicU8::new(0) }; REGION_IDS + 1];
 static LETTERS: [OnceLock<u8>; 26 * 26 * 26] = [const { OnceLock::new() }; 26 * 26 * 26];
@@ -164,27 +162,16 @@ impl Run {
         let tag = hash & (1 << 47) - 1 | 1;
         let bucket = &self.2 .0[index];
         let wanted = _mm256_set1_epi64x(tag as i64);
-        let ptr = bucket.as_ptr().cast::<__m256i>();
-        let v0 = _mm256_load_si256(ptr);
-        let v1 = _mm256_load_si256(ptr.add(1));
-        let s0 = _mm256_srli_epi64::<NUMBER_BITS>(v0);
-        let s1 = _mm256_srli_epi64::<NUMBER_BITS>(v1);
-        let m0 = _mm256_movemask_pd(_mm256_castsi256_pd(_mm256_cmpeq_epi64(s0, wanted)));
-        let m1 = _mm256_movemask_pd(_mm256_castsi256_pd(_mm256_cmpeq_epi64(s1, wanted)));
-        let found = m0 | (m1 << 4);
+        let [low, high] = [0, 1].map(|half| {
+            let slots = _mm256_load_si256(bucket.as_ptr().cast::<__m256i>().add(half));
+            let slots = _mm256_srli_epi64::<NUMBER_BITS>(slots);
+            _mm256_movemask_pd(_mm256_castsi256_pd(_mm256_cmpeq_epi64(slots, wanted)))
+        });
+        let found = low | high << 4;
         if found == 0 {
             return self.insert(index, tag, spare);
         }
-        let raw = if m0 != 0 {
-            let lane = m0.trailing_zeros() as usize;
-            let arr: [u64; 4] = std::mem::transmute(v0);
-            arr[lane]
-        } else {
-            let lane = m1.trailing_zeros() as usize;
-            let arr: [u64; 4] = std::mem::transmute(v1);
-            arr[lane]
-        };
-        (raw & NAME_MASK) as usize
+        (bucket[found.trailing_zeros() as usize].load(Relaxed) & NAME_MASK) as usize
     }
 
     /// Adds a name whose bucket does not hold it: the 100,000 first appearances, and the few
@@ -383,7 +370,10 @@ impl Run {
                 }
                 for &bit in &hashes[..count] {
                     let word = self.2 .1.get_unchecked((bit >> 6) as usize);
-                    word.fetch_or(1 << (bit & 63), Relaxed);
+                    let mask = 1u64 << (bit & 63);
+                    if word.load(Relaxed) & mask == 0 {
+                        word.fetch_or(mask, Relaxed);
+                    }
                 }
 
                 pos.copy_within(count * FIELDS..filled, 0);
@@ -391,14 +381,6 @@ impl Run {
             }
             // Unmap pages in parallel across worker threads to eliminate single-thread exit teardown.
             madvise(input.add(claim), end - claim, 4);
-        }
-        while let Some(group) = take_block(&NEXT_POP, 1, GROUPS) {
-            let row = &self.2 .1[group * SEEN_WORDS..][..SEEN_WORDS];
-            let mut distinct = 0u32;
-            for w in row {
-                distinct += w.load(Relaxed).count_ones();
-            }
-            DISTINCT[group].store(distinct, Relaxed);
         }
         let mut totals = TOTALS.lock().unwrap();
         for (total, part) in totals.iter_mut().zip(&stats) {
@@ -429,33 +411,6 @@ unsafe fn zeroed<T>() -> &'static T {
     &*aligned.cast()
 }
 
-fn put_u64(out: &mut Vec<u8>, mut value: u64) {
-    let mut buf = [0u8; 24];
-    let mut i = 24;
-    loop {
-        i -= 1;
-        buf[i] = b'0' + (value % 10) as u8;
-        value /= 10;
-        if value == 0 {
-            break;
-        }
-    }
-    out.extend_from_slice(&buf[i..24]);
-}
-
-fn put_cents(out: &mut Vec<u8>, cents: i64) {
-    if cents < 0 {
-        out.push(b'-');
-    }
-    let val = cents.unsigned_abs();
-    let whole = val / 100;
-    let rem = val % 100;
-    put_u64(out, whole);
-    out.push(b'.');
-    out.push(b'0' + (rem / 10) as u8);
-    out.push(b'0' + (rem % 10) as u8);
-}
-
 fn main() {
     let n = thread::available_parallelism().map_or(12, |n| n.get());
     COUNTRIES.lock().unwrap().push("_UNMATCHED".into());
@@ -466,29 +421,17 @@ fn main() {
     // `_UNMATCHED` sorts after every country code.
     let mut keys: Vec<_> = COUNTRIES.lock().unwrap().iter().cloned().zip(0..).collect();
     keys.sort_unstable();
-    let mut out = Vec::with_capacity(18000);
+    let mut out = String::new();
     for (key, group) in keys {
         let [count, id_sum, amount, lengths, hi, lo, ..] = totals[group];
+        let row = &run.2 .1[group * SEEN_WORDS..][..SEEN_WORDS];
+        let distinct: u32 = row.iter().map(|w| w.load(Relaxed).count_ones()).sum();
+        // Cents as text. A double holds any total of cents to well within half a cent.
+        let [sum, min, max] =
+            [amount, BIAS - lo, hi - BIAS].map(|c| format!("{:.2}", c as f64 / 100.0));
+        let [name, note] = [lengths & 0xFFFF_FFFF, lengths >> 32];
         if count > 0 {
-            let distinct = DISTINCT[group].load(Relaxed);
-            out.extend_from_slice(key.as_bytes());
-            out.push(b' ');
-            put_u64(&mut out, count as u64);
-            out.push(b' ');
-            put_u64(&mut out, id_sum as u64);
-            out.push(b' ');
-            put_cents(&mut out, amount);
-            out.push(b' ');
-            put_cents(&mut out, BIAS - lo);
-            out.push(b' ');
-            put_cents(&mut out, hi - BIAS);
-            out.push(b' ');
-            put_u64(&mut out, distinct as u64);
-            out.push(b' ');
-            put_u64(&mut out, (lengths & 0xFFFF_FFFF) as u64);
-            out.push(b' ');
-            put_u64(&mut out, (lengths >> 32) as u64);
-            out.push(b'\n');
+            out += &format!("{key} {count} {id_sum} {sum} {min} {max} {distinct} {name} {note}\n");
         }
     }
     std::fs::write("/out/aggregates.txt", out).unwrap();
