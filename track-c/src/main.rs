@@ -162,19 +162,16 @@ impl Run {
         let tag = hash & (1 << 47) - 1 | 1;
         let bucket = &self.2 .0[index];
         let wanted = _mm256_set1_epi64x(tag as i64);
-        let s0 = _mm256_load_si256(bucket.as_ptr().cast::<__m256i>());
-        let m0 = _mm256_cmpeq_epi64(_mm256_srli_epi64::<NUMBER_BITS>(s0), wanted);
-        let low = _mm256_movemask_pd(_mm256_castsi256_pd(m0)) as u32;
-        if low != 0 {
-            return (bucket[low.trailing_zeros() as usize].load(Relaxed) & NAME_MASK) as usize;
+        let [low, high] = [0, 1].map(|half| {
+            let slots = _mm256_load_si256(bucket.as_ptr().cast::<__m256i>().add(half));
+            let slots = _mm256_srli_epi64::<NUMBER_BITS>(slots);
+            _mm256_movemask_pd(_mm256_castsi256_pd(_mm256_cmpeq_epi64(slots, wanted)))
+        });
+        let found = low | high << 4;
+        if found == 0 {
+            return self.insert(index, tag, spare);
         }
-        let s1 = _mm256_load_si256(bucket.as_ptr().cast::<__m256i>().add(1));
-        let m1 = _mm256_cmpeq_epi64(_mm256_srli_epi64::<NUMBER_BITS>(s1), wanted);
-        let high = _mm256_movemask_pd(_mm256_castsi256_pd(m1)) as u32;
-        if high != 0 {
-            return (bucket[4 + high.trailing_zeros() as usize].load(Relaxed) & NAME_MASK) as usize;
-        }
-        self.insert(index, tag, spare)
+        (bucket[found.trailing_zeros() as usize].load(Relaxed) & NAME_MASK) as usize
     }
 
     /// Adds a name whose bucket does not hold it: the 100,000 first appearances, and the few
@@ -293,9 +290,14 @@ impl Run {
                     // Unconditional stores, so that a varying count needs no loop exit to
                     // predict. Eight cover almost every step.
                     let found = bits.count_ones() as usize;
-                    let mut extra = 0;
-                    while extra < 8 || bits != 0 {
-                        *pos.get_unchecked_mut(filled + extra) = at as u32 + bits.trailing_zeros();
+                    let p = pos.as_mut_ptr().add(filled);
+                    for i in 0..8 {
+                        *p.add(i) = at as u32 + bits.trailing_zeros();
+                        bits &= bits.wrapping_sub(1);
+                    }
+                    let mut extra = 8;
+                    while bits != 0 {
+                        *p.add(extra) = at as u32 + bits.trailing_zeros();
                         bits &= bits.wrapping_sub(1);
                         extra += 1;
                     }
@@ -330,7 +332,8 @@ impl Run {
                     start = newline + 1;
                     count += 1;
                 }
-                let _ = [0, 1, 2].map(|kind| decode_digits(&digits[kind], &mut numbers[kind], count));
+                let _ =
+                    [0, 1, 2].map(|kind| decode_digits(&digits[kind], &mut numbers[kind], count));
                 // Pass B: names and notes.
                 let mut rank = quotes_up_to(record);
                 for at in 0..count {
@@ -370,14 +373,8 @@ impl Run {
                     s[4] = s[4].max(BIAS + amount);
                     s[5] = s[5].max(BIAS - amount);
                     let name = self.intern(hashes[at], &mut spare);
-                    let word = group * SEEN_WORDS + name / 64;
-                    _mm_prefetch::<_MM_HINT_ET0>(self.2 .1.as_ptr().add(word).cast());
-                    // The hash is done with, so its slot carries the bit's address to the next pass.
-                    hashes[at] = (word << 6 | name % 64) as u64;
-                }
-                for &bit in &hashes[..count] {
-                    let mask = 1 << (bit & 63);
-                    let word = self.2 .1.get_unchecked((bit >> 6) as usize);
+                    let word = self.2 .1.get_unchecked(group * SEEN_WORDS + name / 64);
+                    let mask = 1u64 << (name % 64);
                     if word.load(Relaxed) & mask == 0 {
                         word.fetch_or(mask, Relaxed);
                     }

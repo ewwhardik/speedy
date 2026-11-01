@@ -122,6 +122,7 @@ impl Run {
                 let (mut count, mut at) = (0, start);
                 let block_end = (start + BLOCK).min(self.len);
                 while at + 64 <= block_end {
+                    _mm_prefetch(input.add(at + BLOCK).cast(), _MM_HINT_T0);
                     let v0 = _mm256_load_si256(input.add(at).cast());
                     let v1 = _mm256_load_si256(input.add(at + 32).cast());
                     let m0 = _mm256_movemask_epi8(_mm256_cmpeq_epi8(v0, newline)) as u32;
@@ -142,7 +143,6 @@ impl Run {
                 }
                 for &end in &ends[..count] {
                     let end = input.add(end as usize);
-                    _mm_prefetch(end.add(BLOCK).cast(), _MM_HINT_T0);
                     let clock = read(line.add(8));
                     if clock << 24 != key {
                         cursors[hour] = cursor;
@@ -203,22 +203,21 @@ impl Run {
         }
         self.sealed.fetch_max(sealed, Release);
         let sealed = |hour| (hour < self.sealed.load(Acquire)).then_some(hour + 1);
-        let Ok(hour) = self.next_hour.try_update(Relaxed, Relaxed, sealed) else {
-            return;
-        };
-        let order = {
-            let names = self.names.lock().unwrap();
-            let mut order = self.order.lock().unwrap();
-            if order.len() != names.len() {
-                let mut sorted: Vec<_> = names.iter().copied().zip(0..).collect();
-                sorted.sort_unstable();
-                *order = Arc::new(sorted);
-            }
-            order.clone()
-        };
-        let part = unsafe { self.summarise(hour, &order) };
-        self.texts[hour].set(part).unwrap();
-        self.write_ready();
+        while let Ok(hour) = self.next_hour.try_update(Relaxed, Relaxed, sealed) {
+            let order = {
+                let names = self.names.lock().unwrap();
+                let mut order = self.order.lock().unwrap();
+                if order.len() != names.len() {
+                    let mut sorted: Vec<_> = names.iter().copied().zip(0..).collect();
+                    sorted.sort_unstable();
+                    *order = Arc::new(sorted);
+                }
+                order.clone()
+            };
+            let part = unsafe { self.summarise(hour, &order) };
+            self.texts[hour].set(part).unwrap();
+            self.write_ready();
+        }
     }
 
     unsafe fn summarise(&self, hour: usize, order: &[(&[u8], usize)]) -> &'static [u8] {
@@ -324,6 +323,15 @@ impl Run {
         }
     }
 
+    fn start<'scope>(&'scope self, s: &'scope thread::Scope<'scope, '_>, mut count: usize) {
+        while count > 0 {
+            let share = count.div_ceil(2);
+            s.spawn(move || self.start(s, share - 1));
+            count -= share;
+        }
+        self.work();
+    }
+
     fn work(&self) {
         unsafe { self.parse() };
         while self.next_hour.load(Relaxed) < HOURS {
@@ -388,10 +396,5 @@ fn main() {
         output: File::create("/out/summary.txt").unwrap(),
         placed: Mutex::new((0, 0)),
     };
-    thread::scope(|s| {
-        for _ in 1..threads {
-            s.spawn(|| run.work());
-        }
-        run.work();
-    });
+    thread::scope(|s| run.start(s, threads - 1));
 }
