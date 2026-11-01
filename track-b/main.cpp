@@ -163,110 +163,51 @@ inline u64 token_bytes(const uint8_t* p) {
     return half(p) | u64(half(p + 32)) << 32;
 }
 
-// The query terms again, laid out for the indexing loop: a 32-byte slot holds
-// a term's first 16 lowercase bytes, its length and its id, so a token of up
-// to 16 bytes is matched inside the slot it hashes to. Longer terms (rare)
-// finish the comparison against the TermTable's copy.
-class FastTerms {
-public:
-    explicit FastTerms(const TermTable& t) : terms_(t) {
-        for (u32 id = 0; id < t.size(); ++id) {
-            u64 w[2] = {0, 0};
-            memcpy(w, t.bytes(id), std::min<size_t>(t.length(id), 16));
-            u32 len = t.length(id);
-            for (u32 i = hash(w[0], w[1], len);; ++i) {
-                Slot& s = slots_[i & (SLOTS - 1)];
-                if (s.len == 0) { s = {w[0], w[1], id, len}; break; }
-            }
-        }
-    }
-
-    static u32 hash(u64 w0, u64 w1, u32 len) {
-        u64 h = _mm_crc32_u64(len, w0);
-        if (len > 8) h = _mm_crc32_u64(h, w1);
-        return u32(h * 0x9E3779B1u >> 15);
-    }
-
-    void prefetch(u32 h) const { _mm_prefetch(reinterpret_cast<const char*>(&slots_[h & (SLOTS - 1)]), _MM_HINT_T0); }
-
-    // The id of the token whose lowercase key is (w0, w1, ...) at text s, or NONE.
-    u32 find(u64 w0, u64 w1, u32 len, u32 h, const uint8_t* s) const {
-        for (u32 i = h;; ++i) {
-            const Slot& slot = slots_[i & (SLOTS - 1)];
-            if (slot.len == 0) return NONE;
-            if (slot.w0 == w0 && slot.w1 == w1 && slot.len == len &&
-                (len <= 16 || tail_matches(slot.id, s, len)))
-                return slot.id;
-        }
-    }
-
-private:
-    bool tail_matches(u32 id, const uint8_t* s, u32 len) const {
-        const uint8_t* k = terms_.bytes(id);
-        for (u32 i = 16; i < len; ++i)
-            if ((s[i] | (s[i] >= 'A' && s[i] <= 'Z' ? 0x20 : 0)) != k[i]) return false;
-        return true;
-    }
-
-    struct alignas(32) Slot {
-        u64 w0, w1;
-        u32 id, len; // len 0 marks an empty slot
-    };
-    static constexpr u32 SLOTS = 1 << 17; // the queries have about 76,000 terms
-    std::vector<Slot> slots_ = std::vector<Slot>(SLOTS);
-    const TermTable& terms_;
-};
-
-// Bit i is set when byte i of the 16 at p is a token byte (see token_bytes).
-inline u32 token_bytes16(const uint8_t* p) {
-    __m128i v = _mm_loadu_si128(reinterpret_cast<const __m128i*>(p));
-    __m128i letter = _mm_sub_epi8(_mm_or_si128(v, _mm_set1_epi8(0x20)), _mm_set1_epi8('a'));
-    __m128i digit = _mm_sub_epi8(v, _mm_set1_epi8('0'));
-    __m128i zero = _mm_setzero_si128();
-    __m128i in = _mm_or_si128(_mm_cmpeq_epi8(_mm_subs_epu8(letter, _mm_set1_epi8(25)), zero),
-                              _mm_cmpeq_epi8(_mm_subs_epu8(digit, _mm_set1_epi8(9)), zero));
-    return u32(_mm_movemask_epi8(in));
-}
-
-// Calls emit(term_id) for every token of text [q, e) (NONE when the token is
-// not a query term). Token starts come from one class mask per 64-byte window;
-// a token's length from a 16-byte class mask at its start, so tokens that run
-// past a window need no special case. Token bytes are [A-Za-z0-9], so OR-ing
-// 0x20 lowercases letters and leaves digits alone. Lookups trail the scan by
-// LAG tokens so their slots have been prefetched.
+// Calls emit(term_id) for every token of text [q, e) that is a known term
+// (NONE for tokens that are not; tokens longer than 32 bytes are skipped).
+// Token bounds come from one class mask per 64-byte window (a token that runs
+// into the window's end starts the next window). The key is read from the
+// text 8 bytes at a time: token bytes are all [A-Za-z0-9], so OR-ing 0x20
+// lowercases letters and leaves digits alone. Each key's table slot is
+// prefetched and the key looked up LAG tokens later, so the misses overlap.
 template <class F>
-inline void for_each_token(const uint8_t* q, const uint8_t* e, const FastTerms& terms, F&& emit) {
-    constexpr u32 LAG = 8;
-    struct Pending { u64 w0, w1; u32 len, h; const uint8_t* s; } pend[LAG];
-    u32 n = 0;
-    u64 carry = 0; // 1 when the previous window ended inside a token
-    for (const uint8_t* w = q; w < e; w += 64) {
-        u64 m = token_bytes(w);
-        if (e - w < 64) m &= (1ull << (e - w)) - 1;
-        u64 starts = m & ~(m << 1 | carry);
-        carry = m >> 63;
-        for (; starts; starts = _blsr_u64(starts)) {
-            const uint8_t* s = w + __builtin_ctzll(starts);
-            u32 len = __builtin_ctz(~token_bytes16(s));
-            if (len == 16)
-                while (s + len < e && LOWER.t[s[len]]) ++len;
-            if (len > MAX_TERM) continue;
-            u64 w0, w1;
-            memcpy(&w0, s, 8);
-            memcpy(&w1, s + 8, 8);
-            w0 = (w0 | 0x2020202020202020ull) & (len >= 8 ? ~0ull : (1ull << (8 * len)) - 1);
-            w1 = len <= 8 ? 0 : (w1 | 0x2020202020202020ull) & (len >= 16 ? ~0ull : (1ull << (8 * (len - 8))) - 1);
-            u32 h = FastTerms::hash(w0, w1, len);
-            terms.prefetch(h);
-            Pending& p = pend[n++ % LAG];
-            if (n > LAG) emit(terms.find(p.w0, p.w1, p.len, p.h, p.s));
-            p = {w0, w1, len, h, s};
+inline void for_each_token(const uint8_t* q, const uint8_t* e, const TermTable& terms, F&& emit) {
+    constexpr size_t LAG = 8;
+    Key keys[LAG];
+    u64 hashes[LAG];
+    size_t n = 0;
+    u64 m = 0;  // token bytes of the window at q not yet consumed
+    for (bool fresh = true; q < e;) {
+        if (fresh) {
+            m = token_bytes(q);
+            if (e - q < 64) m &= (1ull << (e - q)) - 1;
+            fresh = false;
         }
+        if (m == 0) { q += 64; fresh = true; continue; }
+        const uint8_t* s = q + __builtin_ctzll(m);
+        const u64 after = ~m & (~0ull << __builtin_ctzll(m));  // bytes past the token start that end it
+        if (after == 0 && s != q) { q = s; fresh = true; continue; }  // re-window at the token
+        const uint8_t* t = after ? q + __builtin_ctzll(after) : s + 64;
+        while (t < e && LOWER.t[*t]) ++t;  // only a token of 64 bytes or more
+        m &= after ? ~0ull << __builtin_ctzll(after) : 0;
+        if (t > q + 64) { q = t; fresh = true; }
+        const size_t len = t - s;
+        if (len > MAX_TERM) continue;
+        Key k;
+        for (size_t i = 0; i < 4; ++i) {
+            size_t b = len > 8 * i ? std::min<size_t>(len - 8 * i, 8) : 0;
+            u64 w;
+            memcpy(&w, s + 8 * i, 8);
+            k.w[i] = (w | 0x2020202020202020ull) & (b == 8 ? ~0ull : (1ull << (8 * b)) - 1);
+        }
+        const u64 h = hash_key(k);
+        terms.prefetch(h);
+        const size_t slot = n++ % LAG;
+        if (n > LAG) emit(terms.find(keys[slot], hashes[slot]));
+        keys[slot] = k;
+        hashes[slot] = h;
     }
-    for (u32 i = n > LAG ? n - LAG : 0; i < n; ++i) {
-        const Pending& p = pend[i % LAG];
-        emit(terms.find(p.w0, p.w1, p.len, p.h, p.s));
-    }
+    for (size_t i = n > LAG ? n - LAG : 0; i < n; ++i) emit(terms.find(keys[i % LAG], hashes[i % LAG]));
 }
 
 // One query, as views into the flat arrays below.
@@ -426,7 +367,6 @@ Index build_index(const File& f, TermTable& terms, std::vector<u32>& query_terms
     std::vector<std::vector<BlockList>> seen(nthreads);
     std::vector<std::vector<u32>> count(nthreads);
     std::vector<u32> sampled(nthreads);
-    auto fast = std::make_unique<FastTerms>(terms); // rebuilt after renumbering
     // After the sample: renumber the terms by sampled frequency, most frequent
     // first (the scan's per-term state for common terms then shares a few
     // cache lines), and make the terms over 1/32 of the sample bitmaps.
@@ -446,7 +386,6 @@ Index build_index(const File& f, TermTable& terms, std::vector<u32>& query_terms
             if (df[order[rank]] * 32 > docs) ix.dense[rank] = ndense++;
         }
         terms.renumber(new_id);
-        fast = std::make_unique<FastTerms>(terms);
         for (u32& id : query_terms) id = new_id[id];
         ix.bits.assign(ndense * ix.words, 0);
     });
@@ -469,7 +408,7 @@ Index build_index(const File& f, TermTable& terms, std::vector<u32>& query_terms
                     const uint8_t* tx = static_cast<const uint8_t*>(memchr(p, '\t', nl - p)) + 1;
                     ix.text[2 * size_t(doc)] = tx - base;
                     ix.text[2 * size_t(doc) + 1] = nl - base;
-                    for_each_token(tx, nl, *fast, [&](u32 id) {
+                    for_each_token(tx, nl, terms, [&](u32 id) {
                         if (id != NONE && last_doc[id] != doc) last_doc[id] = doc, term(id, doc);
                     });
                     done();
@@ -829,9 +768,7 @@ int main() {
     // Large blocks always come from mmap and go back to the kernel when freed
     // (glibc otherwise raises this threshold after the first free and keeps them).
     mallopt(M_MMAP_THRESHOLD, 1 << 16);
-    // The box gives every run exactly 12 hardware threads (six P-cores); the
-    // per-thread document numbering below also relies on at least 8 threads.
-    const int nthreads = 12;
+    const int nthreads = std::max(1u, std::min(12u, std::thread::hardware_concurrency()));
     File qf = map_file("/data/queries.txt");
     File df = map_file("/data/docs.txt");
 

@@ -21,7 +21,6 @@
 #include <string>
 #include <string_view>
 #include <malloc.h>
-#include <memory>
 #include <sys/mman.h>
 #include <sys/prctl.h>
 #include <thread>
@@ -74,8 +73,7 @@ u32 parse_digits(const char* end, u32 len) {
 
 // Endpoint interning: open addressing on a CRC of the endpoint's first and last
 // eight bytes (masked to the endpoint when it is shorter; the line around it
-// keeps both loads in bounds). Ids follow first sight; names are copied into
-// the table, because the log is read through a reused buffer.
+// keeps both loads in bounds). Ids follow first sight; names point into the log.
 class EndpointTable {
 public:
     static constexpr u32 SLOTS = 1 << 12, MAX = SLOTS / 2;  // ids fit 11 bits; a seed has 1,842
@@ -88,10 +86,7 @@ public:
             u32& slot = slots_[i % SLOTS];
             if (slot == 0) {
                 if (names.size() == MAX) { fputs("too many endpoints\n", stderr); _exit(1); }
-                char* copy = store_.get() + used_;
-                memcpy(copy, s, len);
-                used_ += len;
-                names.emplace_back(copy, len);
+                names.emplace_back(s, len);
                 return (slot = names.size()) - 1;
             }
             std::string_view n = names[slot - 1];
@@ -101,9 +96,6 @@ public:
 
 private:
     std::vector<u32> slots_ = std::vector<u32>(SLOTS);  // id + 1, 0 when empty
-    // Name bytes, 8 spare in front so a short name's 8-byte loads stay inside.
-    std::unique_ptr<char[]> store_{new char[8 + MAX * 128]()};
-    size_t used_ = 8;
 };
 
 // A chunk of one hour's records from one thread, 16 KB. Each thread carves
@@ -126,15 +118,10 @@ struct Worker {
     char* region = nullptr;
     size_t used = 0;
 
-    // Space for the records of `bytes` of log: a line is at least 40 bytes,
-    // and each hour may leave one block part full.
-    void reserve(size_t bytes) {
-        const size_t n = (bytes / 40 / Block::CAP + 1 + HOURS) * sizeof(Block);
-        region = static_cast<char*>(mmap(nullptr, n, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0));
-    }
-
-    // Parses the lines that start in [p, end); each one ends inside the buffer.
     void parse(const char* p, const char* end) {
+        // A line is at least 40 bytes; each hour may leave one block part full.
+        const size_t reserve = ((end - p) / 40 / Block::CAP + 1 + HOURS) * sizeof(Block);
+        region = static_cast<char*>(mmap(nullptr, reserve, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0));
         while (p < end) {
             // YYYY-MM-DDTHH: month digit at 6, day at 8-9, hour at 11-12. The
             // day index counts Oct 30, Oct 31, Nov 1, Nov 2.
@@ -193,37 +180,24 @@ int main() {
     if (fd < 0 || !out) { perror("open"); return 1; }
 
     // Map the log over a spare zero page, so the 64-byte scans stay in bounds.
-    const size_t size = lseek(fd, 0, SEEK_END);
+    size_t size = lseek(fd, 0, SEEK_END);
+    auto* data = static_cast<char*>(
+        mmap(nullptr, size + 4096, PROT_READ, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0));
+    if (size && mmap(data, size, PROT_READ, MAP_PRIVATE | MAP_FIXED, fd, 0) == MAP_FAILED) {
+        perror("mmap");
+        return 1;
+    }
+
+    // Line-aligned ranges, one per thread.
+    std::vector<size_t> cut(nthreads + 1, size);
+    cut[0] = 0;
+    for (int t = 1; t < nthreads; ++t) {
+        cut[t] = std::max(cut[t - 1], size * t / nthreads);
+        while (cut[t] < size && data[cut[t] - 1] != '\n') ++cut[t];
+    }
     std::vector<Worker> workers(nthreads);
-    // Thread t parses the lines that start in [size * t / n, size * (t + 1) / n).
-    // It reads them with pread through a 256 KB buffer it reuses, so the log
-    // costs no page faults and no page tables, only a copy out of page cache.
-    run_threads(nthreads, [&](int t) {
-        constexpr size_t BUF = 1 << 18, PAD = 256;
-        const size_t lo = size * t / nthreads, hi = size * (t + 1) / nthreads;
-        Worker& w = workers[t];
-        w.reserve(hi - lo);
-        std::unique_ptr<char[]> mem(new char[BUF + PAD]());
-        char* buf = mem.get();
-        size_t off = lo ? lo - 1 : 0;  // file offset of buf[0]
-        size_t have = 0;               // bytes of buf holding data
-        bool skip = lo != 0;           // the first line belongs to thread t - 1
-        while (off + have < size) {
-            ssize_t r = pread(fd, buf + have, BUF - have, off + have);
-            if (r <= 0) _exit(1);
-            have += r;
-            char* begin = buf;
-            if (skip) begin = static_cast<char*>(memchr(buf, '\n', have)) + 1, skip = false;
-            char* end = static_cast<char*>(memrchr(begin, '\n', buf + have - begin)) + 1;
-            const bool last = off + (end - buf) >= hi;
-            char* stop = last ? std::min(end, buf + (hi > off ? hi - off : 0)) : end;
-            if (begin < stop) w.parse(begin, stop);
-            if (last) break;
-            have = buf + have - end;  // carry the partial last line over
-            memmove(buf, end, have);
-            off += end - buf;
-        }
-    });
+    run_threads(nthreads, [&](int t) { workers[t].parse(data + cut[t], data + cut[t + 1]); });
+
     // Merge the local tables and sort the names: global ids become ranks in
     // unsigned byte order (a proper prefix first), which is output order.
     EndpointTable global;
