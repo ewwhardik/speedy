@@ -46,8 +46,8 @@ const ANONYMOUS: i32 = 0x4022; // MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE
 
 const HUGE_PAGE: usize = 1 << 21;
 const CLAIM: usize = 1 << 18;
-// 25 MiB of text between turning rows into postings (fits Raptor Lake 24 MB L3 cache).
-const PHASE_CLAIMS: usize = 100;
+// 50 MiB of text between turning rows into postings.
+const PHASE_CLAIMS: usize = 200;
 // u16s before a list: a sentinel while it fills, so duplicates drop with no branch.
 const HEADER: usize = 1;
 // Slices each of the phrase plan and the bucket plan is cut into.
@@ -708,10 +708,10 @@ impl Run {
         let base = self.phase_base[phase];
         let region = self.rows.add(shard * (self.text.len() + 4096));
         let claimed = self.claimed[shard].load(Relaxed);
-        let mut chunks: Vec<(u32, u32)> = (0..claimed)
-            .step_by(CHUNK)
-            .map(|at| (*region.add(at), at as u32))
-            .collect();
+        let mut chunks = Vec::with_capacity(claimed / CHUNK + 1);
+        for at in (0..claimed).step_by(CHUNK) {
+            chunks.push((*region.add(at), at as u32));
+        }
         chunks.sort_unstable();
         let term_count = self.term_count.load(Relaxed);
         let terms = term_count.div_ceil(SHARDS) + 1;
@@ -719,7 +719,8 @@ impl Run {
         for id in (shard..term_count).step_by(SHARDS) {
             (*self.terms.add(id)).count = 0;
         }
-        let mut cursors = vec![0u32; terms];
+        let mut cursors_buf = [0u32; 4096];
+        let cursors = &mut cursors_buf[..terms];
         for_rows(region, &chunks, |low, _| {
             *cursors.get_unchecked_mut(low) += 1
         });
@@ -729,13 +730,17 @@ impl Run {
         let lists = cursors.iter().filter(|&&size| size > 0).count();
         let total = cursors.iter().sum::<u32>() as usize + lists * HEADER;
         let mut at = self.phase[phase][3].fetch_add(total, Relaxed) as u32;
-        for cursor in cursors.iter_mut().filter(|cursor| **cursor > 0) {
-            let size = *cursor;
-            *cursor = at + HEADER as u32;
-            *self.postings.add(*cursor as usize - 1) = u16::MAX;
-            at += size + HEADER as u32;
+        let mut firsts_buf = [0u32; 4096];
+        let firsts = &mut firsts_buf[..terms];
+        for (i, cursor) in cursors.iter_mut().enumerate() {
+            if *cursor > 0 {
+                let size = *cursor;
+                *cursor = at + HEADER as u32;
+                firsts[i] = *cursor;
+                *self.postings.add(*cursor as usize - 1) = u16::MAX;
+                at += size + HEADER as u32;
+            }
         }
-        let firsts = cursors.clone();
         for_rows(region, &chunks, |low, doc| {
             let cursor = cursors.get_unchecked_mut(low);
             let slot = self.postings.add(*cursor as usize);
@@ -1041,6 +1046,7 @@ unsafe fn filter_by(a: &[u16], b: &[u16], keep: bool, out: &mut Vec<u16>, marks:
 }
 
 fn union(a: &[u16], b: &[u16], out: &mut Vec<u16>) {
+    out.reserve(a.len() + b.len());
     let (mut i, mut j) = (0, 0);
     while i < a.len() && j < b.len() {
         let (x, y) = (a[i], b[j]);
@@ -1228,11 +1234,11 @@ fn main() {
             phase_base,
             arrived: Default::default(),
             round: Default::default(),
-            bitmaps: reserve(2 * MAX_HEAVY * words_per_bitmap, true),
+            bitmaps: reserve(2 * MAX_HEAVY * words_per_bitmap, false),
             // Each shard has more rows than it can hold, `len + 4096`: only touched pages cost memory.
             rows: reserve(SHARDS * (text.len() + 4096), false),
             claimed: (0..SHARDS).map(|_| AtomicUsize::new(0)).collect(),
-            postings: reserve(text.len() + HUGE_PAGE, true),
+            postings: reserve(text.len() + HUGE_PAGE, false),
             parts: (0..batches).map(|_| Mutex::default()).collect(),
             workspace: reserve(threads * WORKSPACE, false),
         };

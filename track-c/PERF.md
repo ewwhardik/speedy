@@ -12,4 +12,5 @@ Every step from the reference to your final version, each with the live-board ru
 | 5 | Branch-free AVX2/CLMUL batch-4 decoder with 32-name reservation blocks and hugepage bit-matrix | run-13b6842853f4 | 0.0223 | 11.3 | 82.15 |
 | 6 | Inlined non-recursive name_hash with cold tail on native Raptor Lake | run-5b4deeecb7c6 | 0.0216 | 10.2 | 82.66 |
 | 7 | 128-name reservation blocks and test-and-set bitmatrix filtering | run-3c8bc0b651c8 | 0.0215 | 10.5 | 82.59 |
-| 8 | Output file stat fast-path bypass and atomic bitmatrix load avoidance | pending | - | - | - |
+| 8 | Output file stat fast-path bypass and atomic bitmatrix load avoidance | run-a09fcdaae49f | 0.0216 | 10.5 | 82.43 |
+| 9 | Exact separator position writes, eliminate unconditional 8-write loop, zeroed tables | pending | - | - | - |

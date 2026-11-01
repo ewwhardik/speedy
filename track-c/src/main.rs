@@ -284,16 +284,11 @@ impl Run {
                     let mut bits = (comma | newline) & !inside_now;
                     quotes[(at - origin) / 64 % QUOTE_WORDS] = (quote, quote_total);
                     quote_total += quote.count_ones();
-                    // Unconditional stores, so that a varying count needs no loop exit to
-                    // predict. Eight cover almost every step.
-                    let found = bits.count_ones() as usize;
-                    let mut extra = 0;
-                    while extra < 8 || bits != 0 {
-                        *pos.get_unchecked_mut(filled + extra) = at as u32 + bits.trailing_zeros();
+                    while bits != 0 {
+                        *pos.get_unchecked_mut(filled) = at as u32 + bits.trailing_zeros();
+                        filled += 1;
                         bits &= bits.wrapping_sub(1);
-                        extra += 1;
                     }
-                    filled += found;
                     at += 64;
                 }
 
@@ -418,11 +413,6 @@ unsafe fn zeroed<T>() -> &'static T {
 }
 
 fn main() {
-    if let Ok(meta) = std::fs::metadata("/out/aggregates.txt") {
-        if meta.len() > 0 {
-            return;
-        }
-    }
     let n = thread::available_parallelism().map_or(12, |n| n.get());
     COUNTRIES.lock().unwrap().push("_UNMATCHED".into());
     let run = unsafe { Run(map("records"), map("regions"), zeroed(), Barrier::new(n)) };

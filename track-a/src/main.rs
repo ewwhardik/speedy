@@ -130,7 +130,8 @@ impl Run {
                     let m1 = _mm256_movemask_epi8(_mm256_cmpeq_epi8(v1, newline)) as u32;
                     *ends.get_unchecked_mut(count) = (at + m0.trailing_zeros() as usize) as u32;
                     count += (m0 != 0) as usize;
-                    *ends.get_unchecked_mut(count) = (at + 32 + m1.trailing_zeros() as usize) as u32;
+                    *ends.get_unchecked_mut(count) =
+                        (at + 32 + m1.trailing_zeros() as usize) as u32;
                     count += (m1 != 0) as usize;
                     at += 64;
                 }
@@ -149,7 +150,8 @@ impl Run {
                         cursors[hour] = cursor;
                         key = clock << 24;
                         let day = (clock >> 8 & 15) + 1 - (clock >> 1 & 1);
-                        hour = (day * 24 + (clock >> 24 & 15) * 10 + (clock >> 32 & 15) - 18) as usize;
+                        hour =
+                            (day * 24 + (clock >> 24 & 15) * 10 + (clock >> 32 & 15) - 18) as usize;
                         cursor = cursors[hour];
                         (low, high) = (low.min(hour), high.max(hour));
                     }
@@ -204,7 +206,9 @@ impl Run {
         }
         self.sealed.fetch_max(sealed, Release);
         let sealed = |hour| (hour < self.sealed.load(Acquire)).then_some(hour + 1);
-        let Ok(hour) = self.next_hour.try_update(Relaxed, Relaxed, sealed) else { return; };
+        let Ok(hour) = self.next_hour.try_update(Relaxed, Relaxed, sealed) else {
+            return;
+        };
         let order = {
             let names = self.names.lock().unwrap();
             let mut order = self.order.lock().unwrap();
@@ -277,15 +281,9 @@ impl Run {
         }
         long.iter().for_each(|&(latency, row)| deal(row, latency));
 
-        let d = (hour + 18) / 24;
-        let h = (hour + 18) % 24;
+        let (d, h) = ((hour + 18) / 24, (hour + 18) % 24);
         let mut label = *b"2026-10-30T00:00:00Z ";
-        match d {
-            0 => label[5..10].copy_from_slice(b"10-30"),
-            1 => label[5..10].copy_from_slice(b"10-31"),
-            2 => label[5..10].copy_from_slice(b"11-01"),
-            _ => label[5..10].copy_from_slice(b"11-02"),
-        }
+        label[5..10].copy_from_slice([b"10-30", b"10-31", b"11-01", b"11-02"][d]);
         label[11] = b'0' + (h / 10) as u8;
         label[12] = b'0' + (h % 10) as u8;
 
@@ -350,7 +348,8 @@ fn eight_digits(value: u32) -> u64 {
 #[inline(always)]
 unsafe fn put_number(w: *mut u8, value: u32) -> *mut u8 {
     *w = b' ';
-    let digits = eight_digits(value / 100_000_000) as u128 | (eight_digits(value % 100_000_000) as u128) << 64;
+    let digits = eight_digits(value / 100_000_000) as u128
+        | (eight_digits(value % 100_000_000) as u128) << 64;
     let skip = (digits | 1 << 127).trailing_zeros() as usize / 8;
     let zeros = ZEROS as u128 * ((1 << 64) + 1);
     write_unaligned(w.add(1).cast(), (digits + zeros) >> (8 * skip));
@@ -358,11 +357,6 @@ unsafe fn put_number(w: *mut u8, value: u32) -> *mut u8 {
 }
 
 fn main() {
-    if let Ok(meta) = std::fs::metadata("/out/summary.txt") {
-        if meta.len() > 0 {
-            return;
-        }
-    }
     let _ = solve(true) && solve(false);
 }
 
@@ -377,7 +371,8 @@ fn solve(early: bool) -> bool {
         let null = std::ptr::null_mut();
         let input = map(null, len.div_ceil(4096) * 4096 + 4096, 1, 0x4022, -1);
         map(input, len, 1, 0x12, file.as_raw_fd());
-        let stride = (SPARE_AT + (len / MIN_LINE + 1) * 4 + threads * CHUNK * 2).next_multiple_of(1 << 19);
+        let stride =
+            (SPARE_AT + (len / MIN_LINE + 1) * 4 + threads * CHUNK * 2).next_multiple_of(1 << 19);
         let rows = map(null, stride * HOURS * 4 + (2 << 20), 3, 0x4022, -1);
         let rows = rows.map_addr(|a| a.next_multiple_of(2 << 20));
         (input, rows.cast(), stride)
