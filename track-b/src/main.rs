@@ -524,17 +524,19 @@ impl Run {
                     let ahead = bucket_of(*hashes.add(token + AHEAD));
                     _mm_prefetch::<_MM_HINT_T0>(buckets.add(ahead).cast());
                     let action = action_in(buckets, *hashes.add(token));
-                    // All three stores happen, and only the right counts move.
-                    *heavy_hits.add(heavy_count) = action;
-                    heavy_count += (action >> 31) as usize;
-                    *list_hits.add(list_count) = (action as u64) << 32 | doc as u64;
-                    // A term id + 1, with or without ANCHOR: not 0 and not HEAVY.
-                    list_count += (action.wrapping_sub(1) < HEAVY - 1) as usize;
-                    // Rare enough to predict: about 1 token in 150 starts a phrase check.
-                    if action & ANCHOR != 0 {
-                        *b.anchor_hits.get_unchecked_mut(anchor_count) =
-                            (action as u64) << 40 | (doc as u64) << 20 | token as u64;
-                        anchor_count += 1;
+                    if action != 0 {
+                        if action >= HEAVY {
+                            *heavy_hits.add(heavy_count) = action;
+                            heavy_count += 1;
+                        } else {
+                            *list_hits.add(list_count) = (action as u64) << 32 | doc as u64;
+                            list_count += 1;
+                        }
+                        if action & ANCHOR != 0 {
+                            *b.anchor_hits.get_unchecked_mut(anchor_count) =
+                                (action as u64) << 40 | (doc as u64) << 20 | token as u64;
+                            anchor_count += 1;
+                        }
                     }
                     token += 1;
                 }

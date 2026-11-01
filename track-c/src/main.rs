@@ -179,7 +179,7 @@ impl Run {
     /// no lock is needed. A worker that loses a race to the same name wastes one number.
     #[cold]
     unsafe fn insert(&self, index: usize, tag: u64, spare: &mut Range<usize>) -> usize {
-        if spare.start >= spare.end {
+        if spare.is_empty() {
             // Name numbers are reserved 32 at a time.
             let first = NEXT[3].fetch_add(32, Relaxed);
             *spare = first..first + 32;
@@ -243,9 +243,7 @@ impl Run {
                 line += at + 5;
             }
         }
-        if self.3.wait().is_leader() {
-            madvise(self.1.as_ptr() as *mut u8, self.1.len(), 4);
-        }
+        self.3.wait();
         // Records follow. PR_SET_THP_DISABLE is
         // idempotent, and set before the worker allocates anything for them.
         prctl(41, 1usize, 0usize, 0usize, 0usize);
@@ -290,14 +288,9 @@ impl Run {
                     // Unconditional stores, so that a varying count needs no loop exit to
                     // predict. Eight cover almost every step.
                     let found = bits.count_ones() as usize;
-                    let p = pos.as_mut_ptr().add(filled);
-                    for i in 0..8 {
-                        *p.add(i) = at as u32 + bits.trailing_zeros();
-                        bits &= bits.wrapping_sub(1);
-                    }
-                    let mut extra = 8;
-                    while bits != 0 {
-                        *p.add(extra) = at as u32 + bits.trailing_zeros();
+                    let mut extra = 0;
+                    while extra < 8 || bits != 0 {
+                        *pos.get_unchecked_mut(filled + extra) = at as u32 + bits.trailing_zeros();
                         bits &= bits.wrapping_sub(1);
                         extra += 1;
                     }
@@ -373,11 +366,14 @@ impl Run {
                     s[4] = s[4].max(BIAS + amount);
                     s[5] = s[5].max(BIAS - amount);
                     let name = self.intern(hashes[at], &mut spare);
-                    let word = self.2 .1.get_unchecked(group * SEEN_WORDS + name / 64);
-                    let mask = 1u64 << (name % 64);
-                    if word.load(Relaxed) & mask == 0 {
-                        word.fetch_or(mask, Relaxed);
-                    }
+                    let word = group * SEEN_WORDS + name / 64;
+                    _mm_prefetch::<_MM_HINT_ET0>(self.2 .1.as_ptr().add(word).cast());
+                    // The hash is done with, so its slot carries the bit's address to the next pass.
+                    hashes[at] = (word << 6 | name % 64) as u64;
+                }
+                for &bit in &hashes[..count] {
+                    let word = self.2 .1.get_unchecked((bit >> 6) as usize);
+                    word.fetch_or(1 << (bit & 63), Relaxed);
                 }
 
                 pos.copy_within(count * FIELDS..filled, 0);
