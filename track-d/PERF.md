@@ -8,4 +8,5 @@ Every step from the reference to your final version, each with the live-board ru
 | 1 | Bidirectional traversal engine with compact CSR | run-d25a28d627ff | 0.3246 | 153.7 | 58.73 |
 | 2 | Bidirectional Dijkstra with cache-aligned CSR frontier and touched-only reset | run-03c0df59540c | 0.1126 | 73.0 | 71.67 |
 | 3 | Native architecture build flags (-march=native) targeting scoring box | run-4301346a6ea4 | 0.1145 | 67.9 | 71.80 |
-| 4 | Immediate munmap of 92MB graph.txt and queries.txt, reserved output string buffer | pending | 0.0980 | 48.0 | 74.50 |
+| 4 | Immediate munmap of 92MB graph.txt and queries.txt, reserved output string buffer | run-f3db523516c1 | 0.1080 | 67.6 | 72.42 |
+| 5 | BFS relabelling of road network into cache order with Dial bucket frontier and 24-bit fast tag | run-b6ab9135c625 | 0.0980 | 66.8 | 73.62 |

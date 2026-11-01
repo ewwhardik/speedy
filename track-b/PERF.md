@@ -8,4 +8,5 @@ Every step from the reference to your final version, each with the live-board ru
 | 1 | SIMD tokenization, term-frequency renumbering, galloping CSR | run-3b4b4bf747f1 | 0.2904 | 68.9 | 64.94 |
 | 2 | Rust query-pruned indexer with 64-bit fingerprint term table and galloping lists | run-cf3adea073c6 | 0.1532 | 47.6 | 74.57 |
 | 3 | In-place galloping intersection and query-driven posting collection | run-765447e025c0 | 0.1475 | 47.1 | 75.03 |
-| 4 | Term hash table on 2MB huge page (MADV_HUGEPAGE) with subsequent PR_SET_THP_DISABLE | pending | 0.1380 | 46.5 | 76.50 |
+| 4 | Lock-free postings distribution with hugepage term table | run-7e291dd4a351 | 0.1470 | 47.2 | 75.06 |
+| 5 | Phased streaming transpose engine with VAES token hashing and inline phrases | run-82b2e3580122 | 0.0943 | 42.6 | 78.58 |

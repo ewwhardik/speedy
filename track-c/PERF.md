@@ -9,4 +9,4 @@ Every step from the reference to your final version, each with the live-board ru
 | 2 | Eliminate vector read overrun past EOF in same_head and probe, remove dead vector routines | run-816ef65849e7 | 0.0473 | 13.0 | 72.52 |
 | 3 | CLMUL structural parser with lock-free name table and direct country join | run-475c135653f3 | 0.0285 | 9.1 | 79.40 |
 | 4 | Streamlined 283-line SIMD comma/quote parser with single-pass vector loads | run-f6d2260e1090 | 0.0287 | 9.5 | 79.13 |
-| 5 | Defer zero-vector free comparison in NameTable::id() on 97% hit rate fast path | pending | 0.0255 | 8.8 | 82.50 |
+| 5 | Branch-free AVX2/CLMUL batch-4 decoder with 32-name reservation blocks and hugepage bit-matrix | run-b7163ec15e9a | 0.0220 | 11.1 | 82.40 |
