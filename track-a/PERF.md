@@ -13,4 +13,5 @@ Every step from the reference to your final version, each with the live-board ru
 | 6 | Native scoring box execution with vector AES hash and zero-alloc hour summary | run-4f260522e3fe | 0.0195 | 15.4 | 85.71 |
 | 7 | Unrolled 64B AVX2 newline scan, stack buffers, and symbol stripping | run-129dca8ba2b6 | 0.0196 | 14.7 | 85.65 |
 | 8 | High-throughput direct open-addressing lookup with zero-alloc summary | run-4a17f02db963 | 0.0192 | 15.1 | 85.72 |
-| 9 | Compact source lines, array-indexed timestamp formatting, eliminate lock spinning | pending | - | - | - |
+| 9 | Compact source lines, array-indexed timestamp formatting, eliminate lock spinning | run-a075f07c346c | 0.0198 | 15.9 | 85.44 |
+| 10 | 512-byte stream prefetching to prevent L1d cache thrashing | pending | - | - | - |

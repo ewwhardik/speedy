@@ -284,11 +284,14 @@ impl Run {
                     let mut bits = (comma | newline) & !inside_now;
                     quotes[(at - origin) / 64 % QUOTE_WORDS] = (quote, quote_total);
                     quote_total += quote.count_ones();
-                    while bits != 0 {
-                        *pos.get_unchecked_mut(filled) = at as u32 + bits.trailing_zeros();
-                        filled += 1;
+                    let found = bits.count_ones() as usize;
+                    let mut extra = 0;
+                    while extra < 8 || bits != 0 {
+                        *pos.get_unchecked_mut(filled + extra) = at as u32 + bits.trailing_zeros();
                         bits &= bits.wrapping_sub(1);
+                        extra += 1;
                     }
+                    filled += found;
                     at += 64;
                 }
 
@@ -376,12 +379,7 @@ impl Run {
                 pos.copy_within(count * FIELDS..filled, 0);
                 filled -= count * FIELDS;
             }
-            // Unmap this claim's pages now, in parallel. Otherwise the kernel frees all
-            // ~50,000 page-table entries on one thread at exit, which the timer includes. A
-            // record running into the next claim just faults its few pages back in.
-            // The length stops at the file's end (the kernel rounds it up to a page): madvise goes on
-            // into whatever is mapped after the range, and would wipe it.
-            madvise(input.add(claim), end - claim, 4); // MADV_DONTNEED
+            // madvise removed to prevent mmap_lock write-stall across worker threads.
         }
         let mut totals = TOTALS.lock().unwrap();
         for (total, part) in totals.iter_mut().zip(&stats) {

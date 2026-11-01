@@ -68,7 +68,7 @@ const DOC_BITS: u32 = 18;
 const CHUNK: usize = 64; // rows; the first of each chunk names the claim that wrote it
 const QUERY_BATCH: usize = 64;
 // A worker's share of the one reservation for batch space.
-const WORKSPACE: usize = 32 << 20;
+const WORKSPACE: usize = 4 << 20;
 // Words in a phrase, at most (the grammar allows 2 to 8).
 const MAX_WORDS: usize = 8;
 
@@ -888,7 +888,7 @@ impl Run {
     }
 
     unsafe fn work(&self, id: usize) {
-        let tokens = (1 << 19) + 32; // of a batch and an unfinished document
+        let tokens = (1 << 15) + 64; // of a 16 KB batch (max ~8,192 tokens) and an unfinished document
         let mut next = self.workspace.add(id * WORKSPACE);
         let mut buffers = Buffers {
             starts: take(&mut next, tokens),
