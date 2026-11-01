@@ -427,6 +427,10 @@ struct Job {
       while (x.pos < x.stop)
         line(local, x, wp, bp);
 
+    uintptr_t page_lo = (reinterpret_cast<uintptr_t>(p) + 4095) & ~4095UL;
+    uintptr_t page_hi = reinterpret_cast<uintptr_t>(end) & ~4095UL;
+    if (page_hi > page_lo) madvise((void *)page_lo, page_hi - page_lo, MADV_DONTNEED);
+
     std::lock_guard<std::mutex> lock(mu);
     int last = 0;
     for (uint32_t h = 0; h < kHours; ++h) {
