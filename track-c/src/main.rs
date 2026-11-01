@@ -94,6 +94,10 @@ unsafe fn load(p: *const u8) -> __m256i {
     _mm256_loadu_si256(p.cast())
 }
 
+unsafe fn equal_mask(chunk: __m256i, byte: u8) -> u64 {
+    _mm256_movemask_epi8(_mm256_cmpeq_epi8(chunk, _mm256_set1_epi8(byte as i8))) as u32 as u64
+}
+
 /// The `len` digit bytes before `end`, for lengths 1 to 8, as `decode_digits` wants them.
 /// Shifting them to the top makes the bytes below read as leading zeros.
 unsafe fn digits_before(end: *const u8, len: usize) -> u64 {
@@ -137,7 +141,7 @@ unsafe fn name_hash(name: *const u8, len: usize) -> (u64, usize) {
         return long_name_hash(name, len);
     }
     let bytes = _mm256_and_si256(load(name), load(MASKS.as_ptr().cast::<u8>().add(32 - len)));
-    let quotes = _mm256_movemask_epi8(_mm256_cmpeq_epi8(bytes, _mm256_set1_epi8(b'"' as i8))).count_ones() as usize;
+    let quotes = equal_mask(bytes, b'"').count_ones() as usize;
     let key = _mm_set_epi64x(0x1D8E_4E27_C47D_124F, len as i64 ^ 0x5899_65CC_7537_4CC3);
     let low = _mm256_castsi256_si128(bytes);
     let high = _mm256_extracti128_si256::<1>(bytes);
@@ -176,8 +180,9 @@ impl Run {
     #[cold]
     unsafe fn insert(&self, index: usize, tag: u64, spare: &mut Range<usize>) -> usize {
         if spare.start >= spare.end {
-            let first = NEXT[3].fetch_add(128, Relaxed);
-            *spare = first..first + 128;
+            // Name numbers are reserved 32 at a time.
+            let first = NEXT[3].fetch_add(32, Relaxed);
+            *spare = first..first + 32;
         }
         let claimed = tag << NUMBER_BITS | spare.start as u64;
         // From the bucket's first slot to the end of the table, and round again if need be.
@@ -264,29 +269,24 @@ impl Run {
             let mut record = origin; // the next record to read
             let mut at = origin; // the next byte to scan
             let (mut inside, mut quote_total, mut filled) = (0u64, 0u32, 0usize);
-            let (v_quote, v_comma, v_nl) = (
-                _mm256_set1_epi8(b'"' as i8),
-                _mm256_set1_epi8(b',' as i8),
-                _mm256_set1_epi8(b'\n' as i8),
-            );
             let ones = _mm_set1_epi8(-1);
             while record < end {
                 for _ in 0..32 {
                     let low = load(input.add(at));
                     let high = load(input.add(at + 32));
-                    let q0 = _mm256_movemask_epi8(_mm256_cmpeq_epi8(low, v_quote)) as u32 as u64;
-                    let q1 = _mm256_movemask_epi8(_mm256_cmpeq_epi8(high, v_quote)) as u32 as u64;
-                    let c0 = _mm256_movemask_epi8(_mm256_cmpeq_epi8(low, v_comma)) as u32 as u64;
-                    let c1 = _mm256_movemask_epi8(_mm256_cmpeq_epi8(high, v_comma)) as u32 as u64;
-                    let n0 = _mm256_movemask_epi8(_mm256_cmpeq_epi8(low, v_nl)) as u32 as u64;
-                    let n1 = _mm256_movemask_epi8(_mm256_cmpeq_epi8(high, v_nl)) as u32 as u64;
-                    let (quote, comma, newline) = (q0 | q1 << 32, c0 | c1 << 32, n0 | n1 << 32);
+                    let mask = |byte| equal_mask(low, byte) | equal_mask(high, byte) << 32;
+                    let (quote, comma, newline) = (mask(b'"'), mask(b','), mask(b'\n'));
+                    // A carry-less multiply by all ones sets each bit that has an odd number of
+                    // quote bits at or below it: the mask of everything inside quotes.
                     let quoted = _mm_clmulepi64_si128(_mm_cvtsi64_si128(quote as i64), ones, 0);
                     let inside_now = _mm_cvtsi128_si64(quoted) as u64 ^ inside;
+                    // All ones if the step ended inside quotes: the next step starts inverted.
                     inside = ((inside_now as i64) >> 63) as u64;
                     let mut bits = (comma | newline) & !inside_now;
                     quotes[(at - origin) / 64 % QUOTE_WORDS] = (quote, quote_total);
                     quote_total += quote.count_ones();
+                    // Unconditional stores, so that a varying count needs no loop exit to
+                    // predict. Eight cover almost every step.
                     let found = bits.count_ones() as usize;
                     let mut extra = 0;
                     while extra < 8 || bits != 0 {
@@ -325,8 +325,7 @@ impl Run {
                     start = newline + 1;
                     count += 1;
                 }
-                let _ =
-                    [0, 1, 2].map(|kind| decode_digits(&digits[kind], &mut numbers[kind], count));
+                let _ = [0, 1, 2].map(|kind| decode_digits(&digits[kind], &mut numbers[kind], count));
                 // Pass B: names and notes.
                 let mut rank = quotes_up_to(record);
                 for at in 0..count {
@@ -379,6 +378,12 @@ impl Run {
                 pos.copy_within(count * FIELDS..filled, 0);
                 filled -= count * FIELDS;
             }
+            // Unmap this claim's pages now, in parallel. Otherwise the kernel frees all
+            // ~50,000 page-table entries on one thread at exit, which the timer includes. A
+            // record running into the next claim just faults its few pages back in.
+            // The length stops at the file's end (the kernel rounds it up to a page): madvise goes on
+            // into whatever is mapped after the range, and would wipe it.
+            madvise(input.add(claim), end - claim, 4); // MADV_DONTNEED
         }
         let mut totals = TOTALS.lock().unwrap();
         for (total, part) in totals.iter_mut().zip(&stats) {
@@ -419,13 +424,14 @@ fn main() {
     // `_UNMATCHED` sorts after every country code.
     let mut keys: Vec<_> = COUNTRIES.lock().unwrap().iter().cloned().zip(0..).collect();
     keys.sort_unstable();
-
     let mut out = String::new();
     for (key, group) in keys {
         let [count, id_sum, amount, lengths, hi, lo, ..] = totals[group];
         let row = &run.2 .1[group * SEEN_WORDS..][..SEEN_WORDS];
         let distinct: u32 = row.iter().map(|w| w.load(Relaxed).count_ones()).sum();
-        let [sum, min, max] = [amount, BIAS - lo, hi - BIAS].map(|c| format!("{:.2}", c as f64 / 100.0));
+        // Cents as text. A double holds any total of cents to well within half a cent.
+        let [sum, min, max] =
+            [amount, BIAS - lo, hi - BIAS].map(|c| format!("{:.2}", c as f64 / 100.0));
         let [name, note] = [lengths & 0xFFFF_FFFF, lengths >> 32];
         if count > 0 {
             out += &format!("{key} {count} {id_sum} {sum} {min} {max} {distinct} {name} {note}\n");

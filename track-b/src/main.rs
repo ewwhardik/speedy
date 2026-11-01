@@ -131,7 +131,7 @@ enum Set {
 struct Scratch {
     lists: [Vec<u16>; 2],
     bits: Vec<u64>,
-    marks: Vec<u64>,
+    marks: Vec<u64>, // all zeros between uses
 }
 
 /// What the phases so far found for one query. All zeros is the empty answer, so the array
@@ -145,14 +145,20 @@ struct Tally {
 impl Tally {
     /// Adds a phase's result as a list of ids relative to the phase's first document.
     fn add_list(&mut self, base: u32, list: &[u16]) {
-        let sum: u64 = list.iter().map(|&doc| doc as u64).sum();
+        let sum = list.iter().map(|&doc| doc as u64).sum();
+        let ids = list.iter().map(|&doc| doc as u32);
+        self.add(base, list.len() as u64, sum, ids);
+    }
+
+    /// Adds a phase's `count` ids, `sum` of them, relative to the phase's first document, with
+    /// `ids` the smallest first: they fill the tally's slots if it has room for more.
+    fn add(&mut self, base: u32, count: u64, sum: u64, ids: impl Iterator<Item = u32>) {
         let room = (self.count as usize).min(TALLY_IDS);
-        let take = (TALLY_IDS - room).min(list.len());
-        for i in 0..take {
-            self.first[room + i] = base + list[i] as u32;
+        for (slot, id) in self.first[room..].iter_mut().zip(ids) {
+            *slot = base + id;
         }
-        self.count += list.len() as u32;
-        self.sum += sum + base as u64 * list.len() as u64;
+        self.count += count as u32;
+        self.sum += sum + base as u64 * count;
     }
 
     /// Adds a phase's result as a bitmap, whose length is a multiple of 4 words. The sum of the
@@ -194,23 +200,16 @@ impl Tally {
             };
             (total(counts), total(sums) + total(starts) + total(offsets))
         };
-        if self.count < TALLY_IDS as u32 {
-            let mut room = self.count as usize;
-            'outer: for (index, &word) in bits.iter().enumerate() {
-                let mut w = word;
-                while w != 0 {
-                    let bit = w.trailing_zeros();
-                    self.first[room] = base + index as u32 * 64 + bit;
-                    room += 1;
-                    if room == TALLY_IDS {
-                        break 'outer;
-                    }
-                    w &= w - 1;
-                }
-            }
-        }
-        self.count += count as u32;
-        self.sum += sum + base as u64 * count;
+        let ids = bits
+            .iter()
+            .enumerate()
+            .filter(|(_, &word)| word != 0)
+            .flat_map(|(index, &word)| {
+                (0..64)
+                    .filter(move |bit| word >> bit & 1 == 1)
+                    .map(move |bit| index as u32 * 64 + bit)
+            });
+        self.add(base, count, sum, ids);
     }
 
     fn write(&self, out: &mut Vec<u8>) {
@@ -285,6 +284,8 @@ unsafe fn take<T>(next: &mut *mut u8, count: usize) -> &'static mut [T] {
 unsafe fn map_file(path: &str) -> &'static [u8] {
     let file = File::open(path).unwrap();
     let len = file.metadata().unwrap().len() as usize;
+    // The file goes over the start of a longer reservation, so that a vector load past its end
+    // reads zeros. An empty file fails to map and leaves just the zeros.
     let span = len.div_ceil(4096) * 4096 + 4096;
     let base = mmap(null_mut(), span, 1, ANONYMOUS, -1, 0);
     mmap(base, len, 1, 0x12, file.as_raw_fd(), 0);
@@ -433,6 +434,8 @@ impl Run {
                     line_count += 1;
                     breaks &= breaks - 1;
                 }
+                // Unconditional stores, so a varying token count needs no loop to predict. Twelve
+                // cover almost every 64-byte step; the loops after take the rare rest.
                 let (found, ended) = (opened.count_ones() as usize, closed.count_ones() as usize);
                 let first_in = |bits: u64| (at + bits.trailing_zeros() as usize) as u32;
                 for extra in 0..12 {
@@ -705,10 +708,10 @@ impl Run {
         let base = self.phase_base[phase];
         let region = self.rows.add(shard * (self.text.len() + 4096));
         let claimed = self.claimed[shard].load(Relaxed);
-        let mut chunks = Vec::with_capacity(claimed / CHUNK + 1);
-        for at in (0..claimed).step_by(CHUNK) {
-            chunks.push((*region.add(at), at as u32));
-        }
+        let mut chunks: Vec<(u32, u32)> = (0..claimed)
+            .step_by(CHUNK)
+            .map(|at| (*region.add(at), at as u32))
+            .collect();
         chunks.sort_unstable();
         let term_count = self.term_count.load(Relaxed);
         let terms = term_count.div_ceil(SHARDS) + 1;
@@ -726,16 +729,13 @@ impl Run {
         let lists = cursors.iter().filter(|&&size| size > 0).count();
         let total = cursors.iter().sum::<u32>() as usize + lists * HEADER;
         let mut at = self.phase[phase][3].fetch_add(total, Relaxed) as u32;
-        let mut firsts = vec![0u32; terms];
-        for (i, cursor) in cursors.iter_mut().enumerate() {
-            if *cursor > 0 {
-                let size = *cursor;
-                *cursor = at + HEADER as u32;
-                firsts[i] = *cursor;
-                *self.postings.add(*cursor as usize - 1) = u16::MAX;
-                at += size + HEADER as u32;
-            }
+        for cursor in cursors.iter_mut().filter(|cursor| **cursor > 0) {
+            let size = *cursor;
+            *cursor = at + HEADER as u32;
+            *self.postings.add(*cursor as usize - 1) = u16::MAX;
+            at += size + HEADER as u32;
         }
+        let firsts = cursors.clone();
         for_rows(region, &chunks, |low, doc| {
             let cursor = cursors.get_unchecked_mut(low);
             let slot = self.postings.add(*cursor as usize);
@@ -948,6 +948,13 @@ impl Run {
                 break;
             }
             self.barrier();
+            if stage + 1 == phases {
+                // The scan is over: drop the text from the page tables in one slice per thread,
+                // instead of one thread tearing the whole mapping down at exit.
+                let page =
+                    |n: usize| (self.text.len() * n / self.shares.len()).div_ceil(4096) * 4096;
+                discard(self.text.as_ptr().add(page(id)), page(id + 1) - page(id));
+            }
             // Postings are u16 offsets from the phase's first document, with u16::MAX the sentinel.
             assert!(self.phase_base[stage + 1] - self.phase_base[stage] < u16::MAX as u32);
             self.each_job(&self.phase[stage][1], SHARDS, |shard| {
@@ -1035,7 +1042,6 @@ unsafe fn filter_by(a: &[u16], b: &[u16], keep: bool, out: &mut Vec<u16>, marks:
 }
 
 fn union(a: &[u16], b: &[u16], out: &mut Vec<u16>) {
-    out.reserve(a.len() + b.len());
     let (mut i, mut j) = (0, 0);
     while i < a.len() && j < b.len() {
         let (x, y) = (a[i], b[j]);
@@ -1066,13 +1072,8 @@ unsafe fn apply(op: Op, current: Set, term: Set, scratch: &mut Scratch) -> Set {
         (Op::And | Op::Not, Set::List(a), Set::List(b)) => filter_by(a, b, keep, out, marks),
         (Op::And | Op::Not, Set::List(a), Set::Bits(b)) => {
             // Keep what the bitmap holds for AND, and what it lacks for NOT.
-            out.reserve(a.len());
-            for &doc in a {
-                let held = *b.get_unchecked(doc as usize / 64) >> (doc % 64) & 1 == 1;
-                if held == keep {
-                    out.push(doc);
-                }
-            }
+            let held = |doc: u16| *b.get_unchecked(doc as usize / 64) >> (doc % 64) & 1 == 1;
+            out.extend(a.iter().filter(|&&doc| held(doc) == keep));
         }
         // A merged list is cheaper than a bitmap while it is shorter than one.
         (Op::Or, Set::List(a), Set::List(b)) if a.len() + b.len() < words => union(a, b, out),
@@ -1113,22 +1114,14 @@ unsafe fn apply(op: Op, current: Set, term: Set, scratch: &mut Scratch) -> Set {
     Set::List(std::slice::from_raw_parts(out.as_ptr(), out.len()))
 }
 
-/// Appends a number and a space.
-#[inline(always)]
+/// Appends a number and a space: the digits are written backwards, then reversed in place.
 fn put_number(out: &mut Vec<u8>, mut value: u64) {
-    if value == 0 {
-        out.push(b'0');
-        out.push(b' ');
-        return;
-    }
-    let mut buf = [0u8; 21];
-    let mut i = 21;
-    while value > 0 {
-        i -= 1;
-        buf[i] = b'0' + (value % 10) as u8;
+    let from = out.len();
+    while out.len() == from || value > 0 {
+        out.push(b'0' + (value % 10) as u8);
         value /= 10;
     }
-    out.extend_from_slice(&buf[i..]);
+    out[from..].reverse();
     out.push(b' ');
 }
 
@@ -1248,10 +1241,9 @@ fn main() {
 
         thread::scope(|s| spawn_tree(s, &run, 0));
 
-        let out = File::create("/out/results.txt").unwrap();
-        let mut writer = std::io::BufWriter::with_capacity(4 << 20, out);
+        let mut out = File::create("/out/results.txt").unwrap();
         for part in &run.parts {
-            writer.write_all(&part.lock().unwrap()).unwrap();
+            out.write_all(&part.lock().unwrap()).unwrap();
         }
     }
 }

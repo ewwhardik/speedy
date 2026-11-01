@@ -5,6 +5,7 @@ use std::{fs::File, os::fd::AsRawFd, os::unix::fs::FileExt, thread};
 
 extern "C" {
     fn mmap(addr: *mut u8, len: usize, prot: i32, flags: i32, fd: i32, offset: i64) -> *mut u8;
+    fn madvise(addr: *mut u8, len: usize, advice: i32) -> i32;
     fn prctl(option: i32, ...) -> i32;
 }
 
@@ -35,10 +36,9 @@ fn spaces_in(word: u64) -> u64 {
     z.wrapping_sub(0x0101_0101_0101_0101) & !z & 0x8080_8080_8080_8080
 }
 
-const WINDOW: [[u8; 32]; 3] = [[0; 32], [255; 32], [0; 32]];
-
 #[inline(always)]
 unsafe fn name_hash(name: *const u8, len: usize) -> u64 {
+    const WINDOW: [[u8; 32]; 3] = [[0; 32], [255; 32], [0; 32]];
     let load = |at: *const u8| _mm256_loadu_si256(at.cast());
     let (window, n) = (WINDOW.as_ptr().cast::<u8>(), len.min(32));
     let head = _mm256_and_si256(load(name), load(window.add(64 - n)));
@@ -69,6 +69,8 @@ struct Run {
     claimed: [AtomicUsize; HOURS],
     parsed: Vec<AtomicU32>,
     sealed: AtomicUsize,
+    early: bool,
+    dirty: AtomicBool,
     next_hour: AtomicUsize,
     texts: [OnceLock<&'static [u8]>; HOURS],
     output: File,
@@ -187,6 +189,7 @@ impl Run {
                     line = end.add(1);
                 }
             }
+            madvise(input.add(claim), CLAIM.min(self.len - claim), 4);
             self.parsed[claim / CLAIM].store((1 << 16 | low << 8 | high) as u32, Release);
         }
     }
@@ -199,7 +202,8 @@ impl Run {
                 sealed = top.saturating_sub(1);
                 break;
             }
-            top = top.max(info & 255);
+            self.dirty.fetch_or((info >> 8 & 255) + 1 < top, Relaxed);
+            top = top.max((info & 255) * self.early as usize);
         }
         self.sealed.fetch_max(sealed, Release);
         let sealed = |hour| (hour < self.sealed.load(Acquire)).then_some(hour + 1);
@@ -303,17 +307,27 @@ impl Run {
             *w = b'\n';
             w = w.add(1);
         }
+        madvise(spare.cast(), (count + long.len()) * 4, 4);
         std::slice::from_raw_parts(text, w.offset_from(text) as usize)
     }
 
     fn write_ready(&self) {
-        let mut placed = self.placed.lock().unwrap();
-        while let Some(text) = self.texts.get(placed.0).and_then(|t| t.get()) {
-            self.output.write_all_at(text, placed.1).unwrap();
-            placed.1 += text.len() as u64;
-            placed.0 += 1;
+        let mut ready = Vec::new();
+        {
+            let mut placed = self.placed.lock().unwrap();
+            let (next, offset) = &mut *placed;
+            while let Some(text) = self.texts.get(*next).and_then(|text| text.get()) {
+                ready.push((*next, *offset, *text));
+                (*next, *offset) = (*next + 1, *offset + text.len() as u64);
+            }
+        }
+        for (hour, offset, text) in ready {
+            self.output.write_all_at(text, offset).unwrap();
+            let rows = unsafe { self.rows.add(hour * self.stride) };
+            unsafe { madvise(rows.cast(), self.stride * 4, 4) };
         }
     }
+
     fn work(&self) {
         unsafe { self.parse() };
         while self.next_hour.load(Relaxed) < HOURS {
@@ -344,6 +358,10 @@ unsafe fn put_number(w: *mut u8, value: u32) -> *mut u8 {
 }
 
 fn main() {
+    let _ = solve(true) && solve(false);
+}
+
+fn solve(early: bool) -> bool {
     let file = File::open("/data/requests.log").unwrap();
     let len = file.metadata().unwrap().len() as usize;
     let threads = thread::available_parallelism().map_or(12, |n| n.get());
@@ -373,6 +391,8 @@ fn main() {
         order: Mutex::default(),
         parsed: (0..len.div_ceil(CLAIM)).map(|_| 0.into()).collect(),
         sealed: AtomicUsize::new(0),
+        early,
+        dirty: AtomicBool::new(false),
         next_hour: AtomicUsize::new(0),
         texts: [const { OnceLock::new() }; HOURS],
         output: File::create("/out/summary.txt").unwrap(),
@@ -384,4 +404,5 @@ fn main() {
         }
         run.work();
     });
+    run.dirty.load(Relaxed)
 }
