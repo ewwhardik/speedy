@@ -136,35 +136,37 @@ struct EndpointTable {
     }
 };
 
-// Records for one hour, in 16 KB blocks.
+// Records of one hour, from every thread, in 16 KB blocks claimed from one
+// contiguous region per hour: an hour is then read and freed in one sweep.
 struct Block {
-    static constexpr u32 CAP = (16384 - 16) / 4;
-    Block* next;
-    u32 n;
+    static constexpr u32 CAP = (16384 - 8) / 4;
+    u32 n, worker;
     u32 rec[CAP];
 };
 
+struct HourRegion {
+    char* base;
+    std::atomic<size_t> used{0};
+};
+HourRegion hour_region[HOURS];
+
 struct Worker {
+    u32 id;
     EndpointTable endpoints;
-    Block* head[HOURS] = {};
+    Block* cur[HOURS] = {};
     std::vector<std::pair<u32, u32>> big[HOURS]; // (latency, key) pairs
     std::vector<u32> rank;                       // local id -> global rank
-    char* arena;
-    size_t used = 0;
 
     Block* fresh_block(int h) {
-        auto* b = reinterpret_cast<Block*>(arena + used);
-        used += sizeof(Block);
-        b->next = head[h];
+        HourRegion& r = hour_region[h];
+        auto* b = reinterpret_cast<Block*>(r.base + r.used.fetch_add(sizeof(Block)));
         b->n = 0;
-        return head[h] = b;
+        b->worker = id;
+        return cur[h] = b;
     }
 
     // Parses the whole lines in [p, end).
     void parse(const char* p, const char* end) {
-        size_t cap = ((end - p) / 60 / Block::CAP + HOURS + 1) * sizeof(Block);
-        arena = static_cast<char*>(mmap(nullptr, cap, PROT_READ | PROT_WRITE,
-                                        MAP_PRIVATE | MAP_ANONYMOUS, -1, 0));
         u64 last_prefix = ~u64(0);
         int h = 0;
         Block* b = nullptr;
@@ -176,7 +178,7 @@ struct Worker {
                 int hour = (p[11] - '0') * 10 + p[12] - '0';
                 h = (p[6] == '0' ? day - 30 : day + 1) * 24 + hour - 18;
                 last_prefix = prefix;
-                b = head[h];
+                b = cur[h];
             }
             // The method (3 to 7 letters) starts at 28; the endpoint after it.
             // The fields after the timestamp: method, endpoint, status and
@@ -239,7 +241,14 @@ int main() {
         while (cut[t] < size && data[cut[t] - 1] != '\n') ++cut[t];
     }
 
+    // Lines are at least 40 bytes, which bounds the blocks one hour can need.
+    const size_t hour_bytes = (size / 40 / Block::CAP + nthreads + 1) * sizeof(Block);
+    char* records = static_cast<char*>(mmap(nullptr, hour_bytes * HOURS, PROT_READ | PROT_WRITE,
+                                            MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0));
+    if (records == MAP_FAILED) return 1;
+    for (int h = 0; h < HOURS; ++h) hour_region[h].base = records + h * hour_bytes;
     std::vector<Worker> workers(nthreads);
+    for (int t = 0; t < nthreads; ++t) workers[t].id = t;
     std::vector<Name> names; // every endpoint, in byte order
     // Runs once, between the phases: global ranks for every local id.
     auto merge = [&]() noexcept {
@@ -261,6 +270,11 @@ int main() {
 
     std::vector<char*> text(HOURS);
     std::vector<size_t> text_len(HOURS);
+    // Every hour formats into its own slice of one lazily-touched region; a
+    // slice is handed back to the kernel once it has been written.
+    const size_t slice = ((MAX_ENDPOINTS + 1) * 224 + 4095) & ~size_t(4095);
+    char* text_region = static_cast<char*>(mmap(nullptr, slice * HOURS, PROT_READ | PROT_WRITE,
+                                           MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0));
     std::vector<std::atomic<bool>> done(HOURS);
     std::atomic<int> next_hour{0};
 
@@ -278,23 +292,24 @@ int main() {
             std::fill(errors.begin(), errors.end(), 0);
             keys.clear();
             big.clear();
-            for (auto& w : workers) {
-                for (Block *b = w.head[h], *next; b; b = next) {
-                    for (u32 i = 0; i < b->n; ++i) {
-                        u32 r = b->rec[i], e = w.rank[r >> 1 & 2047];
-                        u32 k = e << 20 | r >> 12;
-                        keys.push_back(k);
-                        ++c0[k & 2047], ++c1[k >> 11 & 511], ++c2[e];
-                        errors[e] += r & 1;
-                    }
-                    next = b->next;
-
+            const HourRegion& region = hour_region[h];
+            for (size_t off = 0; off < region.used; off += sizeof(Block)) {
+                const Block* b = reinterpret_cast<const Block*>(region.base + off);
+                const Worker& w = workers[b->worker];
+                for (u32 i = 0; i < b->n; ++i) {
+                    u32 r = b->rec[i], e = w.rank[r >> 1 & 2047];
+                    u32 k = e << 20 | r >> 12;
+                    keys.push_back(k);
+                    ++c0[k & 2047], ++c1[k >> 11 & 511], ++c2[e];
+                    errors[e] += r & 1;
                 }
+            }
+            madvise(region.base, region.used, MADV_DONTNEED); // done with them
+            for (auto& w : workers)
                 for (auto [l, key] : w.big[h]) {
                     big.push_back({w.rank[key >> 1], l});
                     errors[w.rank[key >> 1]] += key & 1;
                 }
-            }
             std::sort(big.begin(), big.end());
             // Three stable counting passes sort keys by (rank, latency).
             const u32 n = keys.size();
@@ -319,7 +334,7 @@ int main() {
             label[12] = '0' + hour % 10;
 
             // A line is at most 21 + 125 + 6 * 11 bytes.
-            char* buf = static_cast<char*>(malloc((ne + 1) * 224));
+            char* buf = text_region + h * slice;
             char* o = buf;
             const auto* bg = big.data();
             for (u32 e = 0; e < ne; ++e) {
@@ -360,7 +375,7 @@ int main() {
                 if (w <= 0) _exit(1);
                 off += w;
             }
-            free(text[h]);
+            madvise(text[h], slice, MADV_DONTNEED);
         }
     });
     std::vector<std::thread> pool;
