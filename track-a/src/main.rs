@@ -85,29 +85,16 @@ fn spaces_in(word: u64) -> u64 {
 /// head load runs at most 32 bytes past the end of the file, into the spare zero page.
 #[inline(always)]
 unsafe fn name_hash(name: *const u8, len: usize) -> u64 {
-    // Loading at `WINDOW + 64 - n` keeps the first n bytes, and at `WINDOW + n` the last n.
-    const WINDOW: [[u8; 32]; 3] = [[0; 32], [255; 32], [0; 32]];
-    let load = |at: *const u8| _mm256_loadu_si256(at.cast());
-    let (window, n) = (WINDOW.as_ptr().cast::<u8>(), len.min(32));
-    let head = _mm256_and_si256(load(name), load(window.add(64 - n)));
-    let tail = _mm256_and_si256(load(name.add(len).sub(32)), load(window.add(n)));
-    let mut mixed = _mm256_aesenc_epi128(head, tail);
-    if len > 64 {
-        mixed = _mm256_aesenc_epi128(mixed, load(name.add(32)));
-        mixed = _mm256_aesenc_epi128(mixed, load(name.add(len - 64)));
-    }
-    // Two more AES rounds (`vaesenc` does both 16-byte halves at once) mix far better than a
-    // multiply, at about the same cost.
-    let key = _mm256_set1_epi64x(KEY as i64);
-    let mixed = _mm256_aesenc_epi128(_mm256_aesenc_epi128(mixed, key), mixed);
-    let [a, b]: [u64; 2] = std::mem::transmute(_mm_xor_si128(
-        _mm256_castsi256_si128(mixed),
-        _mm256_extracti128_si256(mixed, 1),
-    ));
-    (a ^ b) | 1 << ID_BITS
+    let a = read(name);
+    let b = if len >= 8 {
+        read(name.add(len - 8))
+    } else {
+        a & ((1u64 << (8 * len)) - 1)
+    };
+    let h = _mm_crc32_u64(_mm_crc32_u64(len as u64, a), b);
+    h | (1 << ID_BITS)
 }
 
-const KEY: u64 = 0x9E37_79B9_7F4A_7C15;
 
 struct Run {
     input: *mut u8,
@@ -197,19 +184,7 @@ impl Run {
                 // file, into the spare zero page.
                 let newline = _mm256_set1_epi8(b'\n' as i8);
                 let (mut count, mut at) = (0, start);
-                let limit = (start + BLOCK).min(self.len);
-                while at + 64 <= limit {
-                    let h0 = _mm256_cmpeq_epi8(_mm256_load_si256(input.add(at).cast()), newline);
-                    let h1 = _mm256_cmpeq_epi8(_mm256_load_si256(input.add(at + 32).cast()), newline);
-                    let m0 = _mm256_movemask_epi8(h0) as u32;
-                    let m1 = _mm256_movemask_epi8(h1) as u32;
-                    *ends.get_unchecked_mut(count) = (at + m0.trailing_zeros() as usize) as u32;
-                    count += (m0 != 0) as usize;
-                    *ends.get_unchecked_mut(count) = (at + 32 + m1.trailing_zeros() as usize) as u32;
-                    count += (m1 != 0) as usize;
-                    at += 64;
-                }
-                while at < limit {
+                while at < (start + BLOCK).min(self.len) {
                     let hits = _mm256_cmpeq_epi8(_mm256_load_si256(input.add(at).cast()), newline);
                     let mask = _mm256_movemask_epi8(hits) as u32;
                     *ends.get_unchecked_mut(count) = (at + mask.trailing_zeros() as usize) as u32;
@@ -218,7 +193,7 @@ impl Run {
                 }
                 for &end in &ends[..count] {
                     let end = input.add(end as usize);
-                    _mm_prefetch(end.add(1024).cast(), _MM_HINT_T0);
+                    _mm_prefetch(end.add(BLOCK).cast(), _MM_HINT_T0);
                     // `clock` is "DDTHH:MM" (bytes 8 to 15 of the timestamp). Oct 30, Oct 31,
                     // Nov 1 and Nov 2 are day 0 to 3 of the span: the day's units digit plus
                     // one, less one in October, whose tens digit '3' (0x33) has bit 1 set
@@ -347,8 +322,8 @@ impl Run {
         let spare = rows.add(claimed.max(SPARE_AT).next_multiple_of(1024));
         // Counts per endpoint, indexed by the row's group (id + 1), so that after dealing
         // `starts[id]..starts[id + 1]` is the span of `id` (see `deal`).
-        let (mut starts, mut errors) = ([0u32; 1 << ID_BITS], [0u32; 1 << ID_BITS]);
-        let mut long = Vec::with_capacity(512);
+        let (mut starts, mut errors) = (vec![0u32; 1 << ID_BITS], vec![0u32; 1 << ID_BITS]);
+        let mut long = Vec::new();
 
         // Moves rows down over the gaps between chunks. The 1% that escape go aside: they
         // are all longer than the rest, so sorted on their own they simply follow them.
@@ -407,15 +382,8 @@ impl Run {
         long.iter().for_each(|&(latency, row)| deal(row, latency));
 
         // The hour as text with a trailing space (21 bytes), copied in front of every line.
-        let date = [b"10-30", b"10-31", b"11-01", b"11-02"][(hour + 18) / 24];
-        let h = (hour + 18) % 24;
-        let mut label = [0u8; 21];
-        label[..5].copy_from_slice(b"2026-");
-        label[5..10].copy_from_slice(date);
-        label[10] = b'T';
-        label[11] = b'0' + (h / 10) as u8;
-        label[12] = b'0' + (h % 10) as u8;
-        label[13..21].copy_from_slice(b":00:00Z ");
+        let date = ["10-30", "10-31", "11-01", "11-02"][(hour + 18) / 24];
+        let label = format!("2026-{date}T{:02}:00:00Z ", (hour + 18) % 24);
         let (text, mut w) = (rows.cast::<u8>(), rows.cast::<u8>());
         for &(name, id) in order {
             let span = starts[id] as usize..starts[id + 1] as usize;
