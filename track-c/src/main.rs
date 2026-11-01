@@ -162,16 +162,19 @@ impl Run {
         let tag = hash & (1 << 47) - 1 | 1;
         let bucket = &self.2 .0[index];
         let wanted = _mm256_set1_epi64x(tag as i64);
-        let [low, high] = [0, 1].map(|half| {
-            let slots = _mm256_load_si256(bucket.as_ptr().cast::<__m256i>().add(half));
-            let slots = _mm256_srli_epi64::<NUMBER_BITS>(slots);
-            _mm256_movemask_pd(_mm256_castsi256_pd(_mm256_cmpeq_epi64(slots, wanted)))
-        });
-        let found = low | high << 4;
-        if found == 0 {
-            return self.insert(index, tag, spare);
+        let s0 = _mm256_load_si256(bucket.as_ptr().cast::<__m256i>());
+        let m0 = _mm256_cmpeq_epi64(_mm256_srli_epi64::<NUMBER_BITS>(s0), wanted);
+        let low = _mm256_movemask_pd(_mm256_castsi256_pd(m0)) as u32;
+        if low != 0 {
+            return (bucket[low.trailing_zeros() as usize].load(Relaxed) & NAME_MASK) as usize;
         }
-        (bucket[found.trailing_zeros() as usize].load(Relaxed) & NAME_MASK) as usize
+        let s1 = _mm256_load_si256(bucket.as_ptr().cast::<__m256i>().add(1));
+        let m1 = _mm256_cmpeq_epi64(_mm256_srli_epi64::<NUMBER_BITS>(s1), wanted);
+        let high = _mm256_movemask_pd(_mm256_castsi256_pd(m1)) as u32;
+        if high != 0 {
+            return (bucket[4 + high.trailing_zeros() as usize].load(Relaxed) & NAME_MASK) as usize;
+        }
+        self.insert(index, tag, spare)
     }
 
     /// Adds a name whose bucket does not hold it: the 100,000 first appearances, and the few
@@ -373,8 +376,11 @@ impl Run {
                     hashes[at] = (word << 6 | name % 64) as u64;
                 }
                 for &bit in &hashes[..count] {
+                    let mask = 1 << (bit & 63);
                     let word = self.2 .1.get_unchecked((bit >> 6) as usize);
-                    word.fetch_or(1 << (bit & 63), Relaxed);
+                    if word.load(Relaxed) & mask == 0 {
+                        word.fetch_or(mask, Relaxed);
+                    }
                 }
 
                 pos.copy_within(count * FIELDS..filled, 0);
