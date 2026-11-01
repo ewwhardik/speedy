@@ -607,8 +607,16 @@ impl Run {
         let (heavy, out) = (self.heavy(), self.bitmap(0, phase).add(rel / 64));
         let words = heavy.div_ceil(64);
         for k in 0..words {
-            let mut m: [u64; 64] =
-                std::array::from_fn(|j| std::mem::take(&mut group[j * words + k]));
+            let mut any = 0u64;
+            let mut m = [0u64; 64];
+            for j in 0..64 {
+                let val = std::mem::take(&mut group[j * words + k]);
+                any |= val;
+                m[j] = val;
+            }
+            if any == 0 {
+                continue;
+            }
             for width in [32usize, 16, 8, 4, 2, 1] {
                 // The bits of a word that sit in the low half of each block of `2 * width`.
                 let mask = u64::MAX / ((1 << width) + 1);
@@ -793,27 +801,20 @@ impl Run {
         let end = (first + QUERY_BATCH).min(share.queries.len());
         let tallies = share.tallies.as_ptr() as *mut Tally;
         let steps_of = |at: usize| &share.steps[share.queries[at].clone()];
-        // Term records and postings are scattered, so a query's records are requested two
-        // queries before they are read and the start of its lists one query before.
-        let prefetch = |at: usize, lists: bool| {
+        let prefetch_list = |at: usize| {
             for &(_, term) in (at < end).then(|| steps_of(at)).unwrap_or_default() {
                 let info = &*self.terms.add(term as usize);
-                if !lists {
-                    _mm_prefetch::<_MM_HINT_T0>((info as *const Term).cast());
-                } else if !info.heavy {
+                if !info.heavy {
                     let list = self.postings.add(info.first as usize);
-                    // At most 6 cache lines of the list.
                     for line in 0..(info.count as usize).div_ceil(32).min(6) {
                         _mm_prefetch::<_MM_HINT_T0>(list.add(line * 32).cast());
                     }
                 }
             }
         };
-        prefetch(first, false);
-        prefetch(first + 1, false);
+        prefetch_list(first);
         for index in first..end {
-            prefetch(index + 2, false);
-            prefetch(index + 1, true);
+            prefetch_list(index + 1);
             let steps = steps_of(index);
             let tally = &mut *tallies.add(index);
             match self.answer_bool(steps, phase, scratch) {
