@@ -158,11 +158,12 @@ impl Run {
         let tag = hash & (1 << 47) - 1 | 1;
         let bucket = &self.2 .0[index];
         let wanted = _mm256_set1_epi64x(tag as i64);
-        let s0 = _mm256_srli_epi64::<NUMBER_BITS>(_mm256_load_si256(bucket.as_ptr().cast()));
-        let s1 = _mm256_srli_epi64::<NUMBER_BITS>(_mm256_load_si256(bucket.as_ptr().cast::<__m256i>().add(1)));
-        let m0 = _mm256_movemask_pd(_mm256_castsi256_pd(_mm256_cmpeq_epi64(s0, wanted)));
-        let m1 = _mm256_movemask_pd(_mm256_castsi256_pd(_mm256_cmpeq_epi64(s1, wanted)));
-        let found = m0 | (m1 << 4);
+        let [low, high] = [0, 1].map(|half| {
+            let slots = _mm256_load_si256(bucket.as_ptr().cast::<__m256i>().add(half));
+            let slots = _mm256_srli_epi64::<NUMBER_BITS>(slots);
+            _mm256_movemask_pd(_mm256_castsi256_pd(_mm256_cmpeq_epi64(slots, wanted)))
+        });
+        let found = low | high << 4;
         if found == 0 {
             return self.insert(index, tag, spare);
         }
@@ -372,17 +373,12 @@ impl Run {
                 }
                 for &bit in &hashes[..count] {
                     let word = self.2 .1.get_unchecked((bit >> 6) as usize);
-                    let mask = 1u64 << (bit & 63);
-                    if word.load(Relaxed) & mask == 0 {
-                        word.fetch_or(mask, Relaxed);
-                    }
+                    word.fetch_or(1 << (bit & 63), Relaxed);
                 }
 
                 pos.copy_within(count * FIELDS..filled, 0);
                 filled -= count * FIELDS;
             }
-            // Unmap pages in parallel across worker threads to eliminate single-thread exit teardown.
-            madvise(input.add(claim), end - claim, 4);
         }
         let mut totals = TOTALS.lock().unwrap();
         for (total, part) in totals.iter_mut().zip(&stats) {
@@ -424,23 +420,16 @@ fn main() {
     let mut keys: Vec<_> = COUNTRIES.lock().unwrap().iter().cloned().zip(0..).collect();
     keys.sort_unstable();
 
-    use std::fmt::Write;
-    let mut out = String::with_capacity(32768);
+    let mut out = String::new();
     for (key, group) in keys {
         let [count, id_sum, amount, lengths, hi, lo, ..] = totals[group];
-        if count == 0 {
-            continue;
-        }
         let row = &run.2 .1[group * SEEN_WORDS..][..SEEN_WORDS];
         let distinct: u32 = row.iter().map(|w| w.load(Relaxed).count_ones()).sum();
-        let [sum, min, max] =
-            [amount, BIAS - lo, hi - BIAS].map(|c| format!("{:.2}", c as f64 / 100.0));
+        let [sum, min, max] = [amount, BIAS - lo, hi - BIAS].map(|c| format!("{:.2}", c as f64 / 100.0));
         let [name, note] = [lengths & 0xFFFF_FFFF, lengths >> 32];
-        write!(
-            out,
-            "{key} {count} {id_sum} {sum} {min} {max} {distinct} {name} {note}\n"
-        )
-        .unwrap();
+        if count > 0 {
+            out += &format!("{key} {count} {id_sum} {sum} {min} {max} {distinct} {name} {note}\n");
+        }
     }
     std::fs::write("/out/aggregates.txt", out).unwrap();
 }

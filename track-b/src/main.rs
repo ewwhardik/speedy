@@ -948,13 +948,6 @@ impl Run {
                 break;
             }
             self.barrier();
-            if stage + 1 == phases {
-                // The scan is over: drop the text from the page tables in one slice per thread,
-                // instead of one thread tearing the whole mapping down at exit.
-                let page =
-                    |n: usize| (self.text.len() * n / self.shares.len()).div_ceil(4096) * 4096;
-                discard(self.text.as_ptr().add(page(id)), page(id + 1) - page(id));
-            }
             // Postings are u16 offsets from the phase's first document, with u16::MAX the sentinel.
             assert!(self.phase_base[stage + 1] - self.phase_base[stage] < u16::MAX as u32);
             self.each_job(&self.phase[stage][1], SHARDS, |shard| {
