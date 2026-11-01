@@ -18,4 +18,4 @@ Every step from the reference to your final version, each with the live-board ru
 | 11 | Restored 2MB hugepage TLB mappings with zero-alloc build_shard | run-9ad14c995ef9 | 0.0963 | 43.1 | 78.32 |
 | 12 | 4-phase corpus division (PHASE_CLAIMS=248) reducing query answering passes by 20% | run-8dd1424245c4 | 0.0952 | 48.0 | 78.07 |
 | 13 | 5-phase cap compliance (PHASE_CLAIMS=200), early-exit bit scanning | run-7a7d01b4f4b6 | 0.0961 | 43.5 | 78.28 |
-| 14 | Dynamic shard buffer sizing, dead code removal | pending | - | - | - |
+| 14 | 4MB BufWriter on output file, eliminated 782 write syscalls | pending | - | - | - |

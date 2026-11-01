@@ -1260,9 +1260,10 @@ fn main() {
 
         thread::scope(|s| spawn_tree(s, &run, 0));
 
-        let mut out = File::create("/out/results.txt").unwrap();
+        let out = File::create("/out/results.txt").unwrap();
+        let mut writer = std::io::BufWriter::with_capacity(4 << 20, out);
         for part in &run.parts {
-            out.write_all(&part.lock().unwrap()).unwrap();
+            writer.write_all(&part.lock().unwrap()).unwrap();
         }
     }
 }

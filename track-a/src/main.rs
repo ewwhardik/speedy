@@ -333,9 +333,22 @@ impl Run {
         unsafe { self.parse() };
         while self.next_hour.load(Relaxed) < HOURS {
             self.advance();
-            thread::yield_now();
+            std::hint::spin_loop();
         }
     }
+}
+
+fn spawn_tree<'scope, 'env>(
+    scope: &'scope thread::Scope<'scope, 'env>,
+    run: &'env Run,
+    mut descendants: usize,
+) {
+    while descendants > 0 {
+        let share = descendants.div_ceil(2);
+        scope.spawn(move || spawn_tree(scope, run, share - 1));
+        descendants -= share;
+    }
+    run.work();
 }
 
 #[inline(always)]
@@ -393,10 +406,5 @@ fn main() {
         output: File::create("/out/summary.txt").unwrap(),
         placed: Mutex::new((0, 0)),
     };
-    thread::scope(|s| {
-        for _ in 1..threads {
-            s.spawn(|| run.work());
-        }
-        run.work();
-    });
+    thread::scope(|s| spawn_tree(s, &run, threads - 1));
 }
