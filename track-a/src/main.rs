@@ -36,22 +36,26 @@ fn spaces_in(word: u64) -> u64 {
     z.wrapping_sub(0x0101_0101_0101_0101) & !z & 0x8080_8080_8080_8080
 }
 
+const WINDOW: [[u8; 32]; 3] = [[0; 32], [255; 32], [0; 32]];
+
 #[inline(always)]
 unsafe fn name_hash(name: *const u8, len: usize) -> u64 {
-    let mut crc = len as u64;
-    if len < 8 {
-        let chunk = read_unaligned(name.cast::<u64>()) & ((1u64 << (len * 8)) - 1);
-        return (_mm_crc32_u64(crc, chunk).wrapping_mul(KEY)) | 1 << ID_BITS;
+    let load = |at: *const u8| _mm256_loadu_si256(at.cast());
+    let (window, n) = (WINDOW.as_ptr().cast::<u8>(), len.min(32));
+    let head = _mm256_and_si256(load(name), load(window.add(64 - n)));
+    let tail = _mm256_and_si256(load(name.add(len).sub(32)), load(window.add(n)));
+    let mut mixed = _mm256_aesenc_epi128(head, tail);
+    if len > 64 {
+        mixed = _mm256_aesenc_epi128(mixed, load(name.add(32)));
+        mixed = _mm256_aesenc_epi128(mixed, load(name.add(len - 64)));
     }
-    let mut i = 0;
-    while i + 8 <= len {
-        crc = _mm_crc32_u64(crc, read_unaligned(name.add(i).cast()));
-        i += 8;
-    }
-    if i < len {
-        crc = _mm_crc32_u64(crc, read_unaligned(name.add(len - 8).cast()));
-    }
-    (crc.wrapping_mul(KEY)) | 1 << ID_BITS
+    let key = _mm256_set1_epi64x(KEY as i64);
+    let mixed = _mm256_aesenc_epi128(_mm256_aesenc_epi128(mixed, key), key);
+    let [a, b]: [u64; 2] = std::mem::transmute(_mm_xor_si128(
+        _mm256_castsi256_si128(mixed),
+        _mm256_extracti128_si256(mixed, 1),
+    ));
+    (a ^ b) | 1 << ID_BITS
 }
 
 struct Run {
@@ -335,19 +339,6 @@ impl Run {
     }
 }
 
-fn spawn_tree<'scope, 'env>(
-    scope: &'scope thread::Scope<'scope, 'env>,
-    run: &'env Run,
-    mut descendants: usize,
-) {
-    while descendants > 0 {
-        let share = descendants.div_ceil(2);
-        scope.spawn(move || spawn_tree(scope, run, share - 1));
-        descendants -= share;
-    }
-    run.work();
-}
-
 #[inline(always)]
 fn eight_digits(value: u32) -> u64 {
     let merged = (value / 10000) as u64 | ((value % 10000) as u64) << 32;
@@ -378,7 +369,10 @@ fn main() {
         let map = |at, len, prot, flags, fd| mmap(at, len, prot, flags, fd, 0);
         let null = std::ptr::null_mut();
         let input = map(null, len.div_ceil(4096) * 4096 + 4096, 1, 0x4022, -1);
-        map(input, len, 1, 0x12, file.as_raw_fd());
+        let ptr = map(input, len, 1, 0x8011, file.as_raw_fd());
+        if ptr.is_null() || ptr == usize::MAX as *mut u8 {
+            map(input, len, 1, 0x12, file.as_raw_fd());
+        }
         let stride =
             (SPARE_AT + (len / MIN_LINE + 1) * 4 + threads * CHUNK * 2).next_multiple_of(1 << 19);
         let rows = map(null, stride * HOURS * 4 + (2 << 20), 3, 0x4022, -1);
@@ -403,5 +397,10 @@ fn main() {
         output: File::create("/out/summary.txt").unwrap(),
         placed: Mutex::new((0, 0)),
     };
-    thread::scope(|s| spawn_tree(s, &run, threads - 1));
+    thread::scope(|s| {
+        for _ in 1..threads {
+            s.spawn(|| run.work());
+        }
+        run.work();
+    });
 }

@@ -285,11 +285,12 @@ unsafe fn take<T>(next: &mut *mut u8, count: usize) -> &'static mut [T] {
 unsafe fn map_file(path: &str) -> &'static [u8] {
     let file = File::open(path).unwrap();
     let len = file.metadata().unwrap().len() as usize;
-    // The file goes over the start of a longer reservation, so that a vector load past its end
-    // reads zeros. An empty file fails to map and leaves just the zeros.
     let span = len.div_ceil(4096) * 4096 + 4096;
     let base = mmap(null_mut(), span, 1, ANONYMOUS, -1, 0);
-    mmap(base, len, 1, 0x12, file.as_raw_fd(), 0);
+    let ptr = mmap(base, len, 1, 0x8011, file.as_raw_fd(), 0);
+    if ptr.is_null() || ptr == usize::MAX as *mut u8 {
+        mmap(base, len, 1, 0x12, file.as_raw_fd(), 0);
+    }
     std::slice::from_raw_parts(base, len)
 }
 

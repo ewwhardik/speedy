@@ -267,19 +267,26 @@ impl Run {
             let mut record = origin; // the next record to read
             let mut at = origin; // the next byte to scan
             let (mut inside, mut quote_total, mut filled) = (0u64, 0u32, 0usize);
+            let (v_quote, v_comma, v_nl) = (
+                _mm256_set1_epi8(b'"' as i8),
+                _mm256_set1_epi8(b',' as i8),
+                _mm256_set1_epi8(b'\n' as i8),
+            );
+            let ones = _mm_set1_epi8(-1);
             while record < end {
                 for _ in 0..32 {
                     _mm_prefetch::<_MM_HINT_T0>(input.add(at + 256).cast());
                     let low = load(input.add(at));
                     let high = load(input.add(at + 32));
-                    let mask = |byte| equal_mask(low, byte) | equal_mask(high, byte) << 32;
-                    let (quote, comma, newline) = (mask(b'"'), mask(b','), mask(b'\n'));
-                    // A carry-less multiply by all ones sets each bit that has an odd number of
-                    // quote bits at or below it: the mask of everything inside quotes.
-                    let ones = _mm_set1_epi8(-1);
+                    let q0 = _mm256_movemask_epi8(_mm256_cmpeq_epi8(low, v_quote)) as u32 as u64;
+                    let q1 = _mm256_movemask_epi8(_mm256_cmpeq_epi8(high, v_quote)) as u32 as u64;
+                    let c0 = _mm256_movemask_epi8(_mm256_cmpeq_epi8(low, v_comma)) as u32 as u64;
+                    let c1 = _mm256_movemask_epi8(_mm256_cmpeq_epi8(high, v_comma)) as u32 as u64;
+                    let n0 = _mm256_movemask_epi8(_mm256_cmpeq_epi8(low, v_nl)) as u32 as u64;
+                    let n1 = _mm256_movemask_epi8(_mm256_cmpeq_epi8(high, v_nl)) as u32 as u64;
+                    let (quote, comma, newline) = (q0 | q1 << 32, c0 | c1 << 32, n0 | n1 << 32);
                     let quoted = _mm_clmulepi64_si128(_mm_cvtsi64_si128(quote as i64), ones, 0);
                     let inside_now = _mm_cvtsi128_si64(quoted) as u64 ^ inside;
-                    // All ones if the step ended inside quotes: the next step starts inverted.
                     inside = ((inside_now as i64) >> 63) as u64;
                     let mut bits = (comma | newline) & !inside_now;
                     quotes[(at - origin) / 64 % QUOTE_WORDS] = (quote, quote_total);
@@ -397,7 +404,10 @@ unsafe fn map(name: &str) -> &'static [u8] {
     let (fd, len) = (file.as_raw_fd(), file.metadata().unwrap().len() as usize);
     let size = len.next_multiple_of(4096) + 4096;
     let base = mmap(null_mut(), size, 1, MAP_ANON, -1, 0); // PROT_READ
-    mmap(base, len, 1, 0x12, fd, 0); // PROT_READ, MAP_PRIVATE | MAP_FIXED
+    let ptr = mmap(base, len, 1, 0x8011, fd, 0);
+    if ptr.is_null() || ptr == usize::MAX as *mut u8 {
+        mmap(base, len, 1, 0x12, fd, 0);
+    }
     slice::from_raw_parts(base, len)
 }
 
