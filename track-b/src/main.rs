@@ -469,6 +469,33 @@ impl Run {
                 (b.starts.as_ptr(), b.ends.as_ptr(), b.hashes.as_mut_ptr());
             let span = |i: usize| (*starts.add(i) as usize, *ends.add(i) as usize);
             let mut i = token;
+            while i + 3 < ready {
+                let (from_a, to_a) = span(i);
+                let (from_b, to_b) = span(i + 1);
+                let (from_c, to_c) = span(i + 2);
+                let (from_d, to_d) = span(i + 3);
+                let (len_a, len_b, len_c, len_d) =
+                    (to_a - from_a, to_b - from_b, to_c - from_c, to_d - from_d);
+                if (len_a | len_b | len_c | len_d) <= 16 {
+                    let (a, b) = (text.add(from_a), text.add(from_b));
+                    let (c, d) = (text.add(from_c), text.add(from_d));
+                    let (h0, h1) = hash_pair(a, len_a, b, len_b);
+                    let (h2, h3) = hash_pair(c, len_c, d, len_d);
+                    *hashes.add(i) = h0;
+                    *hashes.add(i + 1) = h1;
+                    *hashes.add(i + 2) = h2;
+                    *hashes.add(i + 3) = h3;
+                    i += 4;
+                    continue;
+                }
+                let (a, b) = (text.add(from_a), text.add(from_b));
+                (*hashes.add(i), *hashes.add(i + 1)) = if (len_a | len_b) > 16 {
+                    (hash_of(a, len_a), hash_of(b, len_b))
+                } else {
+                    hash_pair(a, len_a, b, len_b)
+                };
+                i += 2;
+            }
             while i + 1 < ready {
                 let (from_a, to_a) = span(i);
                 let (from_b, to_b) = span(i + 1);
@@ -497,19 +524,17 @@ impl Run {
                     let ahead = bucket_of(*hashes.add(token + AHEAD));
                     _mm_prefetch::<_MM_HINT_T0>(buckets.add(ahead).cast());
                     let action = action_in(buckets, *hashes.add(token));
-                    if action != 0 {
-                        if action >= HEAVY {
-                            *heavy_hits.add(heavy_count) = action;
-                            heavy_count += 1;
-                        } else {
-                            *list_hits.add(list_count) = (action as u64) << 32 | doc as u64;
-                            list_count += 1;
-                            if action & ANCHOR != 0 {
-                                *b.anchor_hits.get_unchecked_mut(anchor_count) =
-                                    (action as u64) << 40 | (doc as u64) << 20 | token as u64;
-                                anchor_count += 1;
-                            }
-                        }
+                    // All three stores happen, and only the right counts move.
+                    *heavy_hits.add(heavy_count) = action;
+                    heavy_count += (action >> 31) as usize;
+                    *list_hits.add(list_count) = (action as u64) << 32 | doc as u64;
+                    // A term id + 1, with or without ANCHOR: not 0 and not HEAVY.
+                    list_count += (action.wrapping_sub(1) < HEAVY - 1) as usize;
+                    // Rare enough to predict: about 1 token in 150 starts a phrase check.
+                    if action & ANCHOR != 0 {
+                        *b.anchor_hits.get_unchecked_mut(anchor_count) =
+                            (action as u64) << 40 | (doc as u64) << 20 | token as u64;
+                        anchor_count += 1;
                     }
                     token += 1;
                 }
