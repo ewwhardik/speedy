@@ -243,7 +243,9 @@ impl Run {
                 line += at + 5;
             }
         }
-        self.3.wait();
+        if self.3.wait().is_leader() {
+            madvise(self.1.as_ptr() as *mut u8, self.1.len(), 4);
+        }
         // Records follow. PR_SET_THP_DISABLE is
         // idempotent, and set before the worker allocates anything for them.
         prctl(41, 1usize, 0usize, 0usize, 0usize);

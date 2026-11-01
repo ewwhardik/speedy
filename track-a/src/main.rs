@@ -142,6 +142,7 @@ impl Run {
                 }
                 for &end in &ends[..count] {
                     let end = input.add(end as usize);
+                    _mm_prefetch(end.add(BLOCK).cast(), _MM_HINT_T0);
                     let clock = read(line.add(8));
                     if clock << 24 != key {
                         cursors[hour] = cursor;
