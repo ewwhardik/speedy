@@ -94,10 +94,6 @@ unsafe fn load(p: *const u8) -> __m256i {
     _mm256_loadu_si256(p.cast())
 }
 
-unsafe fn equal_mask(chunk: __m256i, byte: u8) -> u64 {
-    _mm256_movemask_epi8(_mm256_cmpeq_epi8(chunk, _mm256_set1_epi8(byte as i8))) as u32 as u64
-}
-
 /// The `len` digit bytes before `end`, for lengths 1 to 8, as `decode_digits` wants them.
 /// Shifting them to the top makes the bytes below read as leading zeros.
 unsafe fn digits_before(end: *const u8, len: usize) -> u64 {
@@ -141,7 +137,7 @@ unsafe fn name_hash(name: *const u8, len: usize) -> (u64, usize) {
         return long_name_hash(name, len);
     }
     let bytes = _mm256_and_si256(load(name), load(MASKS.as_ptr().cast::<u8>().add(32 - len)));
-    let quotes = equal_mask(bytes, b'"').count_ones() as usize;
+    let quotes = _mm256_movemask_epi8(_mm256_cmpeq_epi8(bytes, _mm256_set1_epi8(b'"' as i8))).count_ones() as usize;
     let key = _mm_set_epi64x(0x1D8E_4E27_C47D_124F, len as i64 ^ 0x5899_65CC_7537_4CC3);
     let low = _mm256_castsi256_si128(bytes);
     let high = _mm256_extracti128_si256::<1>(bytes);
@@ -162,12 +158,12 @@ impl Run {
         let tag = hash & (1 << 47) - 1 | 1;
         let bucket = &self.2 .0[index];
         let wanted = _mm256_set1_epi64x(tag as i64);
-        let [low, high] = [0, 1].map(|half| {
-            let slots = _mm256_load_si256(bucket.as_ptr().cast::<__m256i>().add(half));
-            let slots = _mm256_srli_epi64::<NUMBER_BITS>(slots);
-            _mm256_movemask_pd(_mm256_castsi256_pd(_mm256_cmpeq_epi64(slots, wanted)))
-        });
-        let found = low | high << 4;
+        let ptr = bucket.as_ptr().cast::<__m256i>();
+        let s0 = _mm256_srli_epi64::<NUMBER_BITS>(_mm256_load_si256(ptr));
+        let s1 = _mm256_srli_epi64::<NUMBER_BITS>(_mm256_load_si256(ptr.add(1)));
+        let m0 = _mm256_movemask_pd(_mm256_castsi256_pd(_mm256_cmpeq_epi64(s0, wanted)));
+        let m1 = _mm256_movemask_pd(_mm256_castsi256_pd(_mm256_cmpeq_epi64(s1, wanted)));
+        let found = m0 | m1 << 4;
         if found == 0 {
             return self.insert(index, tag, spare);
         }
@@ -269,20 +265,28 @@ impl Run {
             let mut record = origin; // the next record to read
             let mut at = origin; // the next byte to scan
             let (mut inside, mut quote_total, mut filled) = (0u64, 0u32, 0usize);
-            let ones = _mm_set1_epi8(-1);
+            let (v_quote, v_comma, v_nl, ones) = (
+                _mm256_set1_epi8(b'"' as i8),
+                _mm256_set1_epi8(b',' as i8),
+                _mm256_set1_epi8(b'\n' as i8),
+                _mm_set1_epi8(-1),
+            );
             while record < end {
                 for _ in 0..32 {
                     let low = load(input.add(at));
                     let high = load(input.add(at + 32));
-                    let mask = |byte| equal_mask(low, byte) | equal_mask(high, byte) << 32;
-                    let (quote, comma, newline) = (mask(b'"'), mask(b','), mask(b'\n'));
-                    // A carry-less multiply by all ones sets each bit that has an odd number of
-                    // quote bits at or below it: the mask of everything inside quotes.
+                    let q0 = _mm256_movemask_epi8(_mm256_cmpeq_epi8(low, v_quote)) as u32 as u64;
+                    let q1 = _mm256_movemask_epi8(_mm256_cmpeq_epi8(high, v_quote)) as u32 as u64;
+                    let quote = q0 | q1 << 32;
+
+                    let cn0 = _mm256_or_si256(_mm256_cmpeq_epi8(low, v_comma), _mm256_cmpeq_epi8(low, v_nl));
+                    let cn1 = _mm256_or_si256(_mm256_cmpeq_epi8(high, v_comma), _mm256_cmpeq_epi8(high, v_nl));
+                    let cn = _mm256_movemask_epi8(cn0) as u32 as u64 | (_mm256_movemask_epi8(cn1) as u32 as u64) << 32;
+
                     let quoted = _mm_clmulepi64_si128(_mm_cvtsi64_si128(quote as i64), ones, 0);
                     let inside_now = _mm_cvtsi128_si64(quoted) as u64 ^ inside;
-                    // All ones if the step ended inside quotes: the next step starts inverted.
                     inside = ((inside_now as i64) >> 63) as u64;
-                    let mut bits = (comma | newline) & !inside_now;
+                    let mut bits = cn & !inside_now;
                     quotes[(at - origin) / 64 % QUOTE_WORDS] = (quote, quote_total);
                     quote_total += quote.count_ones();
                     // Unconditional stores, so that a varying count needs no loop exit to
