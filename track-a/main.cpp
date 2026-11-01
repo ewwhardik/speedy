@@ -1,27 +1,3 @@
-// Speed Demon 2026, Track A (Ingest).
-//
-// One pool of threads does everything in three phases.
-//
-// Parse. The log is memory-mapped and cut into line-aligned pieces, eight per
-// thread, claimed in turn. The timestamp is always 27 bytes and the 72-hour
-// span is fixed, so a line's hour comes from its day and hour digits alone.
-// One 64-byte scan after the timestamp finds the endpoint's ends and the
-// line's end. Endpoints are interned in one lock-free table shared by all
-// threads, and each line files a 4-byte record (latency, endpoint id, 5xx
-// flag) under its hour. A thread unmaps each piece once parsed, so the exit
-// does not tear the whole mapping down on one thread.
-//
-// Between the phases the last thread to arrive sorts the names, so each
-// endpoint id gets its rank in output order.
-//
-// Hours. Threads claim hours. An hour's latencies are counting-sorted by
-// endpoint rank into per-thread scratch, and three selections per group give
-// the percentiles. Each group keeps its numbers along with the exact size its
-// line will take, since a number's width is known without formatting it.
-//
-// Text. The last thread into the second barrier turns the sizes into offsets
-// and maps the output file at its final size; then every thread formats its
-// hours straight into it.
 #include <algorithm>
 #include <atomic>
 #include <barrier>
