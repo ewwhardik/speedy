@@ -12,4 +12,4 @@ Every step from the reference to your final version, each with the live-board ru
 | 5 | Phased streaming transpose engine with VAES token hashing and inline phrases | run-ab26e3ba47a7 | 0.0985 | 42.4 | 78.11 |
 | 6 | Slice-compare MRU endpoint cache and native Raptor Lake compilation | run-02c32df116e3 | 0.0947 | 41.1 | 78.54 |
 | 7 | Zero-bitmap two-pointer streaming list intersection in filter_by with binary search | run-4d79708ac4fa | 0.0996 | 40.8 | 77.93 |
-| 8 | Branchless dense bitmap intersection with 4x binary search cutoff and output fast path | pending | - | - | - |
+| 8 | 25 MiB L3 cache-resident phases (PHASE_CLAIMS=100) and branchless bitmap filter | pending | - | - | - |

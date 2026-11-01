@@ -63,8 +63,6 @@ struct Run {
     next_claim: AtomicUsize,
     slots: [AtomicU64; SLOTS],
     names: Mutex<Vec<&'static [u8]>>,
-    names_ptr: [AtomicPtr<u8>; 2048],
-    names_len: [AtomicU16; 2048],
     order: Mutex<Arc<Vec<(&'static [u8], usize)>>>,
     rows: *mut u32,
     stride: usize,
@@ -94,11 +92,7 @@ impl Run {
                 if self.slots[i].load(Acquire) == 0 {
                     let id = names.len();
                     assert!(id < ID_MASK as usize);
-                    let leaked: &'static [u8] =
-                        std::slice::from_raw_parts(name, len).to_vec().leak();
-                    names.push(leaked);
-                    self.names_ptr[id].store(leaked.as_ptr() as *mut u8, Release);
-                    self.names_len[id].store(len as u16, Release);
+                    names.push(std::slice::from_raw_parts(name, len).to_vec().leak());
                     self.slots[i].store(hash >> ID_BITS << ID_BITS | (id + 1) as u64, Release);
                     return id;
                 }
@@ -113,7 +107,6 @@ impl Run {
         let mut cursors = [(std::ptr::null_mut::<u32>(), std::ptr::null_mut()); HOURS];
         let (mut hour, mut cursor) = (0, (std::ptr::null_mut(), std::ptr::null_mut()));
         let mut ends = [0u32; BLOCK / MIN_LINE + 1];
-        let mut cache_id = [u16::MAX; 1024];
 
         loop {
             self.advance();
@@ -137,8 +130,7 @@ impl Run {
                     let m1 = _mm256_movemask_epi8(_mm256_cmpeq_epi8(v1, newline)) as u32;
                     *ends.get_unchecked_mut(count) = (at + m0.trailing_zeros() as usize) as u32;
                     count += (m0 != 0) as usize;
-                    *ends.get_unchecked_mut(count) =
-                        (at + 32 + m1.trailing_zeros() as usize) as u32;
+                    *ends.get_unchecked_mut(count) = (at + 32 + m1.trailing_zeros() as usize) as u32;
                     count += (m1 != 0) as usize;
                     at += 64;
                 }
@@ -157,8 +149,7 @@ impl Run {
                         cursors[hour] = cursor;
                         key = clock << 24;
                         let day = (clock >> 8 & 15) + 1 - (clock >> 1 & 1);
-                        hour =
-                            (day * 24 + (clock >> 24 & 15) * 10 + (clock >> 32 & 15) - 18) as usize;
+                        hour = (day * 24 + (clock >> 24 & 15) * 10 + (clock >> 32 & 15) - 18) as usize;
                         cursor = cursors[hour];
                         (low, high) = (low.min(hour), high.max(hour));
                     }
@@ -180,29 +171,7 @@ impl Run {
                     };
                     let status = end.sub(digits + 4);
                     let len = status.sub(1).offset_from(name) as usize;
-
-                    let h = (((read(name) ^ (len as u64)).wrapping_mul(KEY)) >> 54) as usize;
-                    let cached_id = cache_id[h];
-                    let id = if cached_id != u16::MAX {
-                        let ptr = self.names_ptr[cached_id as usize].load(Acquire);
-                        let l = self.names_len[cached_id as usize].load(Relaxed) as usize;
-                        if l == len
-                            && !ptr.is_null()
-                            && std::slice::from_raw_parts(ptr, len)
-                                == std::slice::from_raw_parts(name, len)
-                        {
-                            cached_id as u32
-                        } else {
-                            let real_id = self.lookup(name, len) as u32;
-                            cache_id[h] = real_id as u16;
-                            real_id
-                        }
-                    } else {
-                        let real_id = self.lookup(name, len) as u32;
-                        cache_id[h] = real_id as u16;
-                        real_id
-                    };
-
+                    let id = self.lookup(name, len) as u32;
                     let is_error = (*status == b'5') as u32;
                     if cursor.0 >= cursor.1 {
                         let at = self.claimed[hour].fetch_add(CHUNK, Relaxed) + hour * self.stride;
@@ -235,9 +204,7 @@ impl Run {
         }
         self.sealed.fetch_max(sealed, Release);
         let sealed = |hour| (hour < self.sealed.load(Acquire)).then_some(hour + 1);
-        let Ok(hour) = self.next_hour.try_update(Relaxed, Relaxed, sealed) else {
-            return;
-        };
+        let Ok(hour) = self.next_hour.try_update(Relaxed, Relaxed, sealed) else { return; };
         let order = {
             let names = self.names.lock().unwrap();
             let mut order = self.order.lock().unwrap();
@@ -383,23 +350,11 @@ fn eight_digits(value: u32) -> u64 {
 #[inline(always)]
 unsafe fn put_number(w: *mut u8, value: u32) -> *mut u8 {
     *w = b' ';
-    let digits = eight_digits(value / 100_000_000) as u128
-        | (eight_digits(value % 100_000_000) as u128) << 64;
+    let digits = eight_digits(value / 100_000_000) as u128 | (eight_digits(value % 100_000_000) as u128) << 64;
     let skip = (digits | 1 << 127).trailing_zeros() as usize / 8;
     let zeros = ZEROS as u128 * ((1 << 64) + 1);
     write_unaligned(w.add(1).cast(), (digits + zeros) >> (8 * skip));
     w.add(17 - skip)
-}
-
-fn spawn_tree<'a>(scope: &'a thread::Scope<'a, '_>, run: &'a Run, n: usize) {
-    if n > 1 {
-        let left = n / 2;
-        let right = n - left;
-        scope.spawn(move || spawn_tree(scope, run, left));
-        spawn_tree(scope, run, right);
-    } else {
-        run.work();
-    }
 }
 
 fn main() {
@@ -422,8 +377,7 @@ fn solve(early: bool) -> bool {
         let null = std::ptr::null_mut();
         let input = map(null, len.div_ceil(4096) * 4096 + 4096, 1, 0x4022, -1);
         map(input, len, 1, 0x12, file.as_raw_fd());
-        let stride =
-            (SPARE_AT + (len / MIN_LINE + 1) * 4 + threads * CHUNK * 2).next_multiple_of(1 << 19);
+        let stride = (SPARE_AT + (len / MIN_LINE + 1) * 4 + threads * CHUNK * 2).next_multiple_of(1 << 19);
         let rows = map(null, stride * HOURS * 4 + (2 << 20), 3, 0x4022, -1);
         let rows = rows.map_addr(|a| a.next_multiple_of(2 << 20));
         (input, rows.cast(), stride)
@@ -435,8 +389,6 @@ fn solve(early: bool) -> bool {
         next_claim: AtomicUsize::new(0),
         slots: [const { AtomicU64::new(0) }; SLOTS],
         names: Mutex::new(Vec::new()),
-        names_ptr: [const { AtomicPtr::new(std::ptr::null_mut()) }; 2048],
-        names_len: [const { AtomicU16::new(0) }; 2048],
         rows,
         stride,
         claimed: [const { AtomicUsize::new(0) }; HOURS],
@@ -451,7 +403,10 @@ fn solve(early: bool) -> bool {
         placed: Mutex::new((0, 0)),
     };
     thread::scope(|s| {
-        spawn_tree(s, &run, threads);
+        for _ in 1..threads {
+            s.spawn(|| run.work());
+        }
+        run.work();
     });
     run.dirty.load(Relaxed)
 }
