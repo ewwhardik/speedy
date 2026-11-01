@@ -145,20 +145,15 @@ struct Tally {
 impl Tally {
     /// Adds a phase's result as a list of ids relative to the phase's first document.
     fn add_list(&mut self, base: u32, list: &[u16]) {
-        let sum = list.iter().map(|&doc| doc as u64).sum();
-        let ids = list.iter().map(|&doc| doc as u32);
-        self.add(base, list.len() as u64, sum, ids);
-    }
-
-    /// Adds a phase's `count` ids, `sum` of them, relative to the phase's first document, with
-    /// `ids` the smallest first: they fill the tally's slots if it has room for more.
-    fn add(&mut self, base: u32, count: u64, sum: u64, ids: impl Iterator<Item = u32>) {
         let room = (self.count as usize).min(TALLY_IDS);
-        for (slot, id) in self.first[room..].iter_mut().zip(ids) {
-            *slot = base + id;
+        let needed = TALLY_IDS - room;
+        let to_copy = needed.min(list.len());
+        for i in 0..to_copy {
+            self.first[room + i] = base + list[i] as u32;
         }
-        self.count += count as u32;
-        self.sum += sum + base as u64 * count;
+        let sum: u64 = list.iter().map(|&doc| doc as u64).sum();
+        self.count += list.len() as u32;
+        self.sum += sum + base as u64 * list.len() as u64;
     }
 
     /// Adds a phase's result as a bitmap, whose length is a multiple of 4 words. The sum of the
@@ -200,16 +195,27 @@ impl Tally {
             };
             (total(counts), total(sums) + total(starts) + total(offsets))
         };
-        let ids = bits
-            .iter()
-            .enumerate()
-            .filter(|(_, &word)| word != 0)
-            .flat_map(|(index, &word)| {
-                (0..64)
-                    .filter(move |bit| word >> bit & 1 == 1)
-                    .map(move |bit| index as u32 * 64 + bit)
-            });
-        self.add(base, count, sum, ids);
+        if (self.count as usize) < TALLY_IDS {
+            let mut room = self.count as usize;
+            'outer: for (index, &word) in bits.iter().enumerate() {
+                if word == 0 {
+                    continue;
+                }
+                let mut w = word;
+                let base_idx = index as u32 * 64;
+                while w != 0 {
+                    let bit = w.trailing_zeros();
+                    self.first[room] = base + base_idx + bit;
+                    room += 1;
+                    if room == TALLY_IDS {
+                        break 'outer;
+                    }
+                    w &= w - 1;
+                }
+            }
+        }
+        self.count += count as u32;
+        self.sum += sum + base as u64 * count;
     }
 
     fn write(&self, out: &mut Vec<u8>) {
@@ -1014,15 +1020,13 @@ unsafe fn aligned_line(text: &[u8], docs: usize, at: usize) -> (usize, usize) {
 /// Appends the values of `a` that are in `b` (or, with `keep` false, are not). A list
 /// much shorter than the other is searched for in it (`binary_search` takes the same number
 /// of steps whatever the value, each one a conditional move, so there is no branch to
-/// mispredict and the searches for neighbouring values overlap). Otherwise one list is marked in `marks`,
-/// which is all zeros between calls, and the other is tested against the marks and the marks
-/// cleared again. Both write every value and move the count only for a kept one, so neither
-/// branches on the data.
-unsafe fn filter_by(a: &[u16], b: &[u16], keep: bool, out: &mut Vec<u16>, marks: &mut [u64]) {
+/// mispredict and the searches for neighbouring values overlap). Otherwise both lists are
+/// traversed in parallel in ascending order with branchless pointer increments.
+unsafe fn filter_by(a: &[u16], b: &[u16], keep: bool, out: &mut Vec<u16>, _marks: &mut [u64]) {
     out.reserve(a.len().max(b.len()));
     let target = out.as_mut_ptr();
     let mut found = 0;
-    // A list 16 times shorter is searched for, not marked.
+    // A list 16 times shorter is searched for, not merged.
     if a.len() * 16 <= b.len() {
         for &doc in a {
             let present = b.binary_search(&doc).is_ok();
@@ -1030,17 +1034,30 @@ unsafe fn filter_by(a: &[u16], b: &[u16], keep: bool, out: &mut Vec<u16>, marks:
             found += (present == keep) as usize;
         }
     } else {
-        let (marked, tested) = if keep { (a, b) } else { (b, a) };
-        for &doc in marked {
-            *marks.get_unchecked_mut(doc as usize / 64) |= 1 << (doc % 64);
-        }
-        for &doc in tested {
-            let present = *marks.get_unchecked(doc as usize / 64) >> (doc % 64) & 1;
-            *target.add(found) = doc;
-            found += (present == keep as u64) as usize;
-        }
-        for &doc in marked {
-            *marks.get_unchecked_mut(doc as usize / 64) = 0;
+        let (mut i, mut j) = (0, 0);
+        if keep {
+            while i < a.len() && j < b.len() {
+                let va = *a.get_unchecked(i);
+                let vb = *b.get_unchecked(j);
+                *target.add(found) = va;
+                found += (va == vb) as usize;
+                i += (va <= vb) as usize;
+                j += (vb <= va) as usize;
+            }
+        } else {
+            while i < a.len() && j < b.len() {
+                let va = *a.get_unchecked(i);
+                let vb = *b.get_unchecked(j);
+                *target.add(found) = va;
+                found += (va < vb) as usize;
+                i += (va <= vb) as usize;
+                j += (vb <= va) as usize;
+            }
+            while i < a.len() {
+                *target.add(found) = *a.get_unchecked(i);
+                found += 1;
+                i += 1;
+            }
         }
     }
     out.set_len(found);
@@ -1120,15 +1137,21 @@ unsafe fn apply(op: Op, current: Set, term: Set, scratch: &mut Scratch) -> Set {
     Set::List(std::slice::from_raw_parts(out.as_ptr(), out.len()))
 }
 
-/// Appends a number and a space: the digits are written backwards, then reversed in place.
+/// Appends a number and a space: the digits are written backwards into a stack buffer,
+/// then written in one slice operation.
 fn put_number(out: &mut Vec<u8>, mut value: u64) {
-    let from = out.len();
-    while out.len() == from || value > 0 {
-        out.push(b'0' + (value % 10) as u8);
+    let mut buf = [0u8; 24];
+    let mut i = 23;
+    buf[i] = b' ';
+    loop {
+        i -= 1;
+        buf[i] = b'0' + (value % 10) as u8;
         value /= 10;
+        if value == 0 {
+            break;
+        }
     }
-    out[from..].reverse();
-    out.push(b' ');
+    out.extend_from_slice(&buf[i..24]);
 }
 
 /// Adds a term to the table, or finds it, and returns its id. Every thread interns at once:
@@ -1252,9 +1275,11 @@ fn main() {
 
         thread::scope(|s| spawn_tree(s, &run, 0));
 
-        let mut out = File::create("/out/results.txt").unwrap();
+        let out_file = File::create("/out/results.txt").unwrap();
+        let mut out = std::io::BufWriter::with_capacity(4 * 1024 * 1024, out_file);
         for part in &run.parts {
             out.write_all(&part.lock().unwrap()).unwrap();
         }
+        out.flush().unwrap();
     }
 }

@@ -14,4 +14,5 @@ Every step from the reference to your final version, each with the live-board ru
 | 7 | Unrolled 64B AVX2 newline scan, stack buffers, and symbol stripping | run-129dca8ba2b6 | 0.0196 | 14.7 | 85.65 |
 | 8 | High-throughput direct open-addressing lookup with zero-alloc summary | run-4a17f02db963 | 0.0192 | 15.1 | 85.72 |
 | 9 | Compact source lines, array-indexed timestamp formatting, eliminate lock spinning | run-a075f07c346c | 0.0198 | 15.9 | 85.44 |
-| 10 | Restore 64KB BLOCK stream prefetching with 391 lines | pending | - | - | - |
+| 10 | Restore 64KB BLOCK stream prefetching with 391 lines (PB) | run-45bbd9873b8b | 0.0193 | 15.8 | 85.75 |
+| 11 | Relaxed atomic lookup, dual stream + next line header prefetching | pending | - | - | - |
