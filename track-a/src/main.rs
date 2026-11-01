@@ -10,7 +10,7 @@ extern "C" {
 }
 
 const CLAIM: usize = 1 << 20;
-const BLOCK: usize = 1 << 16;
+const BLOCK: usize = 1 << 15;
 const MIN_LINE: usize = 40;
 const HOURS: usize = 72;
 const CHUNK: usize = 256;
@@ -69,8 +69,6 @@ struct Run {
     claimed: [AtomicUsize; HOURS],
     parsed: Vec<AtomicU32>,
     sealed: AtomicUsize,
-    early: bool,
-    dirty: AtomicBool,
     next_hour: AtomicUsize,
     texts: [OnceLock<&'static [u8]>; HOURS],
     output: File,
@@ -201,8 +199,7 @@ impl Run {
                 sealed = top.saturating_sub(1);
                 break;
             }
-            self.dirty.fetch_or((info >> 8 & 255) + 1 < top, Relaxed);
-            top = top.max((info & 255) * self.early as usize);
+            top = top.max(info & 255);
         }
         self.sealed.fetch_max(sealed, Release);
         let sealed = |hour| (hour < self.sealed.load(Acquire)).then_some(hour + 1);
@@ -357,10 +354,6 @@ unsafe fn put_number(w: *mut u8, value: u32) -> *mut u8 {
 }
 
 fn main() {
-    let _ = solve(true) && solve(false);
-}
-
-fn solve(early: bool) -> bool {
     let file = File::open("/data/requests.log").unwrap();
     let len = file.metadata().unwrap().len() as usize;
     let threads = thread::available_parallelism().map_or(12, |n| n.get());
@@ -390,8 +383,6 @@ fn solve(early: bool) -> bool {
         order: Mutex::default(),
         parsed: (0..len.div_ceil(CLAIM)).map(|_| 0.into()).collect(),
         sealed: AtomicUsize::new(0),
-        early,
-        dirty: AtomicBool::new(false),
         next_hour: AtomicUsize::new(0),
         texts: [const { OnceLock::new() }; HOURS],
         output: File::create("/out/summary.txt").unwrap(),
@@ -403,5 +394,4 @@ fn solve(early: bool) -> bool {
         }
         run.work();
     });
-    run.dirty.load(Relaxed)
 }
