@@ -17,4 +17,5 @@ Every step from the reference to your final version, each with the live-board ru
 | 10 | Restore 64KB BLOCK stream prefetching with 391 lines (PB) | run-45bbd9873b8b | 0.0193 | 15.8 | 85.75 |
 | 11 | Restored proven 64KB BLOCK stream prefetching with 391 lines | run-3e3b72a26487 | 0.0200 | 16.4 | 85.23 |
 | 12 | Streamlined main/write_ready, zero-alloc in-place emission | run-e612e5a7b055 | 0.0226 | 15.6 | 83.75 |
-| 13 | Lockless write_ready batching, relaxed lookup probe, zero-alloc emission | pending | - | - | - |
+| 13 | Lockless write_ready batching, relaxed lookup probe | run-b9c88ad67f89 | 0.0194 | 16.1 | 85.62 |
+| 14 | Inlined main solver, compacted source lines | pending | - | - | - |

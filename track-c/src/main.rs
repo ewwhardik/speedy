@@ -75,7 +75,6 @@ static LETTERS: [OnceLock<u8>; 26 * 26 * 26] = [const { OnceLock::new() }; 26 * 
 // updates both), 4 the largest `BIAS + amount`, 5 the largest `BIAS - amount`. The last two
 // slots only pad a group to one cache line.
 static TOTALS: Mutex<[[i64; 8]; GROUPS]> = Mutex::new([[0; 8]; GROUPS]);
-static DISTINCTS: [AtomicU32; GROUPS] = [const { AtomicU32::new(0) }; GROUPS];
 // Group to country code, with the unmatched group first.
 static COUNTRIES: Mutex<Vec<String>> = Mutex::new(Vec::new());
 
@@ -271,6 +270,7 @@ impl Run {
             let (mut inside, mut quote_total, mut filled) = (0u64, 0u32, 0usize);
             while record < end {
                 for _ in 0..32 {
+                    _mm_prefetch::<_MM_HINT_T0>(input.add(at + 256).cast());
                     let low = load(input.add(at));
                     let high = load(input.add(at + 32));
                     let mask = |byte| equal_mask(low, byte) | equal_mask(high, byte) << 32;
@@ -423,21 +423,6 @@ fn main() {
     let mut keys: Vec<_> = COUNTRIES.lock().unwrap().iter().cloned().zip(0..).collect();
     keys.sort_unstable();
 
-    let step = GROUPS.div_ceil(n);
-    thread::scope(|s| {
-        for t in 0..n {
-            s.spawn(move || {
-                let start = t * step;
-                let end = (start + step).min(GROUPS);
-                for g in start..end {
-                    let row = &run.2 .1[g * SEEN_WORDS..][..SEEN_WORDS];
-                    let sum = row.iter().map(|w| w.load(Relaxed).count_ones()).sum();
-                    DISTINCTS[g].store(sum, Relaxed);
-                }
-            });
-        }
-    });
-
     use std::fmt::Write;
     let mut out = String::with_capacity(32768);
     for (key, group) in keys {
@@ -445,7 +430,8 @@ fn main() {
         if count == 0 {
             continue;
         }
-        let distinct = DISTINCTS[group].load(Relaxed);
+        let row = &run.2 .1[group * SEEN_WORDS..][..SEEN_WORDS];
+        let distinct: u32 = row.iter().map(|w| w.load(Relaxed).count_ones()).sum();
         let [sum, min, max] =
             [amount, BIAS - lo, hi - BIAS].map(|c| format!("{:.2}", c as f64 / 100.0));
         let [name, note] = [lengths & 0xFFFF_FFFF, lengths >> 32];

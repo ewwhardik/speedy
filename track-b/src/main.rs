@@ -721,8 +721,7 @@ impl Run {
         for id in (shard..term_count).step_by(SHARDS) {
             (*self.terms.add(id)).count = 0;
         }
-        let mut cursors_buf = [0u32; 4096];
-        let cursors = &mut cursors_buf[..terms];
+        let mut cursors = vec![0u32; terms];
         for_rows(region, &chunks, |low, _| {
             *cursors.get_unchecked_mut(low) += 1
         });
@@ -732,8 +731,7 @@ impl Run {
         let lists = cursors.iter().filter(|&&size| size > 0).count();
         let total = cursors.iter().sum::<u32>() as usize + lists * HEADER;
         let mut at = self.phase[phase][3].fetch_add(total, Relaxed) as u32;
-        let mut firsts_buf = [0u32; 4096];
-        let firsts = &mut firsts_buf[..terms];
+        let mut firsts = vec![0u32; terms];
         for (i, cursor) in cursors.iter_mut().enumerate() {
             if *cursor > 0 {
                 let size = *cursor;
@@ -1210,11 +1208,6 @@ fn spawn_tree<'scope, 'env>(scope: &'scope thread::Scope<'scope, 'env>, run: &'e
 }
 
 fn main() {
-    if let Ok(meta) = std::fs::metadata("/out/results.txt") {
-        if meta.len() > 0 {
-            return;
-        }
-    }
     let threads = thread::available_parallelism().map_or(12, |n| n.get());
     unsafe {
         // Mapped rather than read: a few fault-arounds instead of a copy into fresh pages.

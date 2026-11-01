@@ -359,10 +359,6 @@ unsafe fn put_number(w: *mut u8, value: u32) -> *mut u8 {
 }
 
 fn main() {
-    solve();
-}
-
-fn solve() {
     let file = File::open("/data/requests.log").unwrap();
     let len = file.metadata().unwrap().len() as usize;
     let threads = thread::available_parallelism().map_or(12, |n| n.get());
