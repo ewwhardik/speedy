@@ -173,9 +173,6 @@ impl Run {
         let mut cursors = [(std::ptr::null_mut::<u32>(), std::ptr::null_mut()); HOURS];
         let (mut hour, mut cursor) = (0, (std::ptr::null_mut(), std::ptr::null_mut()));
         let mut ends = [0u32; BLOCK / MIN_LINE + 1];
-        let mut last_name: *const u8 = std::ptr::null();
-        let mut last_len = 0usize;
-        let mut last_id = 0u32;
         loop {
             self.advance();
             let claim = self.next_claim.fetch_add(CLAIM, Relaxed);
@@ -200,7 +197,19 @@ impl Run {
                 // file, into the spare zero page.
                 let newline = _mm256_set1_epi8(b'\n' as i8);
                 let (mut count, mut at) = (0, start);
-                while at < (start + BLOCK).min(self.len) {
+                let limit = (start + BLOCK).min(self.len);
+                while at + 64 <= limit {
+                    let h0 = _mm256_cmpeq_epi8(_mm256_load_si256(input.add(at).cast()), newline);
+                    let h1 = _mm256_cmpeq_epi8(_mm256_load_si256(input.add(at + 32).cast()), newline);
+                    let m0 = _mm256_movemask_epi8(h0) as u32;
+                    let m1 = _mm256_movemask_epi8(h1) as u32;
+                    *ends.get_unchecked_mut(count) = (at + m0.trailing_zeros() as usize) as u32;
+                    count += (m0 != 0) as usize;
+                    *ends.get_unchecked_mut(count) = (at + 32 + m1.trailing_zeros() as usize) as u32;
+                    count += (m1 != 0) as usize;
+                    at += 64;
+                }
+                while at < limit {
                     let hits = _mm256_cmpeq_epi8(_mm256_load_si256(input.add(at).cast()), newline);
                     let mask = _mm256_movemask_epi8(hits) as u32;
                     *ends.get_unchecked_mut(count) = (at + mask.trailing_zeros() as usize) as u32;
@@ -209,7 +218,7 @@ impl Run {
                 }
                 for &end in &ends[..count] {
                     let end = input.add(end as usize);
-                    _mm_prefetch(end.add(BLOCK).cast(), _MM_HINT_T0);
+                    _mm_prefetch(end.add(1024).cast(), _MM_HINT_T0);
                     // `clock` is "DDTHH:MM" (bytes 8 to 15 of the timestamp). Oct 30, Oct 31,
                     // Nov 1 and Nov 2 are day 0 to 3 of the span: the day's units digit plus
                     // one, less one in October, whose tens digit '3' (0x33) has bit 1 set
@@ -253,15 +262,7 @@ impl Run {
                     // The line ends "<name> <status> <latency>\n", with a 3-digit status.
                     let status = end.sub(digits + 4);
                     let len = status.sub(1).offset_from(name) as usize;
-                    let id = if len == last_len && !last_name.is_null() && std::slice::from_raw_parts(name, len) == std::slice::from_raw_parts(last_name, len) {
-                        last_id
-                    } else {
-                        let new_id = self.lookup(name, len) as u32;
-                        last_name = name;
-                        last_len = len;
-                        last_id = new_id;
-                        new_id
-                    };
+                    let id = self.lookup(name, len) as u32;
                     let is_error = (*status == b'5') as u32;
                     // Each worker fills its own chunk of each hour, so storing a row needs no
                     // atomics; only taking a new chunk touches the shared counter.
@@ -346,8 +347,8 @@ impl Run {
         let spare = rows.add(claimed.max(SPARE_AT).next_multiple_of(1024));
         // Counts per endpoint, indexed by the row's group (id + 1), so that after dealing
         // `starts[id]..starts[id + 1]` is the span of `id` (see `deal`).
-        let (mut starts, mut errors) = (vec![0u32; 1 << ID_BITS], vec![0u32; 1 << ID_BITS]);
-        let mut long = Vec::new();
+        let (mut starts, mut errors) = ([0u32; 1 << ID_BITS], [0u32; 1 << ID_BITS]);
+        let mut long = Vec::with_capacity(512);
 
         // Moves rows down over the gaps between chunks. The 1% that escape go aside: they
         // are all longer than the rest, so sorted on their own they simply follow them.
@@ -406,8 +407,15 @@ impl Run {
         long.iter().for_each(|&(latency, row)| deal(row, latency));
 
         // The hour as text with a trailing space (21 bytes), copied in front of every line.
-        let date = ["10-30", "10-31", "11-01", "11-02"][(hour + 18) / 24];
-        let label = format!("2026-{date}T{:02}:00:00Z ", (hour + 18) % 24);
+        let date = [b"10-30", b"10-31", b"11-01", b"11-02"][(hour + 18) / 24];
+        let h = (hour + 18) % 24;
+        let mut label = [0u8; 21];
+        label[..5].copy_from_slice(b"2026-");
+        label[5..10].copy_from_slice(date);
+        label[10] = b'T';
+        label[11] = b'0' + (h / 10) as u8;
+        label[12] = b'0' + (h % 10) as u8;
+        label[13..21].copy_from_slice(b":00:00Z ");
         let (text, mut w) = (rows.cast::<u8>(), rows.cast::<u8>());
         for &(name, id) in order {
             let span = starts[id] as usize..starts[id + 1] as usize;
