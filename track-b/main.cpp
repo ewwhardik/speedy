@@ -467,8 +467,6 @@ Index build_index(const File& f, TermTable& terms, std::vector<u32>& query_terms
     }
     for (auto& th : pool) th.join();
     ix.seg_end = std::move(count);
-    seen.clear();
-    malloc_trim(0);
 
     ix.df.resize(nterms);
     for (u32 id = 0; id < nterms; ++id) {
@@ -777,9 +775,6 @@ int main() {
     TermTable terms;
     Queries queries = parse_queries(qf, terms);
     Index ix = build_index(df, terms, queries.terms, nthreads);
-    madvise(const_cast<uint8_t*>(qf.data), qf.size, MADV_DONTNEED);
-    madvise(const_cast<uint8_t*>(df.data), df.size, MADV_DONTNEED);
-    malloc_trim(0);
 
     // Answer queries in parallel; each result goes to its own fixed-size slot
     // (the longest line is 6 + 12 + 10 * 7 digits and spaces, well under 128).

@@ -431,7 +431,6 @@ int main(void) {
   FILE *out = fopen("/out/distances.txt", "w");
   if (!out)
     die("cannot create /out/distances.txt");
-  setvbuf(out, NULL, _IOFBF, 1 << 20);
   for (uint32_t i = 0; i < nq; i++)
     fprintf(out, "%lld\n", (long long)ans[i]);
   if (fclose(out))
