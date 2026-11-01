@@ -38,7 +38,6 @@ extern "C" {
 // MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE
 const MAP_ANON: i32 = 0x4022;
 
-const HUGE_PAGE: usize = 1 << 21;
 // Structural bytes per record: four commas and an LF.
 const FIELDS: usize = 5;
 // A batch is 32 steps of 64 bytes of the file. Records that fit in one (the shortest is
@@ -64,8 +63,8 @@ const SEEN_WORDS: usize = 1 << (NUMBER_BITS - 6);
 // that a zeroed group is a valid empty one and merging two needs only sums and maxima.
 const BIAS: i64 = 1 << 40;
 
-// Counters that hand out work: region claims, record claims, huge pages to zero, name numbers.
-static NEXT: [AtomicUsize; 4] = [const { AtomicUsize::new(0) }; 4];
+// Counters that hand out work: region claims, record claims, name numbers.
+static NEXT: [AtomicUsize; 3] = [const { AtomicUsize::new(0) }; 3];
 // Region id to group, and country code (as base-26 digits) to group. Both start zeroed.
 static REGION_GROUP: [AtomicU8; REGION_IDS + 1] = [const { AtomicU8::new(0) }; REGION_IDS + 1];
 static LETTERS: [OnceLock<u8>; 26 * 26 * 26] = [const { OnceLock::new() }; 26 * 26 * 26];
@@ -181,7 +180,7 @@ impl Run {
     unsafe fn insert(&self, index: usize, tag: u64, spare: &mut Range<usize>) -> usize {
         if spare.start >= spare.end {
             // Name numbers are reserved 32 at a time.
-            let first = NEXT[3].fetch_add(32, Relaxed);
+            let first = NEXT[2].fetch_add(32, Relaxed);
             *spare = first..first + 32;
         }
         let claimed = tag << NUMBER_BITS | spare.start as u64;
@@ -205,19 +204,13 @@ impl Run {
     }
 
     /// One worker's whole life. It starts `descendants` more workers as a tree, so that no thread
-    /// spends a millisecond spawning them all, zeroes its huge page, parses its share of the
-    /// regions, waits for the others, and parses its share of the records.
+    /// spends a millisecond spawning them all, parses its share of the regions, waits for the
+    /// others, and parses its share of the records.
     unsafe fn start<'a>(&'a self, scope: &'a thread::Scope<'a, '_>, mut descendants: usize) {
         while descendants > 0 {
             let share = descendants.div_ceil(2);
             scope.spawn(move || unsafe { self.start(scope, share - 1) });
             descendants -= share;
-        }
-        // Zeroing a huge page takes a few hundred microseconds, so the workers share it and do
-        // it while the regions load. It must end before huge pages are disabled.
-        let page = NEXT[2].fetch_add(1, Relaxed) * HUGE_PAGE;
-        if page < size_of::<Tables>() {
-            (*(self.2 as *const Tables as *const AtomicU8).add(page)).store(0, Relaxed);
         }
         // Region claims are 64 KiB. Each starts after the first LF at or past its start, so the
         // header goes to nobody and a line belongs to the claim holding the LF before it.
@@ -404,14 +397,10 @@ unsafe fn map(name: &str) -> &'static [u8] {
     slice::from_raw_parts(base, len)
 }
 
-/// A zeroed table of whole huge pages, which must start on a huge page boundary to get any. Its
-/// pages are touched later by the workers, because huge pages are disabled for everything else
-/// before the records start.
+/// A zeroed table of anonymous pages.
 unsafe fn zeroed<T>() -> &'static T {
-    let region = mmap(null_mut(), size_of::<T>() + HUGE_PAGE, 3, MAP_ANON, -1, 0); // read, write
-    let aligned = region.add(region.align_offset(HUGE_PAGE));
-    madvise(aligned, size_of::<T>(), 14); // MADV_HUGEPAGE
-    &*aligned.cast()
+    let region = mmap(null_mut(), size_of::<T>(), 3, MAP_ANON, -1, 0); // read, write
+    &*region.cast()
 }
 
 fn main() {
