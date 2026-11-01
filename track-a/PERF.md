@@ -15,4 +15,5 @@ Every step from the reference to your final version, each with the live-board ru
 | 8 | High-throughput direct open-addressing lookup with zero-alloc summary | run-4a17f02db963 | 0.0192 | 15.1 | 85.72 |
 | 9 | Compact source lines, array-indexed timestamp formatting, eliminate lock spinning | run-a075f07c346c | 0.0198 | 15.9 | 85.44 |
 | 10 | Restore 64KB BLOCK stream prefetching with 391 lines (PB) | run-45bbd9873b8b | 0.0193 | 15.8 | 85.75 |
-| 11 | Restored proven 64KB BLOCK stream prefetching with 391 lines | pending | - | - | - |
+| 11 | Restored proven 64KB BLOCK stream prefetching with 391 lines | run-3e3b72a26487 | 0.0200 | 16.4 | 85.23 |
+| 12 | Streamlined main/write_ready, zero-alloc in-place emission, 377 lines | pending | - | - | - |
