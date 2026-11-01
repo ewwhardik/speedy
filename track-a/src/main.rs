@@ -173,6 +173,9 @@ impl Run {
         let mut cursors = [(std::ptr::null_mut::<u32>(), std::ptr::null_mut()); HOURS];
         let (mut hour, mut cursor) = (0, (std::ptr::null_mut(), std::ptr::null_mut()));
         let mut ends = [0u32; BLOCK / MIN_LINE + 1];
+        let mut last_name: *const u8 = std::ptr::null();
+        let mut last_len = 0usize;
+        let mut last_id = 0u32;
         loop {
             self.advance();
             let claim = self.next_claim.fetch_add(CLAIM, Relaxed);
@@ -250,7 +253,15 @@ impl Run {
                     // The line ends "<name> <status> <latency>\n", with a 3-digit status.
                     let status = end.sub(digits + 4);
                     let len = status.sub(1).offset_from(name) as usize;
-                    let id = self.lookup(name, len) as u32;
+                    let id = if len == last_len && !last_name.is_null() && std::slice::from_raw_parts(name, len) == std::slice::from_raw_parts(last_name, len) {
+                        last_id
+                    } else {
+                        let new_id = self.lookup(name, len) as u32;
+                        last_name = name;
+                        last_len = len;
+                        last_id = new_id;
+                        new_id
+                    };
                     let is_error = (*status == b'5') as u32;
                     // Each worker fills its own chunk of each hour, so storing a row needs no
                     // atomics; only taking a new chunk touches the shared counter.
@@ -478,7 +489,7 @@ unsafe fn put_number(w: *mut u8, value: u32) -> *mut u8 {
 }
 
 fn main() {
-    solve(true) && solve(false);
+    let _ = solve(true) && solve(false);
 }
 
 /// Returns whether the early sealing failed.

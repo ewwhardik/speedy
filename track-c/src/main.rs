@@ -321,7 +321,7 @@ impl Run {
                     start = newline + 1;
                     count += 1;
                 }
-                [0, 1, 2].map(|kind| decode_digits(&digits[kind], &mut numbers[kind], count));
+                let _ = [0, 1, 2].map(|kind| decode_digits(&digits[kind], &mut numbers[kind], count));
                 // Pass B: names and notes.
                 let mut rank = quotes_up_to(record);
                 for at in 0..count {
@@ -368,7 +368,10 @@ impl Run {
                 }
                 for &bit in &hashes[..count] {
                     let word = self.2 .1.get_unchecked((bit >> 6) as usize);
-                    word.fetch_or(1 << (bit & 63), Relaxed);
+                    let mask = 1u64 << (bit & 63);
+                    if word.load(Relaxed) & mask == 0 {
+                        word.fetch_or(mask, Relaxed);
+                    }
                 }
 
                 pos.copy_within(count * FIELDS..filled, 0);
