@@ -14,4 +14,5 @@ Every step from the reference to your final version, each with the live-board ru
 | 7 | Zero-bitmap two-pointer streaming list intersection in filter_by with binary search | run-4d79708ac4fa | 0.0996 | 40.8 | 77.93 |
 | 8 | 25 MiB L3 cache-resident phases (PHASE_CLAIMS=100) and branchless bitmap filter | run-b02bebeadab6 | 0.1008 | 30.6 | 77.84 |
 | 9 | 4KB small-page postings/bitmaps (huge=false), zero-heap-alloc build_shard, pre-reserved union | run-b9cc8b4d3255 | 0.0969 | 43.1 | 78.25 |
-| 10 | Iterator-free Tally (direct indexing, trailing_zeros bit extraction), 8MB workspace | pending | - | - | - |
+| 10 | Iterator-free Tally (direct indexing, trailing_zeros bit extraction), 8MB workspace | run-2821b0dc5fc1 | 0.1040 | 42.8 | 77.44 |
+| 11 | Restored 2MB hugepage TLB mappings with zero-alloc build_shard | pending | - | - | - |

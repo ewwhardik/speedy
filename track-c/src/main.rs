@@ -370,10 +370,7 @@ impl Run {
                 }
                 for &bit in &hashes[..count] {
                     let word = self.2 .1.get_unchecked((bit >> 6) as usize);
-                    let mask = 1u64 << (bit & 63);
-                    if word.load(Relaxed) & mask == 0 {
-                        word.fetch_or(mask, Relaxed);
-                    }
+                    word.fetch_or(1 << (bit & 63), Relaxed);
                 }
 
                 pos.copy_within(count * FIELDS..filled, 0);

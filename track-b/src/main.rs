@@ -68,7 +68,7 @@ const DOC_BITS: u32 = 18;
 const CHUNK: usize = 64; // rows; the first of each chunk names the claim that wrote it
 const QUERY_BATCH: usize = 64;
 // A worker's share of the one reservation for batch space.
-const WORKSPACE: usize = 8 << 20;
+const WORKSPACE: usize = 32 << 20;
 // Words in a phrase, at most (the grammar allows 2 to 8).
 const MAX_WORDS: usize = 8;
 
@@ -145,21 +145,20 @@ struct Tally {
 impl Tally {
     /// Adds a phase's result as a list of ids relative to the phase's first document.
     fn add_list(&mut self, base: u32, list: &[u16]) {
-        if list.is_empty() {
-            return;
-        }
-        let mut sum = 0u64;
-        for &doc in list {
-            sum += doc as u64;
-        }
-        let count = list.len() as u32;
+        let sum = list.iter().map(|&doc| doc as u64).sum();
+        let ids = list.iter().map(|&doc| doc as u32);
+        self.add(base, list.len() as u64, sum, ids);
+    }
+
+    /// Adds a phase's `count` ids, `sum` of them, relative to the phase's first document, with
+    /// `ids` the smallest first: they fill the tally's slots if it has room for more.
+    fn add(&mut self, base: u32, count: u64, sum: u64, ids: impl Iterator<Item = u32>) {
         let room = (self.count as usize).min(TALLY_IDS);
-        let needed = (TALLY_IDS - room).min(list.len());
-        for i in 0..needed {
-            self.first[room + i] = base + list[i] as u32;
+        for (slot, id) in self.first[room..].iter_mut().zip(ids) {
+            *slot = base + id;
         }
-        self.count += count;
-        self.sum += sum + base as u64 * count as u64;
+        self.count += count as u32;
+        self.sum += sum + base as u64 * count;
     }
 
     /// Adds a phase's result as a bitmap, whose length is a multiple of 4 words. The sum of the
@@ -201,23 +200,16 @@ impl Tally {
             };
             (total(counts), total(sums) + total(starts) + total(offsets))
         };
-        let mut room = (self.count as usize).min(TALLY_IDS);
-        if room < TALLY_IDS {
-            'outer: for (index, &word) in bits.iter().enumerate() {
-                let mut w = word;
-                while w != 0 {
-                    let bit = w.trailing_zeros();
-                    self.first[room] = base + (index as u32 * 64 + bit);
-                    room += 1;
-                    if room == TALLY_IDS {
-                        break 'outer;
-                    }
-                    w &= w - 1;
-                }
-            }
-        }
-        self.count += count as u32;
-        self.sum += sum + base as u64 * count;
+        let ids = bits
+            .iter()
+            .enumerate()
+            .filter(|(_, &word)| word != 0)
+            .flat_map(|(index, &word)| {
+                (0..64)
+                    .filter(move |bit| word >> bit & 1 == 1)
+                    .map(move |bit| index as u32 * 64 + bit)
+            });
+        self.add(base, count, sum, ids);
     }
 
     fn write(&self, out: &mut Vec<u8>) {
@@ -896,7 +888,7 @@ impl Run {
     }
 
     unsafe fn work(&self, id: usize) {
-        let tokens = (1 << 16) + 64; // of a 16 KB batch (max ~8,192 tokens) and an unfinished document
+        let tokens = (1 << 19) + 32; // of a batch and an unfinished document
         let mut next = self.workspace.add(id * WORKSPACE);
         let mut buffers = Buffers {
             starts: take(&mut next, tokens),
@@ -1030,7 +1022,8 @@ unsafe fn filter_by(a: &[u16], b: &[u16], keep: bool, out: &mut Vec<u16>, marks:
     out.reserve(a.len().max(b.len()));
     let target = out.as_mut_ptr();
     let mut found = 0;
-    if a.len() * 4 <= b.len() {
+    // A list 16 times shorter is searched for, not marked.
+    if a.len() * 16 <= b.len() {
         for &doc in a {
             let present = b.binary_search(&doc).is_ok();
             *target.add(found) = doc;
@@ -1242,11 +1235,11 @@ fn main() {
             phase_base,
             arrived: Default::default(),
             round: Default::default(),
-            bitmaps: reserve(2 * MAX_HEAVY * words_per_bitmap, false),
+            bitmaps: reserve(2 * MAX_HEAVY * words_per_bitmap, true),
             // Each shard has more rows than it can hold, `len + 4096`: only touched pages cost memory.
             rows: reserve(SHARDS * (text.len() + 4096), false),
             claimed: (0..SHARDS).map(|_| AtomicUsize::new(0)).collect(),
-            postings: reserve(text.len() + HUGE_PAGE, false),
+            postings: reserve(text.len() + HUGE_PAGE, true),
             parts: (0..batches).map(|_| Mutex::default()).collect(),
             workspace: reserve(threads * WORKSPACE, false),
         };
