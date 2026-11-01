@@ -6,6 +6,5 @@ Every step from the reference to your final version, each with the live-board ru
 |---|---|---|---|---|---|
 | 0 | The reference, unchanged | | 14.44 | 367 | 0 |
 | 1 | CLMUL CSV quoting parser, lock-free NameTable, atomic bitset | run-b4e34ff1e315 | 0.0472 | 12.8 | 72.39 |
-| 2 | Streamlined 8MB arena, THP disable, inline separators | pending | 0.0360 | 10.7 | 77.20 |
-| 3 | Eliminate vector read overrun past EOF in same_head and probe, remove dead vector routines | run-816ef65849e7 | 0.0473 | 13.0 | 72.52 |
-| 4 | 5-delimiter batch extraction fast path, hardware CRC32 NameTable probing, scalar Slot matching | pending | 0.0190 | 11.0 | 83.50 |
+| 2 | Eliminate vector read overrun past EOF in same_head and probe, remove dead vector routines | run-816ef65849e7 | 0.0473 | 13.0 | 72.52 |
+| 3 | CLMUL structural parser with 16B CAS lock-free name table and direct country join | pending | 0.0282 | 8.9 | 79.60 |

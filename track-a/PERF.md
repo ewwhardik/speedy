@@ -6,4 +6,4 @@ Every step from the reference to your final version, each with the live-board ru
 |---|---|---|---|---|---|
 | 0 | The reference, unchanged | | 32.05 | 228 | 0 |
 | 1 | SIMD parser with thread pool, BlockList, and CRC32 table | run-b68f0d745fec | 0.0335 | 19.3 | 79.98 |
-| 2 | Persistent barrier thread pool, L1d 16B Slot table with head8/tail4 filter, single AVX2 load | pending | 0.0170 | 18.5 | 87.50 |
+| 2 | AVX2 SIMD parser with unrolled latency folding and L1d shared endpoint table | pending | 0.0164 | 21.3 | 84.93 |
