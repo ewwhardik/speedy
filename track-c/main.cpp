@@ -52,6 +52,11 @@ inline u64 load8(const char* p) {
     return v;
 }
 
+inline u32 match32(const char* p, char c) {
+    __m256i v = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(p));
+    return _mm256_movemask_epi8(_mm256_cmpeq_epi8(v, _mm256_set1_epi8(c)));
+}
+
 inline u64 fold(u64 v, size_t n) {
     v &= 0x0F0F0F0F0F0F0F0F & ~u64(0) << 8 * (8 - n);
     v = (v * 10 + (v >> 8)) & 0x00FF00FF00FF00FF;
@@ -66,44 +71,51 @@ inline u64 money(const char* s, const char* e) {
     return fold((w & 0xFFFFFFFFFF) << 8 | (w & 0xFFFF000000000000), e - s - 1);
 }
 
-class Structure {
-public:
-    struct Delim {
-        const char* at;
-        u64 quotes;
-    };
+inline const char* comma_after(const char* p) {
+    u64 x = load8(p) ^ 0x2C2C2C2C2C2C2C2C;
+    return p + __builtin_ctzll((x - 0x0101010101010101) & ~x & 0x8080808080808080) / 8;
+}
 
-    Structure(const char* p, const char* file_end) : block_(p - 64), end_(file_end) {}
+[[gnu::always_inline]] inline const char* find_comma(const char* p) {
+    u32 m = match32(p, ',');
+    if (m) return p + __builtin_ctz(m);
+    p += 32;
+    for (;; p += 64)
+        if (u64 m2 = match32(p, ',') | u64(match32(p + 32, ',')) << 32) return p + __builtin_ctzll(m2);
+}
 
-    Delim next() {
-        while (bits_ == 0) {
-            block_ += 64;
-            if (block_ >= end_) return {end_, before_ + __builtin_popcountll(q_)};
-            before_ += __builtin_popcountll(q_);
-            __m256i v0 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(block_));
-            __m256i v1 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(block_ + 32));
-            u64 q0 = _mm256_movemask_epi8(_mm256_cmpeq_epi8(v0, _mm256_set1_epi8('"')));
-            u64 q1 = _mm256_movemask_epi8(_mm256_cmpeq_epi8(v1, _mm256_set1_epi8('"')));
-            q_ = q0 | (q1 << 32);
-            __m128i x = _mm_clmulepi64_si128(_mm_cvtsi64_si128(q_), _mm_set1_epi8(-1), 0);
-            u64 inside = u64(_mm_cvtsi128_si64(x)) ^ carry_;
-            carry_ = u64(i64(inside) >> 63);
-            u64 s0 = _mm256_movemask_epi8(_mm256_cmpeq_epi8(v0, _mm256_set1_epi8(','))) |
-                     _mm256_movemask_epi8(_mm256_cmpeq_epi8(v0, _mm256_set1_epi8('\n')));
-            u64 s1 = _mm256_movemask_epi8(_mm256_cmpeq_epi8(v1, _mm256_set1_epi8(','))) |
-                     _mm256_movemask_epi8(_mm256_cmpeq_epi8(v1, _mm256_set1_epi8('\n')));
-            bits_ = (s0 | (s1 << 32)) & ~inside;
-        }
-        u32 i = __builtin_ctzll(bits_);
-        bits_ &= bits_ - 1;
-        return {block_ + i, before_ + __builtin_popcountll(q_ & ((u64(1) << i) - 1))};
-    }
-
-private:
-    const char* block_;
-    const char* end_;
-    u64 bits_ = 0, carry_ = 0, q_ = 0, before_ = 0;
+struct Text {
+    const char* at;
+    u32 raw, length;
 };
+
+[[gnu::always_inline]] inline Text text(const char*& p) {
+    const char* s = p;
+    if (__builtin_expect(*s != '"', 1)) {
+        const char* e = find_comma(s);
+        p = e + 1;
+        return {s, u32(e - s), u32(e - s)};
+    }
+    u32 pairs = 0;
+    const char* q = s + 1;
+    for (u64 m = match32(q, '"') | u64(match32(q + 32, '"')) << 32;;) {
+        u32 i = m ? __builtin_ctzll(m) : 64;
+        if (i >= 63) {
+            q += i;
+            m = match32(q, '"') | u64(match32(q + 32, '"')) << 32;
+            continue;
+        }
+        if (!(m >> (i + 1) & 1)) {
+            q += i;
+            break;
+        }
+        ++pairs;
+        m &= m - 1;
+        m &= m - 1;
+    }
+    p = q + 2;
+    return {s + 1, u32(q - s - 1), u32(q - s - 1 - pairs)};
+}
 
 class NameTable {
 public:
@@ -146,7 +158,7 @@ private:
     std::atomic<u64>* slots_ = zeroed<std::atomic<u64>>(SLOTS);
 };
 
-struct Totals {
+struct alignas(64) Totals {
     u64 count = 0, id_sum = 0, name_bytes = 0, note_bytes = 0, distinct = 0;
     i64 amount_sum = 0, amount_min = INT64_MAX, amount_max = INT64_MIN;
 };
@@ -196,28 +208,20 @@ void parse_records(const char* p, const char* end, const char* file_end, const u
         }
     };
 
-    Structure sep(p, file_end);
     while (p < end) {
-        auto [f1, q1] = sep.next();
-        auto [f2, q2] = sep.next();
-        auto [f3, q3] = sep.next();
-        const char* f4 = sep.next().at;
-        const char* eol = sep.next().at;
-
+        _mm_prefetch(p + 2048, _MM_HINT_T0);
+        if (u8(*p) == 0xEF) p += 3;
+        const char* f1 = comma_after(p);
         u64 id = digits(p, f1);
-        u32 name_quotes = q2 - q1;
-        bool name_quoted = name_quotes != 0;
-        const char* name_at = f1 + 1 + name_quoted;
-        u32 name_raw = f2 - f1 - 1 - 2 * name_quoted;
-        u32 name_len = name_raw - (name_quoted ? (name_quotes / 2 - 1) : 0);
-
-        u32 note_quotes = q3 - q2;
-        bool note_quoted = note_quotes != 0;
-        u32 note_raw = f3 - f2 - 1 - 2 * note_quoted;
-        u32 note_len = note_raw - (note_quoted ? (note_quotes / 2 - 1) : 0);
-
-        u64 region = digits(f3 + 1, f4);
+        p = f1 + 1;
+        Text name = text(p), note = text(p);
+        __m256i v = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(p));
+        u32 lf = _mm256_movemask_epi8(_mm256_cmpeq_epi8(v, _mm256_set1_epi8('\n')));
+        u32 comma = _mm256_movemask_epi8(_mm256_cmpeq_epi8(v, _mm256_set1_epi8(',')));
+        const char* f4 = p + __builtin_ctz(comma);
+        u64 region = digits(p, f4);
         const char* amount = f4 + 1;
+        const char* eol = lf ? p + __builtin_ctz(lf) : file_end;
         const char* amount_end = eol - (eol[-1] == '\r');
         bool negative = *amount == '-';
         i64 cents = money(amount + negative, amount_end);
@@ -226,8 +230,8 @@ void parse_records(const char* p, const char* end, const char* file_end, const u
         u32 r = region < regions ? u32(region) : u32(regions);
         _mm_prefetch(reinterpret_cast<const char*>(country_of + r), _MM_HINT_T0);
         advance();
-        u64 key = NameTable::key(name_at, name_raw);
-        pending[n++ % LAG] = {key, r, u32(id), name_len, note_len, cents};
+        u64 key = NameTable::key(name.at, name.raw);
+        pending[n++ % LAG] = {key, r, u32(id), name.length, note.length, cents};
         names.prefetch(key);
         p = eol + 1;
     }
