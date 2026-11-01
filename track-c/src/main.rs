@@ -162,12 +162,11 @@ impl Run {
         let tag = hash & (1 << 47) - 1 | 1;
         let bucket = &self.2 .0[index];
         let wanted = _mm256_set1_epi64x(tag as i64);
-        let [low, high] = [0, 1].map(|half| {
-            let slots = _mm256_load_si256(bucket.as_ptr().cast::<__m256i>().add(half));
-            let slots = _mm256_srli_epi64::<NUMBER_BITS>(slots);
-            _mm256_movemask_pd(_mm256_castsi256_pd(_mm256_cmpeq_epi64(slots, wanted)))
-        });
-        let found = low | high << 4;
+        let s0 = _mm256_srli_epi64::<NUMBER_BITS>(_mm256_load_si256(bucket.as_ptr().cast()));
+        let s1 = _mm256_srli_epi64::<NUMBER_BITS>(_mm256_load_si256(bucket.as_ptr().cast::<__m256i>().add(1)));
+        let m0 = _mm256_movemask_pd(_mm256_castsi256_pd(_mm256_cmpeq_epi64(s0, wanted)));
+        let m1 = _mm256_movemask_pd(_mm256_castsi256_pd(_mm256_cmpeq_epi64(s1, wanted)));
+        let found = m0 | (m1 << 4);
         if found == 0 {
             return self.insert(index, tag, spare);
         }
@@ -285,14 +284,11 @@ impl Run {
                     let mut bits = (comma | newline) & !inside_now;
                     quotes[(at - origin) / 64 % QUOTE_WORDS] = (quote, quote_total);
                     quote_total += quote.count_ones();
-                    let found = bits.count_ones() as usize;
-                    let mut extra = 0;
-                    while extra < 8 || bits != 0 {
-                        *pos.get_unchecked_mut(filled + extra) = at as u32 + bits.trailing_zeros();
-                        bits &= bits.wrapping_sub(1);
-                        extra += 1;
+                    while bits != 0 {
+                        *pos.get_unchecked_mut(filled) = at as u32 + bits.trailing_zeros();
+                        filled += 1;
+                        bits &= bits - 1;
                     }
-                    filled += found;
                     at += 64;
                 }
 

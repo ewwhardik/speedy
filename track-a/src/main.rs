@@ -23,8 +23,6 @@ const LATENCY_BITS: u32 = 20;
 const ESCAPE: u32 = (1 << LATENCY_BITS) - 1;
 const DIGIT_BITS: u32 = 10;
 const DIGITS: usize = 1 << DIGIT_BITS;
-const KEY: u64 = 0x9E37_79B9_7F4A_7C15;
-
 #[inline(always)]
 unsafe fn read(p: *const u8) -> u64 {
     read_unaligned(p.cast())
@@ -38,23 +36,20 @@ fn spaces_in(word: u64) -> u64 {
 
 #[inline(always)]
 unsafe fn name_hash(name: *const u8, len: usize) -> u64 {
-    const WINDOW: [[u8; 32]; 3] = [[0; 32], [255; 32], [0; 32]];
-    let load = |at: *const u8| _mm256_loadu_si256(at.cast());
-    let (window, n) = (WINDOW.as_ptr().cast::<u8>(), len.min(32));
-    let head = _mm256_and_si256(load(name), load(window.add(64 - n)));
-    let tail = _mm256_and_si256(load(name.add(len).sub(32)), load(window.add(n)));
-    let mut mixed = _mm256_aesenc_epi128(head, tail);
-    if len > 64 {
-        mixed = _mm256_aesenc_epi128(mixed, load(name.add(32)));
-        mixed = _mm256_aesenc_epi128(mixed, load(name.add(len - 64)));
+    let mut crc = len as u64;
+    if len < 8 {
+        let chunk = read_unaligned(name.cast::<u64>()) & ((1u64 << (len * 8)) - 1);
+        return _mm_crc32_u64(crc, chunk) | 1 << ID_BITS;
     }
-    let key = _mm256_set1_epi64x(KEY as i64);
-    let mixed = _mm256_aesenc_epi128(_mm256_aesenc_epi128(mixed, key), key);
-    let [a, b]: [u64; 2] = std::mem::transmute(_mm_xor_si128(
-        _mm256_castsi256_si128(mixed),
-        _mm256_extracti128_si256(mixed, 1),
-    ));
-    (a ^ b) | 1 << ID_BITS
+    let mut i = 0;
+    while i + 8 <= len {
+        crc = _mm_crc32_u64(crc, read_unaligned(name.add(i).cast()));
+        i += 8;
+    }
+    if i < len {
+        crc = _mm_crc32_u64(crc, read_unaligned(name.add(len - 8).cast()));
+    }
+    crc | 1 << ID_BITS
 }
 
 struct Run {
@@ -333,7 +328,7 @@ impl Run {
         unsafe { self.parse() };
         while self.next_hour.load(Relaxed) < HOURS {
             self.advance();
-            std::hint::spin_loop();
+            thread::yield_now();
         }
     }
 }
