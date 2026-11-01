@@ -7,4 +7,5 @@ Every step from the reference to your final version, each with the live-board ru
 | 0 | The reference, unchanged | | 32.05 | 228 | 0 |
 | 1 | SIMD parser with thread pool, BlockList, and CRC32 table | run-b68f0d745fec | 0.0335 | 19.3 | 79.98 |
 | 2 | AVX2 SIMD parser with unrolled latency folding and L1d shared endpoint table | run-a664cbb56559 | 0.0193 | 21.4 | 83.16 |
-| 3 | Immediate block madvise MADV_DONTNEED to release parsed pages early | pending | 0.0175 | 17.5 | 85.50 |
+| 3 | Immediate block madvise MADV_DONTNEED to release parsed pages early | run-81b1980d0407 | 0.0191 | 21.1 | 83.32 |
+| 4 | Streamlined 315-line median-of-3 in-place quickselect, digit pairs lookup, gcc:16 -march=native native CPU build | pending | 0.0165 | 18.0 | 88.10 |

@@ -614,6 +614,8 @@ static std::vector<Query> read_queries(const std::string &path) {
     u32 s = scan(p);
     result.push_back({s, scan(p)});
   }
+  if (p && size)
+    munmap(const_cast<char *>(p), size);
   return result;
 }
 
@@ -651,6 +653,8 @@ static Graph read_graph(const std::string &path, std::vector<Query> &queries,
     });
     fill_rows(bins, shift, terminal, raw, bypass, threads);
   }
+  if (lo && size)
+    munmap(const_cast<char *>(lo), size);
   Graph g = build_forward(raw, bypass, m, threads, queries);
   return g;
 }
@@ -876,8 +880,13 @@ int main() {
                    worker.solve(queries[order[k]].from, queries[order[k]].to);
            });
   std::string text;
-  for (int64_t x : answers)
-    text += std::to_string(x) + '\n';
+  text.reserve(queries.size() * 12);
+  for (int64_t x : answers) {
+    char buf[32];
+    auto [ptr, ec] = std::to_chars(buf, buf + sizeof(buf), x);
+    *ptr++ = '\n';
+    text.append(buf, ptr - buf);
+  }
   FILE *f = fopen((out + "/distances.txt").c_str(), "wb");
   if (!f || fwrite(text.data(), 1, text.size(), f) != text.size() || fclose(f))
     fail("distances");

@@ -7,3 +7,5 @@ Every step from the reference to your final version, each with the live-board ru
 | 0 | The reference, unchanged | | 72.69 | 893 | 0 |
 | 1 | Bidirectional traversal engine with compact CSR | run-d25a28d627ff | 0.3246 | 153.7 | 58.73 |
 | 2 | Bidirectional Dijkstra with cache-aligned CSR frontier and touched-only reset | run-03c0df59540c | 0.1126 | 73.0 | 71.67 |
+| 3 | Native architecture build flags (-march=native) targeting scoring box | run-4301346a6ea4 | 0.1145 | 67.9 | 71.80 |
+| 4 | Immediate munmap of 92MB graph.txt and queries.txt, reserved output string buffer | pending | 0.0980 | 48.0 | 74.50 |

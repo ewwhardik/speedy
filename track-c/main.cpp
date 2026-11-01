@@ -142,8 +142,8 @@ public:
         for (u32 i = k >> (64 - BITS) & ~3u;; i = (i + 4) % SLOTS) {
             __m256i v = _mm256_load_si256(reinterpret_cast<const __m256i*>(&slots_[i]));
             u32 hit = _mm256_movemask_pd(_mm256_castsi256_pd(_mm256_cmpeq_epi64(v, _mm256_set1_epi64x(k))));
-            u32 free = _mm256_movemask_pd(_mm256_castsi256_pd(_mm256_cmpeq_epi64(v, _mm256_setzero_si256())));
             if (hit) return i + __builtin_ctz(hit);
+            u32 free = _mm256_movemask_pd(_mm256_castsi256_pd(_mm256_cmpeq_epi64(v, _mm256_setzero_si256())));
             for (; free; free &= free - 1) {
                 u32 j = i + __builtin_ctz(free);
                 u64 s = 0;
