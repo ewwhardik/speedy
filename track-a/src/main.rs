@@ -38,20 +38,23 @@ fn spaces_in(word: u64) -> u64 {
 
 #[inline(always)]
 unsafe fn name_hash(name: *const u8, len: usize) -> u64 {
-    let mut crc = len as u64;
-    if len < 8 {
-        let chunk = read_unaligned(name.cast::<u64>()) & ((1u64 << (len * 8)) - 1);
-        return (_mm_crc32_u64(crc, chunk).wrapping_mul(KEY)) | 1 << ID_BITS;
+    const WINDOW: [[u8; 32]; 3] = [[0; 32], [255; 32], [0; 32]];
+    let load = |at: *const u8| _mm256_loadu_si256(at.cast());
+    let (window, n) = (WINDOW.as_ptr().cast::<u8>(), len.min(32));
+    let head = _mm256_and_si256(load(name), load(window.add(64 - n)));
+    let tail = _mm256_and_si256(load(name.add(len).sub(32)), load(window.add(n)));
+    let mut mixed = _mm256_aesenc_epi128(head, tail);
+    if len > 64 {
+        mixed = _mm256_aesenc_epi128(mixed, load(name.add(32)));
+        mixed = _mm256_aesenc_epi128(mixed, load(name.add(len - 64)));
     }
-    let mut i = 0;
-    while i + 8 <= len {
-        crc = _mm_crc32_u64(crc, read_unaligned(name.add(i).cast()));
-        i += 8;
-    }
-    if i < len {
-        crc = _mm_crc32_u64(crc, read_unaligned(name.add(len - 8).cast()));
-    }
-    (crc.wrapping_mul(KEY)) | 1 << ID_BITS
+    let key = _mm256_set1_epi64x(KEY as i64);
+    let mixed = _mm256_aesenc_epi128(_mm256_aesenc_epi128(mixed, key), key);
+    let [a, b]: [u64; 2] = std::mem::transmute(_mm_xor_si128(
+        _mm256_castsi256_si128(mixed),
+        _mm256_extracti128_si256(mixed, 1),
+    ));
+    (a ^ b) | 1 << ID_BITS
 }
 
 struct Run {
@@ -81,7 +84,7 @@ impl Run {
         let hash = name_hash(name, len);
         let mut i = (hash >> (64 - SLOTS.trailing_zeros())) as usize;
         loop {
-            let slot = self.slots[i].load(Relaxed);
+            let slot = self.slots[i].load(Acquire);
             if slot >> ID_BITS == hash >> ID_BITS {
                 return (slot & ID_MASK) as usize - 1;
             } else if slot == 0 {
@@ -141,12 +144,11 @@ impl Run {
                 }
                 for &end in &ends[..count] {
                     let end = input.add(end as usize);
-                    _mm_prefetch(end.add(512).cast(), _MM_HINT_T0);
+                    _mm_prefetch(end.add(BLOCK).cast(), _MM_HINT_T0);
                     let clock = read(line.add(8));
-                    let hour_key = clock & 0x0000_00FF_FFFF_FFFF;
-                    if hour_key != key {
+                    if clock << 24 != key {
                         cursors[hour] = cursor;
-                        key = hour_key;
+                        key = clock << 24;
                         let day = (clock >> 8 & 15) + 1 - (clock >> 1 & 1);
                         hour =
                             (day * 24 + (clock >> 24 & 15) * 10 + (clock >> 32 & 15) - 18) as usize;
@@ -325,15 +327,6 @@ impl Run {
         }
     }
 
-    fn start<'a>(&'a self, scope: &'a thread::Scope<'a, '_>, mut descendants: usize) {
-        while descendants > 0 {
-            let share = descendants.div_ceil(2);
-            scope.spawn(move || self.start(scope, share - 1));
-            descendants -= share;
-        }
-        self.work();
-    }
-
     fn work(&self) {
         unsafe { self.parse() };
         while self.next_hour.load(Relaxed) < HOURS {
@@ -405,7 +398,10 @@ fn solve(early: bool) -> bool {
         placed: Mutex::new((0, 0)),
     };
     thread::scope(|s| {
-        run.start(s, threads - 1);
+        for _ in 1..threads {
+            s.spawn(|| run.work());
+        }
+        run.work();
     });
     run.dirty.load(Relaxed)
 }
