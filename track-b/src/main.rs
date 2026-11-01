@@ -47,7 +47,7 @@ const ANONYMOUS: i32 = 0x4022; // MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE
 const HUGE_PAGE: usize = 1 << 21;
 const CLAIM: usize = 1 << 18;
 // 50 MiB of text between turning rows into postings.
-const PHASE_CLAIMS: usize = 248;
+const PHASE_CLAIMS: usize = 200;
 // u16s before a list: a sentinel while it fills, so duplicates drop with no branch.
 const HEADER: usize = 1;
 // Slices each of the phrase plan and the bucket plan is cut into.
@@ -145,20 +145,14 @@ struct Tally {
 impl Tally {
     /// Adds a phase's result as a list of ids relative to the phase's first document.
     fn add_list(&mut self, base: u32, list: &[u16]) {
-        let sum = list.iter().map(|&doc| doc as u64).sum();
-        let ids = list.iter().map(|&doc| doc as u32);
-        self.add(base, list.len() as u64, sum, ids);
-    }
-
-    /// Adds a phase's `count` ids, `sum` of them, relative to the phase's first document, with
-    /// `ids` the smallest first: they fill the tally's slots if it has room for more.
-    fn add(&mut self, base: u32, count: u64, sum: u64, ids: impl Iterator<Item = u32>) {
+        let sum: u64 = list.iter().map(|&doc| doc as u64).sum();
         let room = (self.count as usize).min(TALLY_IDS);
-        for (slot, id) in self.first[room..].iter_mut().zip(ids) {
-            *slot = base + id;
+        let take = (TALLY_IDS - room).min(list.len());
+        for i in 0..take {
+            self.first[room + i] = base + list[i] as u32;
         }
-        self.count += count as u32;
-        self.sum += sum + base as u64 * count;
+        self.count += list.len() as u32;
+        self.sum += sum + base as u64 * list.len() as u64;
     }
 
     /// Adds a phase's result as a bitmap, whose length is a multiple of 4 words. The sum of the
@@ -200,16 +194,23 @@ impl Tally {
             };
             (total(counts), total(sums) + total(starts) + total(offsets))
         };
-        let ids = bits
-            .iter()
-            .enumerate()
-            .filter(|(_, &word)| word != 0)
-            .flat_map(|(index, &word)| {
-                (0..64)
-                    .filter(move |bit| word >> bit & 1 == 1)
-                    .map(move |bit| index as u32 * 64 + bit)
-            });
-        self.add(base, count, sum, ids);
+        if self.count < TALLY_IDS as u32 {
+            let mut room = self.count as usize;
+            'outer: for (index, &word) in bits.iter().enumerate() {
+                let mut w = word;
+                while w != 0 {
+                    let bit = w.trailing_zeros();
+                    self.first[room] = base + index as u32 * 64 + bit;
+                    room += 1;
+                    if room == TALLY_IDS {
+                        break 'outer;
+                    }
+                    w &= w - 1;
+                }
+            }
+        }
+        self.count += count as u32;
+        self.sum += sum + base as u64 * count;
     }
 
     fn write(&self, out: &mut Vec<u8>) {
@@ -405,6 +406,7 @@ impl Run {
             let batch_end = (at + BATCH).min(end);
             while at < batch_end {
                 let classify = |at: usize| {
+                    _mm_prefetch::<_MM_HINT_T0>(text.add(at + 256).cast());
                     let chunk = _mm256_loadu_si256(text.add(at).cast());
                     let lower = _mm256_or_si256(chunk, fold);
                     let letters = between(lower, floor_lower, ceil_lower);
@@ -1078,8 +1080,13 @@ unsafe fn apply(op: Op, current: Set, term: Set, scratch: &mut Scratch) -> Set {
         (Op::And | Op::Not, Set::List(a), Set::List(b)) => filter_by(a, b, keep, out, marks),
         (Op::And | Op::Not, Set::List(a), Set::Bits(b)) => {
             // Keep what the bitmap holds for AND, and what it lacks for NOT.
-            let held = |doc: u16| *b.get_unchecked(doc as usize / 64) >> (doc % 64) & 1 == 1;
-            out.extend(a.iter().filter(|&&doc| held(doc) == keep));
+            out.reserve(a.len());
+            for &doc in a {
+                let held = *b.get_unchecked(doc as usize / 64) >> (doc % 64) & 1 == 1;
+                if held == keep {
+                    out.push(doc);
+                }
+            }
         }
         // A merged list is cheaper than a bitmap while it is shorter than one.
         (Op::Or, Set::List(a), Set::List(b)) if a.len() + b.len() < words => union(a, b, out),
@@ -1120,14 +1127,22 @@ unsafe fn apply(op: Op, current: Set, term: Set, scratch: &mut Scratch) -> Set {
     Set::List(std::slice::from_raw_parts(out.as_ptr(), out.len()))
 }
 
-/// Appends a number and a space: the digits are written backwards, then reversed in place.
+/// Appends a number and a space.
+#[inline(always)]
 fn put_number(out: &mut Vec<u8>, mut value: u64) {
-    let from = out.len();
-    while out.len() == from || value > 0 {
-        out.push(b'0' + (value % 10) as u8);
+    if value == 0 {
+        out.push(b'0');
+        out.push(b' ');
+        return;
+    }
+    let mut buf = [0u8; 21];
+    let mut i = 21;
+    while value > 0 {
+        i -= 1;
+        buf[i] = b'0' + (value % 10) as u8;
         value /= 10;
     }
-    out[from..].reverse();
+    out.extend_from_slice(&buf[i..]);
     out.push(b' ');
 }
 

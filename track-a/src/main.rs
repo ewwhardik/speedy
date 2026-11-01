@@ -82,7 +82,7 @@ impl Run {
         let hash = name_hash(name, len);
         let mut i = (hash >> (64 - SLOTS.trailing_zeros())) as usize;
         loop {
-            let slot = self.slots[i].load(Acquire);
+            let slot = self.slots[i].load(Relaxed);
             if slot >> ID_BITS == hash >> ID_BITS {
                 return (slot & ID_MASK) as usize - 1;
             } else if slot == 0 {
@@ -308,12 +308,25 @@ impl Run {
     }
 
     fn write_ready(&self) {
-        let mut placed = self.placed.lock().unwrap();
-        while let Some(text) = self.texts.get(placed.0).and_then(|t| t.get()) {
-            self.output.write_all_at(text, placed.1).unwrap();
-            unsafe { madvise(self.rows.add(placed.0 * self.stride).cast(), self.stride * 4, 4) };
-            placed.1 += text.len() as u64;
-            placed.0 += 1;
+        let mut ready = [(0usize, 0u64, &[][..]); 8];
+        let mut count = 0;
+        {
+            let mut placed = self.placed.lock().unwrap();
+            while count < ready.len() {
+                if let Some(text) = self.texts.get(placed.0).and_then(|t| t.get()) {
+                    ready[count] = (placed.0, placed.1, *text);
+                    placed.1 += text.len() as u64;
+                    placed.0 += 1;
+                    count += 1;
+                } else {
+                    break;
+                }
+            }
+        }
+        for i in 0..count {
+            let (hour, offset, text) = ready[i];
+            self.output.write_all_at(text, offset).unwrap();
+            unsafe { madvise(self.rows.add(hour * self.stride).cast(), self.stride * 4, 4) };
         }
     }
     fn work(&self) {

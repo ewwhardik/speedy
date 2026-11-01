@@ -17,3 +17,4 @@ Every step from the reference to your final version, each with the live-board ru
 | 10 | Restore unrolled branchless 8-store separator loop and parallel madvise teardown | run-e64e526a15ea | 0.0229 | 10.8 | 81.96 |
 | 11 | Restored branchless atomic fetch_or and 8-store unrolled parser | run-04a434eeff50 | 0.0216 | 10.7 | 82.55 |
 | 12 | Restored verified atomic bitmatrix filtering and clean sequential popcounts | run-4858e8e414e6 | 0.0234 | 11.1 | 81.59 |
+| 13 | Post-join parallel popcounts across 12 threads, pre-allocated format buffer | pending | - | - | - |
