@@ -10,3 +10,5 @@ Every step from the reference to your final version, each with the live-board ru
 | 3 | In-place galloping intersection and query-driven posting collection | run-765447e025c0 | 0.1475 | 47.1 | 75.03 |
 | 4 | Lock-free postings distribution with hugepage term table | run-7e291dd4a351 | 0.1470 | 47.2 | 75.06 |
 | 5 | Phased streaming transpose engine with VAES token hashing and inline phrases | run-ab26e3ba47a7 | 0.0985 | 42.4 | 78.11 |
+| 6 | Slice-compare MRU endpoint cache and native Raptor Lake compilation | run-02c32df116e3 | 0.0947 | 41.1 | 78.54 |
+| 7 | Zero-bitmap two-pointer streaming list intersection in filter_by with binary search | pending | - | - | - |

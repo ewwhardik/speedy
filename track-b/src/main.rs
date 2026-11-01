@@ -131,7 +131,6 @@ enum Set {
 struct Scratch {
     lists: [Vec<u16>; 2],
     bits: Vec<u64>,
-    marks: Vec<u64>, // all zeros between uses
 }
 
 /// What the phases so far found for one query. All zeros is the empty answer, so the array
@@ -925,7 +924,6 @@ impl Run {
         }
         let mut scratch = Scratch {
             bits: vec![0; self.words_per_bitmap],
-            marks: vec![0; self.words_per_bitmap],
             ..Default::default()
         };
         let phases = self.phase_base.len() - 1;
@@ -1013,11 +1011,10 @@ unsafe fn aligned_line(text: &[u8], docs: usize, at: usize) -> (usize, usize) {
 /// which is all zeros between calls, and the other is tested against the marks and the marks
 /// cleared again. Both write every value and move the count only for a kept one, so neither
 /// branches on the data.
-unsafe fn filter_by(a: &[u16], b: &[u16], keep: bool, out: &mut Vec<u16>, marks: &mut [u64]) {
+unsafe fn filter_by(a: &[u16], b: &[u16], keep: bool, out: &mut Vec<u16>) {
     out.reserve(a.len().max(b.len()));
     let target = out.as_mut_ptr();
     let mut found = 0;
-    // A list 16 times shorter is searched for, not marked.
     if a.len() * 16 <= b.len() {
         for &doc in a {
             let present = b.binary_search(&doc).is_ok();
@@ -1025,17 +1022,34 @@ unsafe fn filter_by(a: &[u16], b: &[u16], keep: bool, out: &mut Vec<u16>, marks:
             found += (present == keep) as usize;
         }
     } else {
-        let (marked, tested) = if keep { (a, b) } else { (b, a) };
-        for &doc in marked {
-            *marks.get_unchecked_mut(doc as usize / 64) |= 1 << (doc % 64);
+        let (mut ia, mut ib) = (0, 0);
+        let (na, nb) = (a.len(), b.len());
+        while ia < na && ib < nb {
+            let da = *a.get_unchecked(ia);
+            let db = *b.get_unchecked(ib);
+            if da == db {
+                if keep {
+                    *target.add(found) = da;
+                    found += 1;
+                }
+                ia += 1;
+                ib += 1;
+            } else if da < db {
+                if !keep {
+                    *target.add(found) = da;
+                    found += 1;
+                }
+                ia += 1;
+            } else {
+                ib += 1;
+            }
         }
-        for &doc in tested {
-            let present = *marks.get_unchecked(doc as usize / 64) >> (doc % 64) & 1;
-            *target.add(found) = doc;
-            found += (present == keep as u64) as usize;
-        }
-        for &doc in marked {
-            *marks.get_unchecked_mut(doc as usize / 64) = 0;
+        if !keep {
+            while ia < na {
+                *target.add(found) = *a.get_unchecked(ia);
+                found += 1;
+                ia += 1;
+            }
         }
     }
     out.set_len(found);
@@ -1067,9 +1081,9 @@ unsafe fn apply(op: Op, current: Set, term: Set, scratch: &mut Scratch) -> Set {
     let out = &mut scratch.lists[0];
     out.clear();
     let bits = &mut scratch.bits;
-    let (words, keep, marks) = (bits.len(), op == Op::And, &mut scratch.marks);
+    let (words, keep) = (bits.len(), op == Op::And);
     match (op, a, b) {
-        (Op::And | Op::Not, Set::List(a), Set::List(b)) => filter_by(a, b, keep, out, marks),
+        (Op::And | Op::Not, Set::List(a), Set::List(b)) => filter_by(a, b, keep, out),
         (Op::And | Op::Not, Set::List(a), Set::Bits(b)) => {
             // Keep what the bitmap holds for AND, and what it lacks for NOT.
             let held = |doc: u16| *b.get_unchecked(doc as usize / 64) >> (doc % 64) & 1 == 1;

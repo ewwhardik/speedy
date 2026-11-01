@@ -179,10 +179,9 @@ impl Run {
     /// no lock is needed. A worker that loses a race to the same name wastes one number.
     #[cold]
     unsafe fn insert(&self, index: usize, tag: u64, spare: &mut Range<usize>) -> usize {
-        if spare.is_empty() {
-            // Name numbers are reserved 32 at a time.
-            let first = NEXT[3].fetch_add(32, Relaxed);
-            *spare = first..first + 32;
+        if spare.start >= spare.end {
+            let first = NEXT[3].fetch_add(128, Relaxed);
+            *spare = first..first + 128;
         }
         let claimed = tag << NUMBER_BITS | spare.start as u64;
         // From the bucket's first slot to the end of the table, and round again if need be.
@@ -325,7 +324,8 @@ impl Run {
                     start = newline + 1;
                     count += 1;
                 }
-                let _ = [0, 1, 2].map(|kind| decode_digits(&digits[kind], &mut numbers[kind], count));
+                let _ =
+                    [0, 1, 2].map(|kind| decode_digits(&digits[kind], &mut numbers[kind], count));
                 // Pass B: names and notes.
                 let mut rank = quotes_up_to(record);
                 for at in 0..count {
@@ -372,7 +372,10 @@ impl Run {
                 }
                 for &bit in &hashes[..count] {
                     let word = self.2 .1.get_unchecked((bit >> 6) as usize);
-                    word.fetch_or(1 << (bit & 63), Relaxed);
+                    let mask = 1u64 << (bit & 63);
+                    if word.load(Relaxed) & mask == 0 {
+                        word.fetch_or(mask, Relaxed);
+                    }
                 }
 
                 pos.copy_within(count * FIELDS..filled, 0);
