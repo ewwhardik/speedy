@@ -265,6 +265,14 @@ void put_money(std::string& out, i64 cents) {
     out += {'.', char('0' + a % 100 / 10), char('0' + a % 10)};
 }
 
+// Drops this thread's slice of a finished input mapping, so the kernel tears
+// its page tables down now, in parallel, instead of serially at exit.
+inline void release(const char* from, const char* to) {
+    uintptr_t a = (reinterpret_cast<uintptr_t>(from) + 4095) & ~uintptr_t(4095);
+    uintptr_t b = reinterpret_cast<uintptr_t>(to) & ~uintptr_t(4095);
+    if (a < b) madvise(reinterpret_cast<void*>(a), b - a, MADV_DONTNEED);
+}
+
 int main() {
     prctl(PR_SET_THP_DISABLE, 1, 0, 0, 0);
         const int nthreads = 12;
@@ -308,6 +316,7 @@ int main() {
             sync.arrive_and_wait();
             parse_records(records + cut[t], records + cut[t + 1], records + size, country_of,
                           nregions, names, seen, totals[t].data());
+            release(records + cut[t], records + cut[t + 1]);
             sync.arrive_and_wait();
             for (u32 c = t; c <= codes.size(); c += nthreads) totals[t][c].distinct = seen.count(c);
         });

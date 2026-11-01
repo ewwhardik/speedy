@@ -157,6 +157,14 @@ struct Worker {
     }
 };
 
+// Drops this thread's slice of a finished input mapping, so the kernel tears
+// its page tables down now, in parallel, instead of serially at exit.
+inline void release(const char* from, const char* to) {
+    uintptr_t a = (reinterpret_cast<uintptr_t>(from) + 4095) & ~uintptr_t(4095);
+    uintptr_t b = reinterpret_cast<uintptr_t>(to) & ~uintptr_t(4095);
+    if (a < b) madvise(reinterpret_cast<void*>(a), b - a, MADV_DONTNEED);
+}
+
 // "YYYY-MM-DDTHH:00:00Z " for hour index h, plus a terminating zero.
 void hour_label(int h, char* o) {
     int day = (h + 18) / 24;  // Oct 30, Oct 31, Nov 1, Nov 2
@@ -196,7 +204,10 @@ int main() {
         while (cut[t] < size && data[cut[t] - 1] != '\n') ++cut[t];
     }
     std::vector<Worker> workers(nthreads);
-    run_threads(nthreads, [&](int t) { workers[t].parse(data + cut[t], data + cut[t + 1]); });
+    run_threads(nthreads, [&](int t) {
+        workers[t].parse(data + cut[t], data + cut[t + 1]);
+        release(data + cut[t], data + cut[t + 1]);
+    });
 
     // Merge the local tables and sort the names: global ids become ranks in
     // unsigned byte order (a proper prefix first), which is output order.
