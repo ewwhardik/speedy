@@ -143,11 +143,12 @@ impl Run {
                 }
                 for &end in &ends[..count] {
                     let end = input.add(end as usize);
-                    _mm_prefetch(end.add(BLOCK).cast(), _MM_HINT_T0);
+                    _mm_prefetch(end.add(512).cast(), _MM_HINT_T0);
                     let clock = read(line.add(8));
-                    if clock << 24 != key {
+                    let hour_key = clock & 0x0000_00FF_FFFF_FFFF;
+                    if hour_key != key {
                         cursors[hour] = cursor;
-                        key = clock << 24;
+                        key = hour_key;
                         let day = (clock >> 8 & 15) + 1 - (clock >> 1 & 1);
                         hour =
                             (day * 24 + (clock >> 24 & 15) * 10 + (clock >> 32 & 15) - 18) as usize;
@@ -369,10 +370,7 @@ fn main() {
         let map = |at, len, prot, flags, fd| mmap(at, len, prot, flags, fd, 0);
         let null = std::ptr::null_mut();
         let input = map(null, len.div_ceil(4096) * 4096 + 4096, 1, 0x4022, -1);
-        let ptr = map(input, len, 1, 0x8011, file.as_raw_fd());
-        if ptr.is_null() || ptr == usize::MAX as *mut u8 {
-            map(input, len, 1, 0x12, file.as_raw_fd());
-        }
+        map(input, len, 1, 0x12, file.as_raw_fd());
         let stride =
             (SPARE_AT + (len / MIN_LINE + 1) * 4 + threads * CHUNK * 2).next_multiple_of(1 << 19);
         let rows = map(null, stride * HOURS * 4 + (2 << 20), 3, 0x4022, -1);

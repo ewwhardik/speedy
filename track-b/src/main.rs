@@ -287,10 +287,7 @@ unsafe fn map_file(path: &str) -> &'static [u8] {
     let len = file.metadata().unwrap().len() as usize;
     let span = len.div_ceil(4096) * 4096 + 4096;
     let base = mmap(null_mut(), span, 1, ANONYMOUS, -1, 0);
-    let ptr = mmap(base, len, 1, 0x8011, file.as_raw_fd(), 0);
-    if ptr.is_null() || ptr == usize::MAX as *mut u8 {
-        mmap(base, len, 1, 0x12, file.as_raw_fd(), 0);
-    }
+    mmap(base, len, 1, 0x12, file.as_raw_fd(), 0);
     std::slice::from_raw_parts(base, len)
 }
 
@@ -407,7 +404,6 @@ impl Run {
             let batch_end = (at + BATCH).min(end);
             while at < batch_end {
                 let classify = |at: usize| {
-                    _mm_prefetch::<_MM_HINT_T0>(text.add(at + 256).cast());
                     let chunk = _mm256_loadu_si256(text.add(at).cast());
                     let lower = _mm256_or_si256(chunk, fold);
                     let letters = between(lower, floor_lower, ceil_lower);

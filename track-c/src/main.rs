@@ -94,10 +94,6 @@ unsafe fn load(p: *const u8) -> __m256i {
     _mm256_loadu_si256(p.cast())
 }
 
-unsafe fn equal_mask(chunk: __m256i, byte: u8) -> u64 {
-    _mm256_movemask_epi8(_mm256_cmpeq_epi8(chunk, _mm256_set1_epi8(byte as i8))) as u32 as u64
-}
-
 /// The `len` digit bytes before `end`, for lengths 1 to 8, as `decode_digits` wants them.
 /// Shifting them to the top makes the bytes below read as leading zeros.
 unsafe fn digits_before(end: *const u8, len: usize) -> u64 {
@@ -141,7 +137,7 @@ unsafe fn name_hash(name: *const u8, len: usize) -> (u64, usize) {
         return long_name_hash(name, len);
     }
     let bytes = _mm256_and_si256(load(name), load(MASKS.as_ptr().cast::<u8>().add(32 - len)));
-    let quotes = equal_mask(bytes, b'"').count_ones() as usize;
+    let quotes = _mm256_movemask_epi8(_mm256_cmpeq_epi8(bytes, _mm256_set1_epi8(b'"' as i8))).count_ones() as usize;
     let key = _mm_set_epi64x(0x1D8E_4E27_C47D_124F, len as i64 ^ 0x5899_65CC_7537_4CC3);
     let low = _mm256_castsi256_si128(bytes);
     let high = _mm256_extracti128_si256::<1>(bytes);
@@ -275,7 +271,6 @@ impl Run {
             let ones = _mm_set1_epi8(-1);
             while record < end {
                 for _ in 0..32 {
-                    _mm_prefetch::<_MM_HINT_T0>(input.add(at + 256).cast());
                     let low = load(input.add(at));
                     let high = load(input.add(at + 32));
                     let q0 = _mm256_movemask_epi8(_mm256_cmpeq_epi8(low, v_quote)) as u32 as u64;
@@ -404,10 +399,7 @@ unsafe fn map(name: &str) -> &'static [u8] {
     let (fd, len) = (file.as_raw_fd(), file.metadata().unwrap().len() as usize);
     let size = len.next_multiple_of(4096) + 4096;
     let base = mmap(null_mut(), size, 1, MAP_ANON, -1, 0); // PROT_READ
-    let ptr = mmap(base, len, 1, 0x8011, fd, 0);
-    if ptr.is_null() || ptr == usize::MAX as *mut u8 {
-        mmap(base, len, 1, 0x12, fd, 0);
-    }
+    mmap(base, len, 1, 0x12, fd, 0); // PROT_READ, MAP_PRIVATE | MAP_FIXED
     slice::from_raw_parts(base, len)
 }
 
