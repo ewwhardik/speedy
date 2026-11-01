@@ -469,33 +469,6 @@ impl Run {
                 (b.starts.as_ptr(), b.ends.as_ptr(), b.hashes.as_mut_ptr());
             let span = |i: usize| (*starts.add(i) as usize, *ends.add(i) as usize);
             let mut i = token;
-            while i + 3 < ready {
-                let (from_a, to_a) = span(i);
-                let (from_b, to_b) = span(i + 1);
-                let (from_c, to_c) = span(i + 2);
-                let (from_d, to_d) = span(i + 3);
-                let (len_a, len_b, len_c, len_d) =
-                    (to_a - from_a, to_b - from_b, to_c - from_c, to_d - from_d);
-                if (len_a | len_b | len_c | len_d) <= 16 {
-                    let (a, b) = (text.add(from_a), text.add(from_b));
-                    let (c, d) = (text.add(from_c), text.add(from_d));
-                    let (h0, h1) = hash_pair(a, len_a, b, len_b);
-                    let (h2, h3) = hash_pair(c, len_c, d, len_d);
-                    *hashes.add(i) = h0;
-                    *hashes.add(i + 1) = h1;
-                    *hashes.add(i + 2) = h2;
-                    *hashes.add(i + 3) = h3;
-                    i += 4;
-                    continue;
-                }
-                let (a, b) = (text.add(from_a), text.add(from_b));
-                (*hashes.add(i), *hashes.add(i + 1)) = if (len_a | len_b) > 16 {
-                    (hash_of(a, len_a), hash_of(b, len_b))
-                } else {
-                    hash_pair(a, len_a, b, len_b)
-                };
-                i += 2;
-            }
             while i + 1 < ready {
                 let (from_a, to_a) = span(i);
                 let (from_b, to_b) = span(i + 1);
@@ -524,19 +497,17 @@ impl Run {
                     let ahead = bucket_of(*hashes.add(token + AHEAD));
                     _mm_prefetch::<_MM_HINT_T0>(buckets.add(ahead).cast());
                     let action = action_in(buckets, *hashes.add(token));
-                    if action != 0 {
-                        if action >= HEAVY {
-                            *heavy_hits.add(heavy_count) = action;
-                            heavy_count += 1;
-                        } else {
-                            *list_hits.add(list_count) = (action as u64) << 32 | doc as u64;
-                            list_count += 1;
-                        }
-                        if action & ANCHOR != 0 {
-                            *b.anchor_hits.get_unchecked_mut(anchor_count) =
-                                (action as u64) << 40 | (doc as u64) << 20 | token as u64;
-                            anchor_count += 1;
-                        }
+                    // All three stores happen, and only the right counts move.
+                    *heavy_hits.add(heavy_count) = action;
+                    heavy_count += (action >> 31) as usize;
+                    *list_hits.add(list_count) = (action as u64) << 32 | doc as u64;
+                    // A term id + 1, with or without ANCHOR: not 0 and not HEAVY.
+                    list_count += (action.wrapping_sub(1) < HEAVY - 1) as usize;
+                    // Rare enough to predict: about 1 token in 150 starts a phrase check.
+                    if action & ANCHOR != 0 {
+                        *b.anchor_hits.get_unchecked_mut(anchor_count) =
+                            (action as u64) << 40 | (doc as u64) << 20 | token as u64;
+                        anchor_count += 1;
                     }
                     token += 1;
                 }
@@ -636,16 +607,8 @@ impl Run {
         let (heavy, out) = (self.heavy(), self.bitmap(0, phase).add(rel / 64));
         let words = heavy.div_ceil(64);
         for k in 0..words {
-            let mut any = 0u64;
-            let mut m = [0u64; 64];
-            for j in 0..64 {
-                let val = std::mem::take(&mut group[j * words + k]);
-                any |= val;
-                m[j] = val;
-            }
-            if any == 0 {
-                continue;
-            }
+            let mut m: [u64; 64] =
+                std::array::from_fn(|j| std::mem::take(&mut group[j * words + k]));
             for width in [32usize, 16, 8, 4, 2, 1] {
                 // The bits of a word that sit in the low half of each block of `2 * width`.
                 let mask = u64::MAX / ((1 << width) + 1);
@@ -830,20 +793,27 @@ impl Run {
         let end = (first + QUERY_BATCH).min(share.queries.len());
         let tallies = share.tallies.as_ptr() as *mut Tally;
         let steps_of = |at: usize| &share.steps[share.queries[at].clone()];
-        let prefetch_list = |at: usize| {
+        // Term records and postings are scattered, so a query's records are requested two
+        // queries before they are read and the start of its lists one query before.
+        let prefetch = |at: usize, lists: bool| {
             for &(_, term) in (at < end).then(|| steps_of(at)).unwrap_or_default() {
                 let info = &*self.terms.add(term as usize);
-                if !info.heavy {
+                if !lists {
+                    _mm_prefetch::<_MM_HINT_T0>((info as *const Term).cast());
+                } else if !info.heavy {
                     let list = self.postings.add(info.first as usize);
+                    // At most 6 cache lines of the list.
                     for line in 0..(info.count as usize).div_ceil(32).min(6) {
                         _mm_prefetch::<_MM_HINT_T0>(list.add(line * 32).cast());
                     }
                 }
             }
         };
-        prefetch_list(first);
+        prefetch(first, false);
+        prefetch(first + 1, false);
         for index in first..end {
-            prefetch_list(index + 1);
+            prefetch(index + 2, false);
+            prefetch(index + 1, true);
             let steps = steps_of(index);
             let tally = &mut *tallies.add(index);
             match self.answer_bool(steps, phase, scratch) {
