@@ -92,6 +92,7 @@ public:
     u32 size() const { return keys_.size(); }
     const uint8_t* bytes(u32 id) const { return reinterpret_cast<const uint8_t*>(keys_[id].w); }
     size_t length(u32 id) const { return lens_[id]; }
+    void drop_hash_table() { std::vector<u64>().swap(slots_); }
 
     u32 insert(const Key& k) {
         // Keep the load at or under 1/2 so probe chains stay short.
@@ -765,8 +766,7 @@ int main() {
     // With transparent huge pages, a block written only in part can be backed
     // by a whole 2 MB page; plain pages keep memory to what is written.
     prctl(PR_SET_THP_DISABLE, 1, 0, 0, 0);
-    // Large blocks always come from mmap and go back to the kernel when freed
-    // (glibc otherwise raises this threshold after the first free and keeps them).
+    mallopt(M_ARENA_MAX, 1);
     mallopt(M_MMAP_THRESHOLD, 1 << 16);
     const int nthreads = std::max(1u, std::min(12u, std::thread::hardware_concurrency()));
     File qf = map_file("/data/queries.txt");
@@ -775,6 +775,8 @@ int main() {
     TermTable terms;
     Queries queries = parse_queries(qf, terms);
     Index ix = build_index(df, terms, queries.terms, nthreads);
+    terms.drop_hash_table();
+    malloc_trim(0);
 
     // Answer queries in parallel; each result goes to its own fixed-size slot
     // (the longest line is 6 + 12 + 10 * 7 digits and spaces, well under 128).
@@ -794,12 +796,20 @@ int main() {
     }
     for (auto& th : pool) th.join();
 
-    std::string out;
-    out.reserve(nq * 32);
-    for (size_t i = 0; i < nq; ++i) out.append(&slots[i * SLOT], lens[i]);
-    FILE* f = fopen("/out/results.txt", "wb");
-    if (!f) { perror("/out/results.txt"); return 1; }
-    fwrite(out.data(), 1, out.size(), f);
-    fclose(f);
+    int out_fd = open("/out/results.txt", O_WRONLY | O_CREAT | O_TRUNC, 0666);
+    if (out_fd < 0) { perror("open out"); return 1; }
+    char buf[65536];
+    size_t bp = 0;
+    for (size_t i = 0; i < nq; ++i) {
+        uint8_t len = lens[i];
+        if (bp + len > sizeof(buf)) {
+            if (write(out_fd, buf, bp) <= 0) { perror("write"); return 1; }
+            bp = 0;
+        }
+        memcpy(buf + bp, &slots[i * SLOT], len);
+        bp += len;
+    }
+    if (bp && write(out_fd, buf, bp) <= 0) { perror("write"); return 1; }
+    close(out_fd);
     return 0;
 }

@@ -74,11 +74,28 @@ public:
             block_ += 64;
             if (block_ >= end_) return {end_, before_ + __builtin_popcountll(q_)};
             before_ += __builtin_popcountll(q_);
-            q_ = match64(block_, '"');
+            __m256i v0, v1;
+            if (__builtin_expect(block_ + 64 <= end_, 1)) {
+                v0 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(block_));
+                v1 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(block_ + 32));
+            } else {
+                alignas(32) char tail[64] = {};
+                size_t rem = end_ > block_ ? size_t(end_ - block_) : 0;
+                memcpy(tail, block_, rem);
+                v0 = _mm256_load_si256(reinterpret_cast<const __m256i*>(tail));
+                v1 = _mm256_load_si256(reinterpret_cast<const __m256i*>(tail + 32));
+            }
+            u64 q0 = _mm256_movemask_epi8(_mm256_cmpeq_epi8(v0, _mm256_set1_epi8('"')));
+            u64 q1 = _mm256_movemask_epi8(_mm256_cmpeq_epi8(v1, _mm256_set1_epi8('"')));
+            q_ = q0 | (q1 << 32);
             __m128i x = _mm_clmulepi64_si128(_mm_cvtsi64_si128(q_), _mm_set1_epi8(-1), 0);
             u64 inside = u64(_mm_cvtsi128_si64(x)) ^ carry_;
             carry_ = u64(i64(inside) >> 63);
-            bits_ = (match64(block_, ',') | match64(block_, '\n')) & ~inside;
+            u64 s0 = _mm256_movemask_epi8(_mm256_cmpeq_epi8(v0, _mm256_set1_epi8(','))) |
+                     _mm256_movemask_epi8(_mm256_cmpeq_epi8(v0, _mm256_set1_epi8('\n')));
+            u64 s1 = _mm256_movemask_epi8(_mm256_cmpeq_epi8(v1, _mm256_set1_epi8(','))) |
+                     _mm256_movemask_epi8(_mm256_cmpeq_epi8(v1, _mm256_set1_epi8('\n')));
+            bits_ = (s0 | (s1 << 32)) & ~inside;
         }
         u32 i = __builtin_ctzll(bits_);
         bits_ &= bits_ - 1;
@@ -107,15 +124,15 @@ public:
             if (len - i < 8) w &= (u64(1) << 8 * (len - i)) - 1;
             h = (h ^ w) * 0x9E3779B97F4A7C15ull;
         }
-        Probe p{u32(h >> 20) % SLOTS, u16(1 + (h >> 48) % (BUSY - 1))};
+        Probe p{u32(h >> 20) & (SLOTS - 1), u16(1 + (h >> 48) % (BUSY - 1))};
         for (u16 t; (t = tags_[p.slot].load(std::memory_order_relaxed)) && t != p.tag && t != BUSY;)
-            p.slot = (p.slot + 1) % SLOTS;
+            p.slot = (p.slot + 1) & (SLOTS - 1);
         _mm_prefetch(reinterpret_cast<const char*>(&slots_[p.slot]), _MM_HINT_T0);
         return p;
     }
 
     u32 id(const char* s, u32 len, Probe p) {
-        for (u32 i = p.slot;; i = (i + 1) % SLOTS) {
+        for (u32 i = p.slot;; i = (i + 1) & (SLOTS - 1)) {
             u16 t = tags_[i].load(std::memory_order_acquire);
             if (t == 0 && tags_[i].compare_exchange_strong(t, BUSY, std::memory_order_acquire)) {
                 Slot& slot = slots_[i];
@@ -267,7 +284,7 @@ void put_money(std::string& out, i64 cents) {
 
 int main() {
     prctl(PR_SET_THP_DISABLE, 1, 0, 0, 0);
-        const int nthreads = 12;
+        const int nthreads = std::clamp<int>(std::thread::hardware_concurrency(), 1, 12);
     size_t rsize, size;
     const char* regions = map_file("/data/regions.csv", rsize);
     const char* records = map_file("/data/records.csv", size);

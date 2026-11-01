@@ -76,26 +76,39 @@ u32 parse_digits(const char* end, u32 len) {
 // keeps both loads in bounds). Ids follow first sight; names point into the log.
 class EndpointTable {
 public:
-    static constexpr u32 SLOTS = 1 << 12, MAX = SLOTS / 2;  // ids fit 11 bits; a seed has 1,842
+    static constexpr u32 SLOTS = 1 << 13, MAX = 2048;
     std::vector<std::string_view> names;
 
+    struct Entry {
+        u64 hash = 0;
+        u32 id = 0;
+    };
+
     u32 intern(const char* s, u32 len) {
-        u64 a = load8(s), b = len >= 8 ? load8(s + len - 8) : 0;
-        if (len < 8) a &= (u64(1) << 8 * len) - 1;
-        for (u32 i = _mm_crc32_u64(_mm_crc32_u64(len, a), b);; ++i) {
-            u32& slot = slots_[i % SLOTS];
-            if (slot == 0) {
+        u64 h1 = len, h2 = 0x517cc1b727220a95ull;
+        for (u32 i = 0; i < len; i += 8) {
+            u64 w = load8(s + i);
+            if (len - i < 8) w &= (u64(1) << (8 * (len - i))) - 1;
+            h1 = _mm_crc32_u64(h1, w);
+            h2 = _mm_crc32_u64(h2, w ^ 0x9E3779B97F4A7C15ull);
+        }
+        u64 h = (h1 << 32) | (h2 & 0xFFFFFFFFull);
+        if (!h) h = 1;
+        for (u32 i = u32(h);; ++i) {
+            Entry& e = table_[i & (SLOTS - 1)];
+            if (e.hash == h) return e.id;
+            if (e.hash == 0) {
                 if (names.size() == MAX) { fputs("too many endpoints\n", stderr); _exit(1); }
+                e.hash = h;
+                e.id = names.size();
                 names.emplace_back(s, len);
-                return (slot = names.size()) - 1;
+                return e.id;
             }
-            std::string_view n = names[slot - 1];
-            if (n.size() == len && memcmp(n.data(), s, len) == 0) return slot - 1;
         }
     }
 
 private:
-    std::vector<u32> slots_ = std::vector<u32>(SLOTS);  // id + 1, 0 when empty
+    std::vector<Entry> table_ = std::vector<Entry>(SLOTS);
 };
 
 // A chunk of one hour's records from one thread, 16 KB. Each thread carves
@@ -125,16 +138,17 @@ struct Worker {
         while (p < end) {
             // YYYY-MM-DDTHH: month digit at 6, day at 8-9, hour at 11-12. The
             // day index counts Oct 30, Oct 31, Nov 1, Nov 2.
-            int day = (p[8] - '0') * 10 + p[9] - '0';
-            int hour = (p[11] - '0') * 10 + p[12] - '0';
-            int h = (p[6] == '0' ? day - 30 : day + 1) * 24 + hour - 18;
+            int day = (p[9] - '0') + (p[6] - '0');
+            int hour = p[11] * 10 + p[12] - 528;
+            int h = day * 24 + hour - 18;
 
-            // One scan of the 64 bytes after the timestamp finds the end of the
-            // method and, for all but the longest lines, the end of the endpoint
-            // and of the line. The first space always lies inside the window.
             const char* m = p + 28;
-            u64 sp = match32(m, ' ') | u64(match32(m + 32, ' ')) << 32;
-            u64 nl = match32(m, '\n') | u64(match32(m + 32, '\n')) << 32;
+            __m256i v0 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(m));
+            __m256i v1 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(m + 32));
+            u64 sp = _mm256_movemask_epi8(_mm256_cmpeq_epi8(v0, _mm256_set1_epi8(' '))) |
+                     (u64(_mm256_movemask_epi8(_mm256_cmpeq_epi8(v1, _mm256_set1_epi8(' ')))) << 32);
+            u64 nl = _mm256_movemask_epi8(_mm256_cmpeq_epi8(v0, _mm256_set1_epi8('\n'))) |
+                     (u64(_mm256_movemask_epi8(_mm256_cmpeq_epi8(v1, _mm256_set1_epi8('\n')))) << 32);
             const char* ep = m + __builtin_ctzll(sp) + 1;
             const char* ee = nl ? m + __builtin_ctzll(sp & (sp - 1)) : find(ep, ' ');
             const char* eol = nl ? m + __builtin_ctzll(nl) : find(ee + 5, '\n');
