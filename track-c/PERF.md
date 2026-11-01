@@ -14,4 +14,4 @@ Every step from the reference to your final version, each with the live-board ru
 | 7 | 128-name reservation blocks and test-and-set bitmatrix filtering | run-3c8bc0b651c8 | 0.0215 | 10.5 | 82.59 |
 | 8 | Output file stat fast-path bypass and atomic bitmatrix load avoidance | run-a09fcdaae49f | 0.0216 | 10.5 | 82.43 |
 | 9 | Exact separator position writes, eliminate unconditional 8-write loop, zeroed tables | run-a2add21750d5 | 0.0240 | 10.9 | 81.42 |
-| 10 | Restore unrolled branchless 8-store separator loop and eliminate inner-loop madvise syscalls | pending | - | - | - |
+| 10 | Restore unrolled branchless 8-store separator loop and parallel madvise teardown | pending | - | - | - |

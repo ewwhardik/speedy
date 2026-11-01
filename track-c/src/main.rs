@@ -379,7 +379,8 @@ impl Run {
                 pos.copy_within(count * FIELDS..filled, 0);
                 filled -= count * FIELDS;
             }
-            // madvise removed to prevent mmap_lock write-stall across worker threads.
+            // Unmap pages in parallel across worker threads to eliminate single-thread exit teardown.
+            madvise(input.add(claim), end - claim, 4);
         }
         let mut totals = TOTALS.lock().unwrap();
         for (total, part) in totals.iter_mut().zip(&stats) {

@@ -68,7 +68,7 @@ const DOC_BITS: u32 = 18;
 const CHUNK: usize = 64; // rows; the first of each chunk names the claim that wrote it
 const QUERY_BATCH: usize = 64;
 // A worker's share of the one reservation for batch space.
-const WORKSPACE: usize = 4 << 20;
+const WORKSPACE: usize = 8 << 20;
 // Words in a phrase, at most (the grammar allows 2 to 8).
 const MAX_WORDS: usize = 8;
 
@@ -145,20 +145,21 @@ struct Tally {
 impl Tally {
     /// Adds a phase's result as a list of ids relative to the phase's first document.
     fn add_list(&mut self, base: u32, list: &[u16]) {
-        let sum = list.iter().map(|&doc| doc as u64).sum();
-        let ids = list.iter().map(|&doc| doc as u32);
-        self.add(base, list.len() as u64, sum, ids);
-    }
-
-    /// Adds a phase's `count` ids, `sum` of them, relative to the phase's first document, with
-    /// `ids` the smallest first: they fill the tally's slots if it has room for more.
-    fn add(&mut self, base: u32, count: u64, sum: u64, ids: impl Iterator<Item = u32>) {
-        let room = (self.count as usize).min(TALLY_IDS);
-        for (slot, id) in self.first[room..].iter_mut().zip(ids) {
-            *slot = base + id;
+        if list.is_empty() {
+            return;
         }
-        self.count += count as u32;
-        self.sum += sum + base as u64 * count;
+        let mut sum = 0u64;
+        for &doc in list {
+            sum += doc as u64;
+        }
+        let count = list.len() as u32;
+        let room = (self.count as usize).min(TALLY_IDS);
+        let needed = (TALLY_IDS - room).min(list.len());
+        for i in 0..needed {
+            self.first[room + i] = base + list[i] as u32;
+        }
+        self.count += count;
+        self.sum += sum + base as u64 * count as u64;
     }
 
     /// Adds a phase's result as a bitmap, whose length is a multiple of 4 words. The sum of the
@@ -200,16 +201,23 @@ impl Tally {
             };
             (total(counts), total(sums) + total(starts) + total(offsets))
         };
-        let ids = bits
-            .iter()
-            .enumerate()
-            .filter(|(_, &word)| word != 0)
-            .flat_map(|(index, &word)| {
-                (0..64)
-                    .filter(move |bit| word >> bit & 1 == 1)
-                    .map(move |bit| index as u32 * 64 + bit)
-            });
-        self.add(base, count, sum, ids);
+        let mut room = (self.count as usize).min(TALLY_IDS);
+        if room < TALLY_IDS {
+            'outer: for (index, &word) in bits.iter().enumerate() {
+                let mut w = word;
+                while w != 0 {
+                    let bit = w.trailing_zeros();
+                    self.first[room] = base + (index as u32 * 64 + bit);
+                    room += 1;
+                    if room == TALLY_IDS {
+                        break 'outer;
+                    }
+                    w &= w - 1;
+                }
+            }
+        }
+        self.count += count as u32;
+        self.sum += sum + base as u64 * count;
     }
 
     fn write(&self, out: &mut Vec<u8>) {
@@ -888,7 +896,7 @@ impl Run {
     }
 
     unsafe fn work(&self, id: usize) {
-        let tokens = (1 << 15) + 64; // of a 16 KB batch (max ~8,192 tokens) and an unfinished document
+        let tokens = (1 << 16) + 64; // of a 16 KB batch (max ~8,192 tokens) and an unfinished document
         let mut next = self.workspace.add(id * WORKSPACE);
         let mut buffers = Buffers {
             starts: take(&mut next, tokens),
