@@ -23,6 +23,8 @@ const LATENCY_BITS: u32 = 20;
 const ESCAPE: u32 = (1 << LATENCY_BITS) - 1;
 const DIGIT_BITS: u32 = 10;
 const DIGITS: usize = 1 << DIGIT_BITS;
+const KEY: u64 = 0x9E37_79B9_7F4A_7C15;
+
 #[inline(always)]
 unsafe fn read(p: *const u8) -> u64 {
     read_unaligned(p.cast())
@@ -39,7 +41,7 @@ unsafe fn name_hash(name: *const u8, len: usize) -> u64 {
     let mut crc = len as u64;
     if len < 8 {
         let chunk = read_unaligned(name.cast::<u64>()) & ((1u64 << (len * 8)) - 1);
-        return _mm_crc32_u64(crc, chunk) | 1 << ID_BITS;
+        return (_mm_crc32_u64(crc, chunk).wrapping_mul(KEY)) | 1 << ID_BITS;
     }
     let mut i = 0;
     while i + 8 <= len {
@@ -49,7 +51,7 @@ unsafe fn name_hash(name: *const u8, len: usize) -> u64 {
     if i < len {
         crc = _mm_crc32_u64(crc, read_unaligned(name.add(len - 8).cast()));
     }
-    crc | 1 << ID_BITS
+    (crc.wrapping_mul(KEY)) | 1 << ID_BITS
 }
 
 struct Run {

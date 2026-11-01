@@ -284,11 +284,14 @@ impl Run {
                     let mut bits = (comma | newline) & !inside_now;
                     quotes[(at - origin) / 64 % QUOTE_WORDS] = (quote, quote_total);
                     quote_total += quote.count_ones();
-                    while bits != 0 {
-                        *pos.get_unchecked_mut(filled) = at as u32 + bits.trailing_zeros();
-                        filled += 1;
-                        bits &= bits - 1;
+                    let found = bits.count_ones() as usize;
+                    let mut extra = 0;
+                    while extra < 8 || bits != 0 {
+                        *pos.get_unchecked_mut(filled + extra) = at as u32 + bits.trailing_zeros();
+                        bits &= bits.wrapping_sub(1);
+                        extra += 1;
                     }
+                    filled += found;
                     at += 64;
                 }
 

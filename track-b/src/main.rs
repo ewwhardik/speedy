@@ -171,10 +171,6 @@ impl Tally {
             let mut first = _mm256_setr_epi64x(0, 64, 128, 192); // the ids of each word's first bit
             for block in bits.chunks_exact(4) {
                 let word = _mm256_loadu_si256(block.as_ptr().cast());
-                if _mm256_testz_si256(word, word) == 1 {
-                    first = _mm256_add_epi64(first, _mm256_set1_epi64x(256));
-                    continue;
-                }
                 let lo = _mm256_and_si256(word, low);
                 let hi = _mm256_and_si256(_mm256_srli_epi16::<4>(word), low);
                 let high_ones = pick(ones, hi);
@@ -440,16 +436,24 @@ impl Run {
                     line_count += 1;
                     breaks &= breaks - 1;
                 }
-                while opened != 0 {
-                    *b.starts.get_unchecked_mut(token_count) = (at + opened.trailing_zeros() as usize) as u32;
-                    token_count += 1;
+                let (found, ended) = (opened.count_ones() as usize, closed.count_ones() as usize);
+                let first_in = |bits: u64| (at + bits.trailing_zeros() as usize) as u32;
+                for extra in 0..12 {
+                    *b.starts.get_unchecked_mut(token_count + extra) = first_in(opened);
+                    *b.ends.get_unchecked_mut(end_count + extra) = first_in(closed);
+                    opened &= opened.wrapping_sub(1);
+                    closed &= closed.wrapping_sub(1);
+                }
+                for extra in 12..found {
+                    b.starts[token_count + extra] = first_in(opened);
                     opened &= opened - 1;
                 }
-                while closed != 0 {
-                    *b.ends.get_unchecked_mut(end_count) = (at + closed.trailing_zeros() as usize) as u32;
-                    end_count += 1;
+                for extra in 12..ended {
+                    b.ends[end_count + extra] = first_in(closed);
                     closed &= closed - 1;
                 }
+                token_count += found;
+                end_count += ended;
                 at += 64;
             }
 
