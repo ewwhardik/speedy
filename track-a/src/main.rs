@@ -85,20 +85,23 @@ fn spaces_in(word: u64) -> u64 {
 /// head load runs at most 32 bytes past the end of the file, into the spare zero page.
 #[inline(always)]
 unsafe fn name_hash(name: *const u8, len: usize) -> u64 {
-    let mut crc = len as u64;
-    if len < 8 {
-        let chunk = read_unaligned(name.cast::<u64>()) & ((1u64 << (len * 8)) - 1);
-        return (_mm_crc32_u64(crc, chunk).wrapping_mul(0x9E37_79B9_7F4A_7C15)) | 1 << ID_BITS;
+    // Loading at `WINDOW + 64 - n` keeps the first n bytes, and at `WINDOW + n` the last n.
+    const WINDOW: [[u8; 32]; 3] = [[0; 32], [255; 32], [0; 32]];
+    let load = |at: *const u8| _mm256_loadu_si256(at.cast());
+    let (window, n) = (WINDOW.as_ptr().cast::<u8>(), len.min(32));
+    let head = _mm256_and_si256(load(name), load(window.add(64 - n)));
+    let tail = _mm256_and_si256(load(name.add(len).sub(32)), load(window.add(n)));
+    let mut mixed = _mm256_aesenc_epi128(head, tail);
+    if len > 64 {
+        mixed = _mm256_aesenc_epi128(mixed, load(name.add(32)));
+        mixed = _mm256_aesenc_epi128(mixed, load(name.add(len - 64)));
     }
-    let mut i = 0;
-    while i + 8 <= len {
-        crc = _mm_crc32_u64(crc, read_unaligned(name.add(i).cast()));
-        i += 8;
-    }
-    if i < len {
-        crc = _mm_crc32_u64(crc, read_unaligned(name.add(len - 8).cast()));
-    }
-    (crc.wrapping_mul(0x9E37_79B9_7F4A_7C15)) | 1 << ID_BITS
+    // Two more AES rounds (`vaesenc` does both 16-byte halves at once) mix far better than a
+    // multiply, at about the same cost.
+    let key = _mm256_set1_epi64x(0x9E37_79B9_7F4A_7C15u64 as i64);
+    let mixed = _mm256_aesenc_epi128(_mm256_aesenc_epi128(mixed, key), mixed);
+    let [a, b, c, d]: [u64; 4] = std::mem::transmute(mixed);
+    (a ^ b ^ c ^ d) | 1 << ID_BITS
 }
 
 struct Run {
@@ -137,7 +140,7 @@ impl Run {
         let hash = name_hash(name, len);
         let mut i = (hash >> (64 - SLOTS.trailing_zeros())) as usize;
         loop {
-            let slot = self.slots[i].load(Relaxed);
+            let slot = self.slots[i].load(Acquire);
             if slot >> ID_BITS == hash >> ID_BITS {
                 return (slot & ID_MASK) as u32;
             } else if slot == 0 {

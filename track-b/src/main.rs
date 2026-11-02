@@ -62,7 +62,7 @@ const AHEAD: usize = 20; // tokens between a bucket's prefetch and its lookup
 const HEAVY: u32 = 1 << 31; // an action: 0 for no term, a bitmap index here, or a term id + 1
 const OVERFLOW: u32 = 1 << 30; // in place of 0: the bucket is full, so look further
 const ANCHOR: u32 = 1 << 29; // added to a term's action: some phrase starts its check here
-const MAX_HEAVY: usize = 1024;
+const MAX_HEAVY: usize = 4096;
 const SHARDS: usize = 64;
 const DOC_BITS: u32 = 18;
 const CHUNK: usize = 64; // rows; the first of each chunk names the claim that wrote it
@@ -174,33 +174,24 @@ impl Tally {
             let weights = _mm256_set1_epi64x(0x3830_2820_1810_0800); // 8 * byte index in a word
             let (low, zero) = (_mm256_set1_epi8(15), _mm256_setzero_si256());
             let (mut counts, mut sums, mut offsets, mut starts) = (zero, zero, zero, zero);
-            let mut first_base = 0u64;
+            let mut first = _mm256_setr_epi64x(0, 64, 128, 192); // the ids of each word's first bit
             for block in bits.chunks_exact(4) {
                 let word = _mm256_loadu_si256(block.as_ptr().cast());
-                if _mm256_testz_si256(word, word) == 0 {
-                    let first = _mm256_setr_epi64x(
-                        first_base as i64,
-                        (first_base + 64) as i64,
-                        (first_base + 128) as i64,
-                        (first_base + 192) as i64,
-                    );
-                    let lo = _mm256_and_si256(word, low);
-                    let hi = _mm256_and_si256(_mm256_srli_epi16::<4>(word), low);
-                    let high_ones = pick(ones, hi);
-                    let per_byte = _mm256_add_epi8(pick(ones, lo), high_ones);
-                    let low_places = _mm256_add_epi8(pick(places, lo), pick(places, hi));
-                    let positions = _mm256_add_epi8(low_places, _mm256_slli_epi16::<2>(high_ones));
-                    let per_word = _mm256_sad_epu8(per_byte, zero);
-                    counts = _mm256_add_epi64(counts, per_word);
-                    sums = _mm256_add_epi64(sums, _mm256_sad_epu8(positions, zero));
-                    starts = _mm256_add_epi64(starts, _mm256_mul_epu32(per_word, first));
-                    let weighted = _mm256_maddubs_epi16(per_byte, weights);
-                    offsets = _mm256_add_epi32(
-                        offsets,
-                        _mm256_madd_epi16(weighted, _mm256_set1_epi16(1)),
-                    );
-                }
-                first_base += 256;
+                let lo = _mm256_and_si256(word, low);
+                let hi = _mm256_and_si256(_mm256_srli_epi16::<4>(word), low);
+                let high_ones = pick(ones, hi);
+                let per_byte = _mm256_add_epi8(pick(ones, lo), high_ones);
+                let low_places = _mm256_add_epi8(pick(places, lo), pick(places, hi));
+                // The high nibble's positions are 4 more than in the table.
+                let positions = _mm256_add_epi8(low_places, _mm256_slli_epi16::<2>(high_ones));
+                let per_word = _mm256_sad_epu8(per_byte, zero);
+                counts = _mm256_add_epi64(counts, per_word);
+                sums = _mm256_add_epi64(sums, _mm256_sad_epu8(positions, zero));
+                starts = _mm256_add_epi64(starts, _mm256_mul_epu32(per_word, first));
+                let weighted = _mm256_maddubs_epi16(per_byte, weights);
+                offsets =
+                    _mm256_add_epi32(offsets, _mm256_madd_epi16(weighted, _mm256_set1_epi16(1)));
+                first = _mm256_add_epi64(first, _mm256_set1_epi64x(256));
             }
             // Every lane is below 2^32, so the halves of the 64-bit ones can be added as 32-bit.
             let total = |v: __m256i| {
@@ -1248,7 +1239,7 @@ fn main() {
             docs,
             words_per_bitmap,
             buckets: reserve(BUCKETS, true),
-            terms: reserve(MAX_TERMS, false),
+            terms: reserve(MAX_TERMS, true),
             term_count: AtomicUsize::new(0),
             queries,
             shares: (0..threads).map(|_| OnceLock::new()).collect(),
@@ -1259,11 +1250,11 @@ fn main() {
             phase_base,
             arrived: Default::default(),
             round: Default::default(),
-            bitmaps: reserve(2 * MAX_HEAVY * words_per_bitmap, false),
+            bitmaps: reserve(2 * MAX_HEAVY * words_per_bitmap, true),
             // Each shard has more rows than it can hold, `len + 4096`: only touched pages cost memory.
             rows: reserve(SHARDS * (text.len() + 4096), false),
             claimed: (0..SHARDS).map(|_| AtomicUsize::new(0)).collect(),
-            postings: reserve(text.len() + HUGE_PAGE, false),
+            postings: reserve(text.len() + HUGE_PAGE, true),
             parts: (0..batches).map(|_| Mutex::default()).collect(),
             workspace: reserve(threads * WORKSPACE, false),
         };
