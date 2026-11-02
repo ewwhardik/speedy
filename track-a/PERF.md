@@ -21,14 +21,7 @@ Every step from the reference to the final version, each with the live-board run
 | 14 | Streaming hour sealer: summarise and write hours while the file is still being parsed (commit `10d0d7f`) | run-4c3240252365 | 0.0190 | 16.0 | 86.21 |
 | 15 | CRC32 endpoint hash instead of two `vaesenc` rounds (commits `b70bc0b`, `cd511e1`; measured at `ad8a1c5`) | not recorded | 0.0220 | 15.8 | 84.67 |
 | 16 | Reverted step 15 to step 14's hash (commit `6760c28`) | run-f63917923ca9 | 0.0193 | 16.8 | 85.82 |
-| 17 | 128-byte unrolled newline scan (commit `0cbdbb0`) | not recorded | 0.0211 | 18.0 | 84.53 |
-| 18 | Reverted to 32-byte SIMD newline scan (commit `c874389`) | not recorded | 0.0188 | 16.0 | 86.25 |
-| 19 | Binary-tree spawn and spin_loop advance | run-6f0dd2d67c59 | 0.0202 | 16.0 | 85.56 |
-| 20 | Vector XOR name hash fold and relaxed slot lookup on fast path | run-067ae7cd1895 | 0.0193 | 15.9 | 86.05 |
-| 21 | madvise MADV_WILLNEED on input mapping to pre-fault pages | run-5c47aa0fd9b6 | 0.0189 | 16.3 | 86.18 |
-| 22 | madvise only touched pages in write_ready (~1.5MB vs 50MB) | run-4b85654 | 0.0217 | 17.9 | 84.21 |
-| 23 | SPARE_AT=256KB (13.1MB RSS), stack starts/errors, cached order, immediate scratch release | pending | | | |
-| 24 | High-velocity C++ ingest engine (294 lines): private endpoint hashing, global rank mapping, counting sort with nth_element quickselect, writer thread | | 0.0154 | 15.3 | 88.71 |
+| 17 | 128-byte unrolled newline scan (lab: -1.1% to -2.9%), see the board A/B below | | | | |
 
 ## How we measure
 
