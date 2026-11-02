@@ -1,0 +1,37 @@
+name: prof
+on:
+  push:
+    branches: [prof]
+jobs:
+  prof:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        track: [a, b, c]
+    steps:
+      - uses: actions/checkout@v4
+      - name: data
+        run: |
+          declare -A F=([a]="track-a/full-seed1/requests.log" [b]="track-b/full-seed1/docs.txt track-b/full-seed1/queries.txt" [c]="track-c/full-seed1/records.csv track-c/full-seed1/regions.csv")
+          mkdir -p /tmp/d
+          for f in ${F[${{matrix.track}}]}; do curl -s -o /tmp/d/$(basename $f) https://s3.amazonaws.com/raptors.dev/speeddemon.dev/2026/data/$f; done
+          ls -la /tmp/d
+          sudo ln -sfn /tmp/d /data; sudo mkdir -p /out; sudo chmod 777 /out
+          sudo apt-get install -qq -y linux-tools-common linux-tools-$(uname -r) >/dev/null 2>&1 || sudo apt-get install -qq -y linux-tools-azure >/dev/null 2>&1 || true
+          sudo sysctl -w kernel.perf_event_paranoid=-1 kernel.kptr_restrict=0
+      - name: build
+        working-directory: track-${{ matrix.track }}
+        run: |
+          cmd=$(sed -n 's/^RUN //p' Dockerfile | head -1 | sed 's/strip = true//')
+          sed -i 's/^strip = true/debug = 1/' Cargo.toml; grep -q '^debug' Cargo.toml || sed -i 's/^\[profile.release\]/[profile.release]\ndebug = 1/' Cargo.toml
+          bash -c "$cmd"
+      - name: profile
+        run: |
+          bin=track-${{ matrix.track }}/target/release/solution
+          for i in 1 2 3; do $bin; done
+          for i in 1 2 3 4 5; do /usr/bin/time -f "wall %e s maxrss %M KB minflt %R majflt %F vctx %w ictx %c" $bin; done
+          perf stat -e task-clock,page-faults,context-switches,cpu-migrations -r 10 $bin 2>&1 | tail -15
+          perf record -q -F 20000 -g -o /tmp/p.data -- bash -c "for i in 1 2 3 4 5 6 7 8 9 10; do $bin; done" 2>/dev/null
+          perf report -i /tmp/p.data --no-children --percent-limit 0.7 --stdio -g none --sort sym 2>/dev/null | grep -v '^#' | grep -v '^$' | head -60
+          perf report -i /tmp/p.data --no-children --percent-limit 2 --stdio -g caller,0.5,callee --sort sym 2>/dev/null | grep -v '^$' | head -150
