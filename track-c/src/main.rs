@@ -427,7 +427,9 @@ fn main() {
     let mut out = String::new();
     for (key, group) in keys {
         let [count, id_sum, amount, lengths, hi, lo, ..] = totals[group];
-        let row = &run.2 .1[group * SEEN_WORDS..][..SEEN_WORDS];
+        // Words past the last name number handed out are all zero.
+        let used = NEXT[3].load(Relaxed).div_ceil(64).min(SEEN_WORDS);
+        let row = &run.2 .1[group * SEEN_WORDS..][..used];
         let distinct: u32 = row.iter().map(|w| w.load(Relaxed).count_ones()).sum();
         // Cents as text. A double holds any total of cents to well within half a cent.
         let [sum, min, max] =
