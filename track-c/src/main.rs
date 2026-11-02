@@ -78,7 +78,7 @@ static TOTALS: Mutex<[[i64; 8]; GROUPS]> = Mutex::new([[0; 8]; GROUPS]);
 // Group to country code, with the unmatched group first.
 static COUNTRIES: Mutex<Vec<String>> = Mutex::new(Vec::new());
 
-/// The two shared tables, zeroed. Together they are exactly three huge pages.
+/// The two shared tables, zeroed: the buckets fill exactly one huge page.
 /// 0: the name buckets. A bucket is one cache line of eight slots. A slot holds a 47-bit name
 /// tag above the name's dense number, so one compare-and-swap claims a slot with its number.
 /// Numbers keep the bit matrix small.
@@ -410,7 +410,11 @@ unsafe fn map(name: &str) -> &'static [u8] {
 unsafe fn zeroed<T>() -> &'static T {
     let region = mmap(null_mut(), size_of::<T>() + HUGE_PAGE, 3, MAP_ANON, -1, 0); // read, write
     let aligned = region.add(region.align_offset(HUGE_PAGE));
-    madvise(aligned, size_of::<T>(), 14); // MADV_HUGEPAGE
+    // The name buckets (the first huge page) are all touched, so a huge page costs nothing
+    // extra there. The bit matrix stays on small pages: rows of unused groups and the bits
+    // past the last name number are never touched, so they are never charged.
+    madvise(aligned, HUGE_PAGE, 14); // MADV_HUGEPAGE
+    madvise(aligned.add(HUGE_PAGE), size_of::<T>() - HUGE_PAGE, 15); // MADV_NOHUGEPAGE
     &*aligned.cast()
 }
 
