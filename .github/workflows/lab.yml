@@ -1,0 +1,48 @@
+name: lab
+on:
+  push:
+    branches: [lab]
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        seed: [1, 2, 3]
+        track: [a, b, c]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - name: machine
+        run: nproc; lscpu | grep -E 'Model name|Flags' | sed 's/Flags:/Flags:/' | grep -oE 'Model name.*|vaes|avx2|bmi2|pclmulqdq|vpclmulqdq|sha_ni' | sort -u | tr '\n' ' '
+      - name: generate and reference
+        run: |
+          git clone -q --depth 1 https://github.com/hackathon-raptors/speed-demon-2026 /tmp/h
+          declare -A GEN=([a]=a_ingest [b]=b_index [c]=c_join)
+          declare -A OUT=([a]=summary.txt [b]=results.txt [c]=aggregates.txt)
+          python /tmp/h/generators/${GEN[${{matrix.track}}]}.py --seed ${{matrix.seed}} --scale full --out /tmp/d
+          mkdir -p /tmp/ref
+          /usr/bin/time -f "reference %e s %M KB" python -c "import sys; sys.path.insert(0,'/tmp/h/reference'); import ${GEN[${{matrix.track}}]} as m; m.main('/tmp/d','/tmp/ref')"
+          sha256sum /tmp/ref/${OUT[${{matrix.track}}]} | cut -c1-64 > /tmp/expected
+          echo "OUTFILE=${OUT[${{matrix.track}}]}" >> $GITHUB_ENV
+          cat /tmp/expected
+      - name: build
+        working-directory: track-${{ matrix.track }}
+        run: |
+          cmd=$(sed -n 's/^RUN //p' Dockerfile | head -1)
+          echo "$cmd"; bash -c "$cmd"
+      - name: run
+        run: |
+          sudo ln -sfn /tmp/d /data; sudo mkdir -p /out; sudo chmod 777 /out
+          bin=track-${{ matrix.track }}/target/release/solution
+          ok=1
+          for i in 1 2 3 4 5 6 7; do
+            rm -f /out/*
+            /usr/bin/time -f "%e s %M KB" -o /tmp/t $bin
+            got=$(sha256sum /out/$OUTFILE | cut -c1-64)
+            if [ "$got" = "$(cat /tmp/expected)" ]; then r=PASS; else r=FAIL; ok=0; fi
+            echo "run $i $r $(cat /tmp/t)"
+          done
+          [ $ok = 1 ]
