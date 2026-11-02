@@ -438,9 +438,10 @@ impl Run {
         }
         for (hour, offset, text) in ready {
             self.output.write_all_at(text, offset).unwrap();
-            // The text is out: give the hour's pages back.
-            let rows = unsafe { self.rows.add(hour * self.stride) };
-            unsafe { madvise(rows.cast(), self.stride * 4, 4) };
+            // The text is out: give the hour's pages back (only the pages actually touched).
+            let claimed = self.claimed[hour].load(Relaxed);
+            let touched = (claimed.max(SPARE_AT) + claimed + 4096) * 4;
+            unsafe { madvise(self.rows.add(hour * self.stride).cast(), touched.next_multiple_of(4096), 4) };
         }
     }
 
@@ -449,7 +450,7 @@ impl Run {
         // Out of claims: what is left is hours that wait for the last claims in flight.
         while self.next_hour.load(Relaxed) < HOURS {
             self.advance();
-            thread::yield_now();
+            std::hint::spin_loop();
         }
     }
 }
@@ -532,11 +533,14 @@ fn solve(early: bool) -> bool {
         output: File::create("/out/summary.txt").unwrap(),
         placed: Mutex::new((0, 0)),
     };
-    thread::scope(|s| {
-        for _ in 1..threads {
-            s.spawn(|| run.work());
+    fn spawn_tree<'scope, 'env>(scope: &'scope thread::Scope<'scope, 'env>, run: &'env Run, mut n: usize) {
+        while n > 0 {
+            let half = n.div_ceil(2);
+            scope.spawn(move || spawn_tree(scope, run, half - 1));
+            n -= half;
         }
         run.work();
-    });
+    }
+    thread::scope(|s| spawn_tree(s, &run, threads - 1));
     run.dirty.load(Relaxed)
 }

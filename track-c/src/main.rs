@@ -127,14 +127,18 @@ unsafe fn decode_digits(words: &[u64], numbers: &mut [u32], count: usize) {
 /// it. Names are compared by their raw bytes: every non-empty name is quoted, so equal raw
 /// bytes mean equal values and nothing needs unescaping. Names of 32 bytes and more do not
 /// occur at seed 1 (the longest is 27), so they cost one predicted branch here.
+#[cold]
+unsafe fn long_name_hash(name: *const u8, len: usize) -> (u64, usize) {
+    let (a, b) = (name_hash(name, 31), name_hash(name.add(31), len - 31));
+    let hash = (a.0.rotate_left(23) ^ b.0).wrapping_mul(0xE703_7ED1_A0B4_28DB);
+    (hash | 1, a.1 + b.1)
+}
+
+#[inline(always)]
 unsafe fn name_hash(name: *const u8, len: usize) -> (u64, usize) {
-    // 32 bytes of ones then 32 of zeros: loading at 32 - len keeps the first `len` bytes.
     static MASKS: [[u8; 32]; 2] = [[0xFF; 32], [0; 32]];
     if len >= 32 {
-        // Cold: hash the first 31 bytes and the rest apart, and combine them.
-        let (a, b) = (name_hash(name, 31), name_hash(name.add(31), len - 31));
-        let hash = (a.0.rotate_left(23) ^ b.0).wrapping_mul(0xE703_7ED1_A0B4_28DB);
-        return (hash | 1, a.1 + b.1);
+        return long_name_hash(name, len);
     }
     let bytes = _mm256_and_si256(load(name), load(MASKS.as_ptr().cast::<u8>().add(32 - len)));
     let quotes = equal_mask(bytes, b'"').count_ones() as usize;
@@ -175,7 +179,7 @@ impl Run {
     /// no lock is needed. A worker that loses a race to the same name wastes one number.
     #[cold]
     unsafe fn insert(&self, index: usize, tag: u64, spare: &mut Range<usize>) -> usize {
-        if spare.is_empty() {
+        if spare.start == spare.end {
             // Name numbers are reserved 32 at a time.
             let first = NEXT[3].fetch_add(32, Relaxed);
             *spare = first..first + 32;
@@ -321,7 +325,7 @@ impl Run {
                     start = newline + 1;
                     count += 1;
                 }
-                [0, 1, 2].map(|kind| decode_digits(&digits[kind], &mut numbers[kind], count));
+                let _ = [0, 1, 2].map(|kind| decode_digits(&digits[kind], &mut numbers[kind], count));
                 // Pass B: names and notes.
                 let mut rank = quotes_up_to(record);
                 for at in 0..count {
