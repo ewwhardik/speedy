@@ -27,9 +27,11 @@ jobs:
       - name: builds
         working-directory: track-${{ matrix.track }}
         run: |
-          flags=$(sed -n 's/.*RUSTFLAGS="\([^"]*\)".*/\1/p' Dockerfile)
+          flags=$(sed -n 's/.*RUSTFLAGS="\([^"]*\)".*/\1/p' Dockerfile | sed 's/target-cpu=native/target-cpu=alderlake/')
+          native=$(sed -n 's/.*RUSTFLAGS="\([^"]*\)".*/\1/p' Dockerfile)
           echo "flags: $flags"
           b() { docker run --rm -u $(id -u):$(id -g) -e HOME=/tmp -v $PWD:/src -w /src -e RUSTFLAGS="$2" -e CARGO_TARGET_DIR=/src/$3 $1 cargo build --release --offline -q; }
+          b $SLIM "$native" t-native
           b $SLIM "$flags" t-plain
           b $TOOLS "$flags -Cprofile-generate=/tmp/pgo" t-gen
           for i in 1 2 3 4 5; do rm -f /out/*; ./t-gen/release/solution; done
