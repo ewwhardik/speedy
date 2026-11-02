@@ -43,7 +43,7 @@ extern "C" {
     fn prctl(option: i32, ...) -> i32;
 }
 
-const CLAIM: usize = 1 << 20;
+const CLAIM: usize = 1 << 21;
 const BLOCK: usize = 1 << 16; // fits in L2 between the newline pass and the line pass
 const MIN_LINE: usize = 40; // ts 27, method 3, endpoint 1, status 3, latency 1, 4 spaces, LF
 const HOURS: usize = 72; // the span is fixed for every seed: 2026-10-30T18 to 2026-11-02T17
