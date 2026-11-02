@@ -1,6 +1,6 @@
 # Track C: performance log
 
-Every step from the reference to your final version, each with the live-board run ID that measured it. Judges check that the run IDs exist and that each change moved the way you say it did.
+Every step from the reference to the final version, each with the live-board run ID that measured it. A board run is a single run, and near-identical code has scored from 21.5 to 24.0 ms (steps 6 to 13), so a change smaller than about 5% cannot be read from one board run. From step 15 on, every change was first measured in our lab (below) and only then pushed.
 
 | Step | Change | Run ID | T (s) | M (MB) | Points |
 |---|---|---|---|---|---|
@@ -18,4 +18,26 @@ Every step from the reference to your final version, each with the live-board ru
 | 11 | Restored branchless atomic fetch_or and 8-store unrolled parser | run-04a434eeff50 | 0.0216 | 10.7 | 82.55 |
 | 12 | Restored verified atomic bitmatrix filtering and clean sequential popcounts | run-4858e8e414e6 | 0.0234 | 11.1 | 81.59 |
 | 13 | Pre-allocated format buffer, 256B CSV scan prefetching | run-c6be052389c9 | 0.0215 | 11.3 | 82.26 |
-| 14 | Streamlined sequential popcounts, L1 CSV prefetch, compact source | pending | - | - | - |
+| 14 | Folded the bit-matrix pass into the stats pass (no write prefetch), test-before-set, `SEEN_WORDS` 2048 → 1600 (commit `ad8a1c5`) | not recorded | 0.0305 | 10.1 | 79.19 |
+| 15 | Reverted step 14 to step 6's code (commit `6760c28`) | run-7b45646d4f2a | 0.0225 | 11.3 | 81.98 |
+| 16 | Profile-guided build, target pinned to `alderlake` (lab: -6.5%) | run-8fdb180e95a8 | 0.0227 | 10.9 | 82.04 |
+
+## How we measure
+
+- **Board:** one run per push on the scoring box, seed 1. Used for the absolute numbers above.
+- **Lab:** a GitHub Actions workflow on a separate branch builds the base (`speed-demon`) and the candidate with `docker build` of the real Dockerfile, checks the candidate's output against the organisers' reference on seed 1 and on a freshly generated seed 7 (full scale), then times base and candidate alternately for 25 rounds on the same machine and compares medians and trimmed means. It also reads the cgroup's `memory.peak`, the counter the board uses. The runners are two-core AMD EPYC and Intel Xeon machines, so absolute times are not the box's, but A/B differences of 1% are visible.
+- **Holdout check:** the final code also matches the reference on seeds 2 and 3 at full scale, 7 runs each.
+
+## Where the time goes
+
+`perf record` on the lab runner (seed 1, ten runs): 86% of samples in the worker loop, about 10% in the kernel (page faults on the input mapping and unmapping it). The hottest lines are the consumers of the three random accesses per record: the name bucket (2 MiB table), the region table (1 MiB) and the bit matrix (4 MiB) with its locked `or`, which is about 10% of samples on its own. The structural pass (AVX2 + carry-less multiply) and the digit decoding are each under 10%. The parse is bound by memory latency, not by instructions, which is why every pass is arranged so that one pass prefetches what the next one reads.
+
+## What did not work
+
+| Experiment | Measured | Why |
+|---|---|---|
+| Folding the bit-matrix `or` into the stats pass (step 14) | board 21.6 → 30.5 ms | Without a pass in between, the write prefetch has no time to land: every record stalls on a cache line held by another core. |
+| Test the bit before the locked `or` | lab +1.3% | Each country sees about 13,800 records drawn from 100,000 names, so about 93% of bit updates are first sets and the test rarely saves the `or`. |
+| `SEEN_WORDS` 1600 instead of 2048 | no memory saved | The tables are on transparent huge pages and the third 2 MiB page is touched either way. 2048 also covers every 17-bit name number, so no seed can overflow a row. |
+| Bit matrix on 4 KiB pages | lab +2.75%, memory unchanged | More TLB misses on random writes, and the touched part is nearly the whole matrix. |
+| Profile-guided build with `target-cpu=native` | lab ±0% | The profile was trained on a different CPU model than it was used on; with `native` the code differs and the profile is silently dropped. Pinning the target fixed it (step 16). |
