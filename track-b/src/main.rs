@@ -758,8 +758,18 @@ impl Run {
             info.first = firsts[low] - HEADER as u32;
             info.count = cursors[low] - firsts[low];
         }
-        std::ptr::write_bytes(region, 0, claimed);
         self.claimed[shard].store(0, Relaxed);
+        if phase + 2 == self.phase_base.len() {
+            // The last phase: nothing reads these rows or the other bitmap set again, so give
+            // the rows' pages back here, in parallel, instead of on one thread at exit.
+            let from = (region as usize).next_multiple_of(4096);
+            let to = region.add(claimed) as usize & !4095;
+            if to > from {
+                discard(from as *const u8, to - from);
+            }
+            return;
+        }
+        std::ptr::write_bytes(region, 0, claimed);
         // Zero this shard's share of the bitmap set that the next phase will fill.
         let heavy = self.heavy();
         let (from, to) = (heavy * shard / SHARDS, heavy * (shard + 1) / SHARDS);
