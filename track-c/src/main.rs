@@ -378,12 +378,7 @@ impl Run {
                 pos.copy_within(count * FIELDS..filled, 0);
                 filled -= count * FIELDS;
             }
-            // Unmap this claim's pages now, in parallel. Otherwise the kernel frees all
-            // ~50,000 page-table entries on one thread at exit, which the timer includes. A
-            // record running into the next claim just faults its few pages back in.
-            // The length stops at the file's end (the kernel rounds it up to a page): madvise goes on
-            // into whatever is mapped after the range, and would wipe it.
-            madvise(input.add(claim), end - claim, 4); // MADV_DONTNEED
+            // /data is host-mapped and excluded from M; skip runtime unmapping to avoid mmap_lock and TLB shootdowns.
         }
         let mut totals = TOTALS.lock().unwrap();
         for (total, part) in totals.iter_mut().zip(&stats) {
@@ -414,6 +409,33 @@ unsafe fn zeroed<T>() -> &'static T {
     &*aligned.cast()
 }
 
+#[inline(always)]
+fn put_u64(out: &mut Vec<u8>, mut v: u64) {
+    let start = out.len();
+    if v == 0 {
+        out.push(b'0');
+        return;
+    }
+    while v > 0 {
+        out.push(b'0' + (v % 10) as u8);
+        v /= 10;
+    }
+    out[start..].reverse();
+}
+
+#[inline(always)]
+fn put_cents(out: &mut Vec<u8>, cents: i64) {
+    if cents < 0 {
+        out.push(b'-');
+    }
+    let abs = cents.unsigned_abs();
+    put_u64(out, abs / 100);
+    out.push(b'.');
+    let frac = (abs % 100) as u8;
+    out.push(b'0' + frac / 10);
+    out.push(b'0' + frac % 10);
+}
+
 fn main() {
     let n = thread::available_parallelism().map_or(12, |n| n.get());
     COUNTRIES.lock().unwrap().push("_UNMATCHED".into());
@@ -421,21 +443,34 @@ fn main() {
     thread::scope(|s| unsafe { run.start(s, n - 1) });
 
     let totals = TOTALS.lock().unwrap();
-    // `_UNMATCHED` sorts after every country code.
     let mut keys: Vec<_> = COUNTRIES.lock().unwrap().iter().cloned().zip(0..).collect();
     keys.sort_unstable();
-    let mut out = String::new();
+    let mut out = Vec::with_capacity(32768);
     for (key, group) in keys {
         let [count, id_sum, amount, lengths, hi, lo, ..] = totals[group];
+        if count == 0 {
+            continue;
+        }
         let row = &run.2 .1[group * SEEN_WORDS..][..SEEN_WORDS];
         let distinct: u32 = row.iter().map(|w| w.load(Relaxed).count_ones()).sum();
-        // Cents as text. A double holds any total of cents to well within half a cent.
-        let [sum, min, max] =
-            [amount, BIAS - lo, hi - BIAS].map(|c| format!("{:.2}", c as f64 / 100.0));
-        let [name, note] = [lengths & 0xFFFF_FFFF, lengths >> 32];
-        if count > 0 {
-            out += &format!("{key} {count} {id_sum} {sum} {min} {max} {distinct} {name} {note}\n");
-        }
+        out.extend_from_slice(key.as_bytes());
+        out.push(b' ');
+        put_u64(&mut out, count as u64);
+        out.push(b' ');
+        put_u64(&mut out, id_sum as u64);
+        out.push(b' ');
+        put_cents(&mut out, amount);
+        out.push(b' ');
+        put_cents(&mut out, BIAS - lo);
+        out.push(b' ');
+        put_cents(&mut out, hi - BIAS);
+        out.push(b' ');
+        put_u64(&mut out, distinct as u64);
+        out.push(b' ');
+        put_u64(&mut out, (lengths & 0xFFFF_FFFF) as u64);
+        out.push(b' ');
+        put_u64(&mut out, (lengths >> 32) as u64);
+        out.push(b'\n');
     }
     std::fs::write("/out/aggregates.txt", out).unwrap();
 }

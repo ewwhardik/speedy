@@ -21,7 +21,8 @@ Every step from the reference to the final version, each with the live-board run
 | 14 | Folded the bit-matrix pass into the stats pass (no write prefetch), test-before-set, `SEEN_WORDS` 2048 → 1600 (commit `ad8a1c5`) | not recorded | 0.0305 | 10.1 | 79.19 |
 | 15 | Reverted step 14 to step 6's code (commit `6760c28`) | run-7b45646d4f2a | 0.0225 | 11.3 | 81.98 |
 | 16 | Profile-guided build, target pinned to `alderlake` (lab: -6.5%) | run-8fdb180e95a8 | 0.0227 | 10.9 | 82.04 |
-| 17 | Native build with `SEEN_WORDS=1600` (1MB saved) + conditional atomic bit-set (skips bus locking) while keeping `ET0` prefetch pass | pending | | | |
+| 17 | Restored SEEN_WORDS=2048 power-of-two alignment and unconditional fetch_or | run-5c47aa0fd9b6 | 0.0216 | 11.1 | 82.49 |
+| 18 | Eliminate input madvise IPIs/mmap_lock contention, zero-alloc direct integer formatter | pending | | | |
 
 ## How we measure
 

@@ -405,8 +405,6 @@ impl Run {
             *w = b'\n';
             w = w.add(1);
         }
-        // The ranks are all read: give the scratch pages back now, not when the hour is written.
-        madvise(spare.cast(), (count + long.len()) * 4, 4);
         std::slice::from_raw_parts(text, w.offset_from(text) as usize)
     }
 
@@ -427,8 +425,10 @@ impl Run {
         }
         for (hour, offset, text) in ready {
             self.output.write_all_at(text, offset).unwrap();
-            // The text is out: give the hour's pages back.
-            unsafe { madvise(self.rows.add(hour * self.stride).cast(), self.stride * 4, 4) };
+            // The text is out: give the hour's pages back (only the pages actually touched).
+            let claimed = self.claimed[hour].load(Relaxed);
+            let touched = (claimed.max(SPARE_AT) + claimed + 4096) * 4;
+            unsafe { madvise(self.rows.add(hour * self.stride).cast(), touched.next_multiple_of(4096), 4) };
         }
     }
 
