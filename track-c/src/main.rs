@@ -58,8 +58,8 @@ const NAME_MASK: u64 = (1 << NUMBER_BITS) - 1;
 const REGION_IDS: usize = 1_000_000;
 // 240 countries, with index 0 for unmatched
 const GROUPS: usize = 256;
-// Words of one group's row of the name bit matrix.
-const SEEN_WORDS: usize = 1 << (NUMBER_BITS - 6);
+// Words of one group's row of the name bit matrix (1600 words = 102,400 bits, covering all 100,000 names).
+const SEEN_WORDS: usize = 1600;
 // Amounts are kept as the largest of `BIAS + amount` and of `BIAS - amount`, both positive, so
 // that a zeroed group is a valid empty one and merging two needs only sums and maxima.
 const BIAS: i64 = 1 << 40;
@@ -287,24 +287,8 @@ impl Run {
                     // predict. Eight cover almost every step.
                     let found = bits.count_ones() as usize;
                     let p = pos.as_mut_ptr().add(filled);
-                    *p.add(0) = at as u32 + bits.trailing_zeros();
-                    bits &= bits.wrapping_sub(1);
-                    *p.add(1) = at as u32 + bits.trailing_zeros();
-                    bits &= bits.wrapping_sub(1);
-                    *p.add(2) = at as u32 + bits.trailing_zeros();
-                    bits &= bits.wrapping_sub(1);
-                    *p.add(3) = at as u32 + bits.trailing_zeros();
-                    bits &= bits.wrapping_sub(1);
-                    *p.add(4) = at as u32 + bits.trailing_zeros();
-                    bits &= bits.wrapping_sub(1);
-                    *p.add(5) = at as u32 + bits.trailing_zeros();
-                    bits &= bits.wrapping_sub(1);
-                    *p.add(6) = at as u32 + bits.trailing_zeros();
-                    bits &= bits.wrapping_sub(1);
-                    *p.add(7) = at as u32 + bits.trailing_zeros();
-                    bits &= bits.wrapping_sub(1);
-                    let mut extra = 8;
-                    while bits != 0 {
+                    let mut extra = 0;
+                    while extra < 8 || bits != 0 {
                         *p.add(extra) = at as u32 + bits.trailing_zeros();
                         bits &= bits.wrapping_sub(1);
                         extra += 1;
