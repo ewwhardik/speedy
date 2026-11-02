@@ -1,0 +1,73 @@
+name: ab
+on:
+  push:
+    branches: ['ab-*']
+jobs:
+  ab:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        track: [a, b, c]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: changed?
+        run: |
+          git fetch -q origin speed-demon
+          if git diff --quiet origin/speed-demon HEAD -- track-${{ matrix.track }}; then echo "SKIP=1" >> $GITHUB_ENV; echo unchanged; fi
+      - uses: actions/setup-python@v5
+        if: env.SKIP != '1'
+        with:
+          python-version: '3.13'
+      - name: data
+        if: env.SKIP != '1'
+        run: |
+          declare -A F=([a]="track-a/full-seed1/requests.log" [b]="track-b/full-seed1/docs.txt track-b/full-seed1/queries.txt" [c]="track-c/full-seed1/records.csv track-c/full-seed1/regions.csv")
+          declare -A H=([a]=495ca09682b9673ef836a506496177680bb4a3af54255174befddb1f83481cd3 [b]=f86973c210228141bcb6f1f1b10188ad2a9b65f71e7cd7cf4590b38de4e80927 [c]=d8088b1cd42ba1338b1345b107b55db7b96ef1f5066f3ff64fd26a8912a0f536)
+          declare -A O=([a]=summary.txt [b]=results.txt [c]=aggregates.txt)
+          declare -A G=([a]=a_ingest [b]=b_index [c]=c_join)
+          t=${{ matrix.track }}
+          echo "OUTFILE=${O[$t]}" >> $GITHUB_ENV
+          mkdir -p /tmp/s1; for f in ${F[$t]}; do curl -s -o /tmp/s1/$(basename $f) https://s3.amazonaws.com/raptors.dev/speeddemon.dev/2026/data/$f; done
+          echo ${H[$t]} > /tmp/s1.sha
+          git clone -q --depth 1 https://github.com/hackathon-raptors/speed-demon-2026 /tmp/h
+          python /tmp/h/generators/${G[$t]}.py --seed 7 --scale full --out /tmp/s7
+          mkdir -p /tmp/ref; python -c "import sys; sys.path.insert(0,'/tmp/h/reference'); import ${G[$t]} as m; m.main('/tmp/s7','/tmp/ref')"
+          sha256sum /tmp/ref/${O[$t]} | cut -c1-64 > /tmp/s7.sha
+          sudo mkdir -p /out; sudo chmod 777 /out
+      - name: build
+        if: env.SKIP != '1'
+        run: |
+          t=${{ matrix.track }}
+          git worktree add -q /tmp/base origin/speed-demon
+          for v in base cand; do
+            d=$([ $v = base ] && echo /tmp/base/track-$t || echo $PWD/track-$t)
+            (cd $d && bash -c "$(sed -n 's/^RUN //p' Dockerfile | head -1)" 2>&1 | grep -E "^error|warning: unused" | head; cp target/release/solution /tmp/$v)
+          done
+      - name: correctness
+        if: env.SKIP != '1'
+        run: |
+          ok=1
+          for s in s1 s7; do sudo ln -sfn /tmp/$s /data; for i in 1 2 3; do
+            rm -f /out/*; /tmp/cand; got=$(sha256sum /out/$OUTFILE | cut -c1-64)
+            if [ "$got" = "$(cat /tmp/$s.sha)" ]; then echo "cand $s PASS"; else echo "cand $s FAIL"; ok=0; fi
+          done; done
+          [ $ok = 1 ]
+      - name: timing
+        if: env.SKIP != '1'
+        run: |
+          sudo ln -sfn /tmp/s1 /data
+          for v in base cand base cand; do /tmp/$v; done
+          for round in $(seq 1 25); do for v in base cand; do
+            s=$(date +%s%N); /tmp/$v; e=$(date +%s%N); echo "$v $(( (e - s) / 1000 ))" >> /tmp/times
+          done; done
+          python3 -c "
+          import statistics as st
+          t={}
+          for l in open('/tmp/times'): v,us=l.split(); t.setdefault(v,[]).append(int(us))
+          b,c=sorted(t['base']),sorted(t['cand'])
+          for v,x in (('base',b),('cand',c)): print('TIME',v,'median_us',st.median(x),'trim_mean',round(st.mean(x[5:-5])),'min',x[0])
+          print('TIME delta_median_pct', round(100*(st.median(c)/st.median(b)-1),2), 'delta_trim_pct', round(100*(st.mean(c[5:-5])/st.mean(b[5:-5])-1),2))
+          "
