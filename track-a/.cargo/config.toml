@@ -1,2 +1,7 @@
+# alderlake = Raptor Lake's feature set (AVX2, BMI2, PCLMULQDQ). Never `native`: the board builds
+# on a different host (Depot, AVX-512) and `native` reroutes builds to the box's E-cores.
+# crt-static: a static binary skips the dynamic loader, which took about 0.25 ms of start-up.
+# relocation-model=static: a plain static executable, not a static PIE. The same code ran 3.9%
+# fewer user cycles, with half the iTLB misses (PERF.md, step 40).
 [build]
-rustflags = ["-C", "target-cpu=x86-64-v3", "-C", "target-feature=+crt-static", "-C", "target-feature=+aes,+vaes"]
+rustflags = ["-C", "target-cpu=alderlake", "-C", "target-feature=+crt-static", "-C", "relocation-model=static"]

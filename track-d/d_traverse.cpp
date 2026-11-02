@@ -4,12 +4,14 @@
 #include <cstring>
 #include <emmintrin.h>
 #include <fcntl.h>
+#include <malloc.h>
 #include <numeric>
 #include <queue>
 #include <string>
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <thread>
+#include <tmmintrin.h>
 #include <unistd.h>
 #include <vector>
 
@@ -22,7 +24,6 @@ using Escapes = std::vector<std::pair<size_t, u64>>;
 using Bits = std::vector<u64>;
 bool test(const Bits &b, u32 v) { return b[v >> 6] >> (v & 63) & 1; }
 void set(Bits &b, u32 v) { b[v >> 6] |= u64(1) << (v & 63); }
-unsigned id_bits(u64 n) { return n < 2 ? 1 : 64 - __builtin_clzll(n - 1); }
 u32 cut(size_t n, unsigned t, unsigned threads) { return n * t / threads; }
 
 // Uninitialized storage, committed page by page as it is written. Huge pages
@@ -75,7 +76,8 @@ u64 separators(const char *p) {
 
 // Value of the digits [a, b). Up to eight digits are converted at once from
 // the 8 bytes ending at b, the bytes before a masked off.
-u32 decimal(const char *a, const char *b, const char *file) {
+__attribute__((target("ssse3"))) u32 decimal(const char *a, const char *b,
+                                             const char *file) {
   u32 len = b - a, v = 0;
   if (len > 8 || b - file < 8) {
     for (; a < b; ++a)
@@ -85,31 +87,37 @@ u32 decimal(const char *a, const char *b, const char *file) {
   u64 x, m = 0x000000FF000000FF;
   memcpy(&x, b - 8, 8);
   x &= (~u64(0) << (64 - 8 * len)) & 0x0F0F0F0F0F0F0F0F;
-  x = x * 10 + (x >> 8); // adjacent digit pairs
-  x = (x & m) * 0x000F424000000064 + ((x >> 16) & m) * 0x0000271000000001;
-  return x >> 32;
+  __m128i z = _mm_setzero_si128(), digits = _mm_cvtsi64_si128(x);
+  __m128i pairs = _mm_maddubs_epi16(digits, _mm_set1_epi16(0x010a));
+  __m128i quads = _mm_madd_epi16(pairs, _mm_set1_epi32(0x00010064));
+  return u32(_mm_cvtsi128_si32(quads)) * 10000 +
+         u32(_mm_cvtsi128_si32(_mm_srli_si128(quads, 4)));
 }
 
 // Calls emit(u, v, w) for each line in [begin, end) of the file [lo, hi).
 template <class Emit>
-void parse(const char *lo, const char *hi, const char *begin, const char *end,
-           Emit emit) {
-  const char *field = begin;
-  u32 val[3], k = 0;
+__attribute__((target("ssse3"))) void parse(const char *lo, const char *hi,
+                                            const char *begin, const char *end,
+                                            Emit emit) {
+  const char *field = begin, *chunk = begin, *block = begin;
+  u64 mask = 0;
   char pad[64];
-  for (const char *q = begin; q < end; q += 64) {
-    // The file's last block is scanned from a copy padded with digits.
-    if (hi - q < 64)
-      memset(pad, '0', 64), memcpy(pad, q, hi - q);
-    u64 m = separators(hi - q < 64 ? pad : q);
-    if (end - q < 64)
-      m &= (u64(1) << (end - q)) - 1;
-    for (; m; m &= m - 1) {
-      const char *sep = q + __builtin_ctzll(m);
-      val[k] = decimal(field, sep, lo), field = sep + 1;
-      if (++k == 3)
-        emit(val[0], val[1], val[2]), k = 0;
+  auto next = [&]() __attribute__((target("ssse3"))) {
+    while (!mask) {
+      block = chunk, chunk += 64;
+      if (hi - block < 64)
+        memset(pad, '0', 64), memcpy(pad, block, hi - block);
+      mask = separators(hi - block < 64 ? pad : block);
     }
+    const char *sep = block + __builtin_ctzll(mask);
+    mask &= mask - 1;
+    return sep;
+  };
+  while (field < end) {
+    const char *a = next(), *b = next(), *c = next();
+    u32 u = decimal(field, a, lo), v = decimal(a + 1, b, lo);
+    u32 w = decimal(b + 1, c, lo);
+    emit(u, v, w), field = c + 1;
   }
 }
 
@@ -139,12 +147,13 @@ constexpr u32 NONE = ~0u, SPILL = ~1u;
 // Compressed rows of packed edges, head << wbits | weight. A weight that does
 // not fit leaves the field all ones and sits in the escape table.
 struct Graph {
-  u32 n, m, wbits, mask, *off, *adj;
+  static constexpr u32 wbits = 11, mask = (1u << wbits) - 1;
+  u32 n, m, *off, *adj;
   Escapes esc;
   // Allocates the rows unless given storage.
   Graph(u32 n, u32 m, u32 *off = nullptr, u32 *adj = nullptr)
-      : n(n), m(m), wbits(32 - id_bits(n + 1)), mask((1u << wbits) - 1),
-        off(off ? off : alloc<u32>(n + 1)), adj(adj ? adj : alloc<u32>(m)) {}
+      : n(n), m(m), off(off ? off : alloc<u32>(n + 1)),
+        adj(adj ? adj : alloc<u32>(m)) {}
   u32 head(u32 e) const { return e >> wbits; }
   u64 weight(size_t i) const {
     if ((adj[i] & mask) != mask)
@@ -175,31 +184,34 @@ struct __attribute__((packed)) Entry {
 // released together once its rows are built, and the bins shrink while the
 // graph grows. Each worker owns `cap` entries (whole pages) of each group.
 struct alignas(64) Bins {
-  static constexpr u32 CHUNK = 256, GROUP = 16;
-  u32 bits, shift, buckets, cap;
+  static constexpr u32 GROUP = 16, bits = 21, shift = 11;
+  u32 buckets, cap, stride;
   Entry *pool;
-  std::vector<u32> fill, used;
-  std::vector<std::vector<u32>> chunks;
-  std::vector<std::pair<u32, u64>> heavy; // pool index -> weight
-  Bins(u32 n, u32 cap, unsigned t, unsigned workers)
-      : bits(id_bits(n)), shift(std::max(6u, std::min(11u, 32 - bits))),
-        buckets(n >> shift), cap(cap), fill(buckets + 1), chunks(buckets + 1) {
-    for (u32 g = 0; g <= buckets / GROUP; ++g)
-      used.push_back((g * workers + t) * cap);
-  }
+  std::vector<u32> fill;
+  std::vector<std::vector<Entry>> extra;
+  std::vector<std::pair<u64, u64>> heavy;
+  Bins(u32 n, u32 cap, unsigned, unsigned workers)
+      : buckets(n >> shift), cap(cap), stride(workers * cap), fill(buckets + 1),
+        extra(buckets + 1) {}
   void add(u32 u, u32 v, u64 w) {
-    u32 b = u >> shift;
-    if (fill[b] % CHUNK == 0)
-      chunks[b].push_back(fill[b] = used[b / GROUP]), used[b / GROUP] += CHUNK;
+    u32 b = u >> shift, i = fill[b]++;
     if (w >= 0xFFFF)
-      heavy.push_back({fill[b], w});
-    u32 key = (u & ((1u << shift) - 1)) << bits | v;
-    pool[fill[b]++] = {key, uint16_t(std::min<u64>(w, 0xFFFF))};
+      heavy.push_back({u64(b) << 32 | i, w});
+    Entry e{(u & ((1u << shift) - 1)) << bits | v,
+            uint16_t(std::min<u64>(w, 0xFFFF))};
+    if (i < cap)
+      pool[b * stride + i] = e;
+    else
+      extra[b].push_back(e);
   }
   template <class F> void each(u32 b, F f) const {
-    for (u32 c : chunks[b])
-      for (u32 i = c; i < std::min(c + CHUNK, fill[b]); ++i)
-        f(pool[i], i);
+    u32 end = std::min(fill[b], cap);
+    u64 key = u64(b) << 32;
+    const Entry *first = pool + b * stride;
+    for (u32 i = 0; i < end; ++i)
+      f(first[i], key | i);
+    for (u32 i = cap; i < fill[b]; ++i)
+      f(extra[b][i - cap], key | i);
   }
 };
 
@@ -217,19 +229,16 @@ Graph *read_graph(const char *lo, const char *hi, const Bits &terminal,
     const char *x = p + (hi - p) * k / threads;
     return x == p || x == hi ? x : (const char *)memchr(x, '\n', hi - x) + 1;
   };
-  size_t most = 0; // edges any one worker may receive
-  for (unsigned t = 0; t < threads; ++t)
-    most = std::max<size_t>(most, (line(t + 1) - line(t)) / 6);
-  u32 cap = (most / 2048 + 9) * 2048;
+  u32 cap = (m / threads / ((n >> 11) + 1) / 256 + 1) * 256;
   std::vector<Bins> bins;
   for (unsigned t = 0; t < threads; ++t)
     bins.emplace_back(n, cap, t, threads);
   const Bins &shape = bins[0];
   u32 bits = shape.bits, shift = shape.shift, buckets = shape.buckets;
-  Entry *pool = alloc<Entry>(size_t(buckets / Bins::GROUP + 1) * threads * cap);
+  Entry *pool = alloc<Entry>(size_t(buckets + 1) * threads * cap);
   parallel(threads, [&](unsigned t) {
     Bins &bin = bins[t];
-    bin.pool = pool;
+    bin.pool = pool + size_t(t) * cap;
     parse(lo, hi, line(t), line(t + 1),
           [&](u32 u, u32 v, u32 w) { bin.add(u, v, w); });
     std::sort(bin.heavy.begin(), bin.heavy.end());
@@ -267,7 +276,7 @@ Graph *read_graph(const char *lo, const char *hi, const Bits &terminal,
           at[x] = 4 * v;
       }
       for (const Bins &bin : bins)
-        bin.each(b, [&](Entry e, u32 i) {
+        bin.each(b, [&](Entry e, u64 i) {
           u64 w = e.w;
           if (w == 0xFFFF)
             w = std::lower_bound(bin.heavy.begin(), bin.heavy.end(),
@@ -276,8 +285,14 @@ Graph *read_graph(const char *lo, const char *hi, const Bits &terminal,
           g->put(at[e.key >> bits]++, e.key & ((1u << bits) - 1), w,
                  escapes[t]);
         });
-      if (--left[b / Bins::GROUP] == 0)
-        release(pool + size_t(b / Bins::GROUP) * threads * cap, threads * cap);
+      for (Bins &bin : bins)
+        std::vector<Entry>().swap(bin.extra[b]);
+      if (--left[b / Bins::GROUP] == 0) {
+        u32 first = b / Bins::GROUP * Bins::GROUP;
+        release(pool + size_t(first) * threads * cap,
+                size_t(std::min(Bins::GROUP, buckets + 1 - first)) * threads *
+                    cap);
+      }
     }
   });
   g->merge(escapes);
@@ -298,7 +313,8 @@ std::pair<u32, u32> row(const Graph &raw, u32 u) {
 // One worker's share of the search order: vertices in discovery order, the
 // end of each one's out-edges, and those edges with their raw heads.
 struct alignas(64) Region {
-  u32 *order, *ends, *out, len = 0, edges = 0;
+  u32 *order, *out, len = 0, edges = 0;
+  uint8_t *ends;
   Escapes esc; // keyed by position in out
 };
 
@@ -338,13 +354,16 @@ struct Grower {
   // branch ends the walk at a survivor; a dead end or a way back to the root
   // leaves a useless self-loop.
   bool step(Walk &w) {
-    auto [i, end] = row(raw, w.at);
-    u32 ahead = 0, next = w.at, which = i;
-    for (; i < end; ++i) {
-      u32 h = raw.head(raw.adj[i]);
-      if (h != w.prev && h != w.at)
-        ++ahead, next = h, which = i;
-    }
+    // Every active walk is at a bypass vertex, whose raw degree is <= 2.
+    u32 i = 4 * w.at;
+    __m128i edges = _mm_loadu_si128((const __m128i *)(raw.adj + i));
+    __m128i heads = _mm_srl_epi32(edges, _mm_cvtsi32_si128(raw.wbits));
+    __m128i skip = _mm_or_si128(_mm_cmpeq_epi32(heads, _mm_set1_epi32(w.prev)),
+                                _mm_cmpeq_epi32(heads, _mm_set1_epi32(w.at)));
+    skip = _mm_or_si128(skip, _mm_cmpeq_epi32(edges, _mm_set1_epi32(-1)));
+    u32 valid = ~u32(_mm_movemask_ps(_mm_castsi128_ps(skip))) & 3;
+    u32 ahead = (valid & 1) + (valid >> 1), which = i + !(valid & 1);
+    u32 next = raw.head(raw.adj[which]);
     if (ahead > 1) {
       next = w.at;
     } else if (ahead == 0 || next == w.root) {
@@ -384,8 +403,14 @@ struct Grower {
       for (u32 h = hi; h < std::min(reg.len, hi + 2 * BATCH); ++h)
         __builtin_prefetch(&raw.adj[4 * size_t(reg.order[h])]);
       size_t walking = 0;
-      for (u32 h = lo; h < hi; ++h)
-        expand(reg.order[h], walking), reg.ends[h] = reg.edges;
+      for (u32 h = lo; h < hi; ++h) {
+        u32 before = reg.edges;
+        expand(reg.order[h], walking);
+        u32 degree = reg.edges - before;
+        reg.ends[h] = std::min(degree, 255u);
+        if (degree >= 255)
+          reg.esc.push_back({~size_t(0) - h, degree});
+      }
       while (walking) {
         size_t kept = 0;
         for (size_t i = 0; i < walking; ++i)
@@ -452,7 +477,7 @@ std::pair<Graph *, Graph *> contract(Graph *raw, const Bits &bypass,
   std::vector<Region> regions(threads);
   parallel(threads, [&](unsigned t) {
     Region &reg = regions[t];
-    reg.order = alloc<u32>(n), reg.ends = alloc<u32>(n),
+    reg.order = alloc<u32>(n), reg.ends = alloc<uint8_t>(n),
     reg.out = alloc<u32>(m);
     Grower grower{*raw, bypass, claimed, reg};
     for (u32 x = cut(n, t, threads); x < cut(n, t + 1, threads); ++x)
@@ -481,6 +506,10 @@ std::pair<Graph *, Graph *> contract(Graph *raw, const Bits &bypass,
         f(t, std::max(cuts[k], base[t]) - base[t],
           std::min(cuts[k + 1], base[t + 1]) - base[t]);
   };
+  if (mremap(where, (size_t(4) * n + m) * 4 + 64,
+             (size_t(n) + total + edges[threads] + 1) * 4 + 64,
+             0) == MAP_FAILED)
+    exit(2);
   // Raw id -> new id. A vertex claimed twice is named by the entry that lands
   // last, the same for every head.
   parallel(threads, [&](unsigned k) {
@@ -504,12 +533,22 @@ std::pair<Graph *, Graph *> contract(Graph *raw, const Bits &bypass,
     std::fill(rev.r->off + cuts[k], rev.r->off + cuts[k + 1], 0);
     each(k, [&](unsigned t, u32 lo, u32 hi) {
       Region &reg = regions[t];
-      u32 pos = lo ? reg.ends[lo - 1] : 0, shift = edges[t];
+      u32 pos = std::accumulate(reg.ends, reg.ends + lo, 0u), shift = edges[t];
+      for (auto it = std::lower_bound(reg.esc.begin(), reg.esc.end(),
+                                      std::pair(~size_t(0) - reg.len, 0ul));
+           it != reg.esc.end(); ++it)
+        if (~it->first < lo)
+          pos += it->second - 255;
       auto esc = std::lower_bound(reg.esc.begin(), reg.esc.end(),
                                   std::pair(size_t(pos), u64(0)));
       for (u32 i = lo; i < hi; ++i) {
         g->off[base[t] + i] = shift + pos;
-        for (; pos < reg.ends[i]; ++pos) {
+        u32 degree = reg.ends[i];
+        if (degree == 255)
+          degree = std::lower_bound(reg.esc.begin(), reg.esc.end(),
+                                    std::pair(~size_t(0) - i, 0ul))
+                       ->second;
+        for (u32 end = pos + degree; pos < end; ++pos) {
           __builtin_prefetch(
               &where[reg.out[std::min(pos + 24, reg.edges - 1)] >> wbits]);
           u32 e = reg.out[pos], w = e & mask, h = where[e >> wbits];
@@ -540,8 +579,8 @@ std::pair<Graph *, Graph *> contract(Graph *raw, const Bits &bypass,
 // Monotone queue: a ring of buckets 2^shift wide; larger jumps wait in a heap.
 // push always writes the entry but counts it only when `take`, so relaxations
 // need no branch.
-struct Queue {
-  static constexpr u32 B = 2048;
+template <bool BOUNDED> struct Queue {
+  static constexpr u32 B = BOUNDED ? 512 : 2048;
   struct Bucket {
     u32 *data = nullptr, size = 0, cap = 0;
   } bucket[B];
@@ -559,7 +598,7 @@ struct Queue {
     far = {}, cur = near = 0;
   }
   void push(u64 d, u32 v, bool take = true) {
-    if ((d >> shift) - cur >= B) {
+    if (!BOUNDED && (d >> shift) - cur >= B) {
       if (take)
         far.push({d, v});
       return;
@@ -579,14 +618,16 @@ struct Queue {
       u32 b = cur % B, w = b / 64;
       u64 bits = occupied[w] & (~u64(0) << b % 64);
       while (!bits)
-        bits = occupied[w = (w + 1) % (B / 64)];
-      cur += (w * 64 + __builtin_ctzll(bits) - b) % B;
-    } else if (!far.empty()) {
+        bits = occupied[w = BOUNDED ? w + 1 : (w + 1) % (B / 64)];
+      cur = BOUNDED ? w * 64 + __builtin_ctzll(bits)
+                    : cur + (w * 64 + __builtin_ctzll(bits) - b) % B;
+    } else if (!BOUNDED && !far.empty()) {
       cur = far.top().first >> shift;
     } else {
       return INF;
     }
-    for (; !far.empty() && (far.top().first >> shift) - cur < B; far.pop())
+    for (; !BOUNDED && !far.empty() && (far.top().first >> shift) - cur < B;
+         far.pop())
       push(far.top().first, far.top().second);
     return cur << shift;
   }
@@ -600,17 +641,17 @@ template <class L> struct Labels {
   static constexpr L NONE = std::min<u64>(INF, L(-1));
   std::vector<L *> dir;
   std::vector<u32> used;
-  L *store, blank[128];
-  explicit Labels(u32 n) : dir(n / 128 + 1, blank), store(alloc<L>(n + 128)) {
-    std::fill(blank, blank + 128, NONE);
+  L *store, blank[256];
+  explicit Labels(u32 n) : dir(n / 256 + 1, blank), store(alloc<L>(n + 256)) {
+    std::fill(blank, blank + 256, NONE);
   }
-  L *at(u32 v) const { return dir[v / 128] + v % 128; }
+  L *at(u32 v) const { return dir[v / 256] + v % 256; }
   u64 get(u32 v) const { return *at(v); }
   // Any finite distance improves a blank label, so writes go to real pages.
   L *slot(u32 v) {
-    if (dir[v / 128] == blank) {
-      dir[v / 128] = std::fill_n(store + used.size() * 128, 128, NONE) - 128;
-      used.push_back(v / 128);
+    if (dir[v / 256] == blank) {
+      dir[v / 256] = std::fill_n(store + used.size() * 256, 256, NONE) - 256;
+      used.push_back(v / 256);
     }
     return at(v);
   }
@@ -627,7 +668,8 @@ template <class L> struct Labels {
 template <class L> struct Side {
   const Graph &g;
   Labels<L> dist;
-  Queue queue;
+  using QueueType = Queue<sizeof(L) == 2>;
+  QueueType queue;
   explicit Side(const Graph &g) : g(g), dist(g.n), queue(g.n) {}
   void start(u32 s) {
     dist.reset(), queue.clear();
@@ -636,9 +678,9 @@ template <class L> struct Side {
   // Settles the current bucket in FIFO order, prefetching rows and labels of
   // the entries ahead; returns the number of vertices settled. Relaxations are
   // branch-free: nd + other(v) is a real path length either way.
-  template <unsigned W = 0> size_t drain_bits(const Side &other, u64 &best) {
-    Queue::Bucket &bk = queue.bucket[queue.cur % Queue::B];
-    u32 mask = (1u << queue.node_bits) - 1, settled = 0;
+  template <unsigned W = 0> void drain_bits(const Side &other, u64 &best) {
+    typename QueueType::Bucket &bk = queue.bucket[queue.cur % QueueType::B];
+    u32 mask = (1u << queue.node_bits) - 1;
     for (u32 k = 0; k < bk.size; ++k) {
       u32 ahead = bk.data[std::min(k + 8, bk.size - 1)] & mask;
       __builtin_prefetch(&g.off[ahead]), __builtin_prefetch(dist.at(ahead));
@@ -648,7 +690,6 @@ template <class L> struct Side {
       u64 d = queue.cur << queue.shift | bk.data[k] >> queue.node_bits;
       if (dist.get(u) != d)
         continue;
-      ++settled;
       for (u32 i = g.off[u]; i < g.off[u + 1]; ++i) {
         u32 v = g.adj[i] >> (W ? W : g.wbits);
         L *x = dist.slot(v);
@@ -661,12 +702,14 @@ template <class L> struct Side {
       }
     }
     queue.near -= bk.size, bk.size = 0;
-    queue.occupied[queue.cur % Queue::B / 64] &= ~(u64(1) << queue.cur % 64);
-    return settled;
+    queue.occupied[queue.cur % QueueType::B / 64] &=
+        ~(u64(1) << queue.cur % 64);
   }
-  size_t drain(const Side &other, u64 &best) {
-    return g.wbits == 11 ? drain_bits<11>(other, best)
-                         : drain_bits<>(other, best);
+  void drain(const Side &other, u64 &best) {
+    if (g.wbits == 11)
+      drain_bits<11>(other, best);
+    else
+      drain_bits<>(other, best);
   }
 };
 
@@ -681,26 +724,18 @@ template <class L> struct Worker {
       return 0;
     if (fwd.g.off[s] == fwd.g.off[s + 1] || bwd.g.off[t] == bwd.g.off[t + 1])
       return INF;
-    bwd.dist.reset(), fwd.start(s);
-    u64 best = INF, fs = 0, bs = 0;
-    while (fs < 256) {
-      u64 f = fwd.queue.lower_bound(), known = fwd.dist.get(t);
-      if (known < f || f == INF) // t is settled, or the forward side ran out
-        return known < Labels<L>::NONE ? known : INF;
-      fs += fwd.drain(bwd, best);
-    }
-    bwd.start(t);
-    best = fwd.dist.get(t);
+    fwd.start(s), bwd.start(t);
+    u64 best = INF;
     for (;;) {
       u64 f = fwd.queue.lower_bound(), b = bwd.queue.lower_bound();
       if (f == INF || b == INF) // one side has seen all it can reach
         return best < Labels<L>::NONE ? best : INF;
       if (f + b >= best)
         return best;
-      if (fs <= bs)
-        fs += fwd.drain(bwd, best);
+      if (fwd.queue.near <= bwd.queue.near)
+        fwd.drain(bwd, best);
       else
-        bs += bwd.drain(fwd, best);
+        bwd.drain(fwd, best);
     }
   }
 };
@@ -723,6 +758,7 @@ int main() {
   for (u32 v : ends)
     set(terminal, v);
   Graph *raw = read_graph(graph, graph + gsize, terminal, bypass, threads);
+  malloc_trim(0);
   auto [fwd, rev] = contract(raw, bypass, threads, ends);
   size_t queries = ends.size() / 2;
   std::vector<int64_t> answers(queries);

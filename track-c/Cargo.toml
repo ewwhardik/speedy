@@ -1,10 +1,40 @@
 [package]
-name = "solution"
+name = "join"
 version = "0.1.0"
-edition = "2021"
+edition = "2024"
+
+# Zero crates: every dependency costs x0.90 on K (the D axis).
+[dependencies]
 
 [profile.release]
 opt-level = 3
 lto = "fat"
 codegen-units = 1
 panic = "abort"
+
+# Local perf/samply builds only; never the scored image.
+[profile.profiling]
+inherits = "release"
+debug = "line-tables-only"
+
+[lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+
+[lints.clippy]
+undocumented_unsafe_blocks = "deny"
+perf = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+# Offsets, ids and counts are narrowed on purpose: the input is under 4 GiB with under 2^32 lines.
+cast_possible_truncation = "allow"
+# The other `as` casts are exact: digits widened to `u64`, and ids and byte counts, all far below
+# 2^63, made `i64` for the group sums. `From` and `cast_signed` would only lengthen the lines.
+cast_lossless = "allow"
+cast_possible_wrap = "allow"
+# `join` is the whole parallel pipeline, its setup, rounds and tail, and reads best in one place.
+too_many_lines = "allow"
+# Forced only where a measurement showed the call's cost (see `number`).
+inline_always = "allow"
+# `use std::arch::x86_64::*`: the SIMD code takes 27 intrinsics and types from it.
+wildcard_imports = "allow"
+# Zero crates, so no `bytecount`, and the one byte count is on a cold path (`text_fields_slow`).
+naive_bytecount = "allow"

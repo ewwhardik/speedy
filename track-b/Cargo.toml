@@ -1,11 +1,33 @@
 [package]
-name = "solution"
+name = "index"
 version = "0.1.0"
-edition = "2021"
+edition = "2024"
+
+# Zero crates: every dependency costs x0.90 on K (the D axis).
+[dependencies]
 
 [profile.release]
 opt-level = 3
 lto = "fat"
 codegen-units = 1
 panic = "abort"
-strip = true
+
+# Local perf/samply builds only; never the scored image.
+[profile.profiling]
+inherits = "release"
+debug = "line-tables-only"
+
+[lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+
+[lints.clippy]
+undocumented_unsafe_blocks = "deny"
+perf = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+# Offsets, ids and counts are narrowed on purpose: the input is under 4 GiB with under 2^32 lines.
+cast_possible_truncation = "allow"
+# One glob import brings in the intrinsics that `classify`, `Check::matches` and `prefetch` call.
+wildcard_imports = "allow"
+# `TermTable::find_from`, called from the corpus pass and the sample, is not inlined otherwise,
+# which costs 22% more instructions (PERF.md, step 45).
+inline_always = "allow"
