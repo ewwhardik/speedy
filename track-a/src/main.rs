@@ -100,8 +100,11 @@ unsafe fn name_hash(name: *const u8, len: usize) -> u64 {
     // multiply, at about the same cost.
     let key = _mm256_set1_epi64x(0x9E37_79B9_7F4A_7C15u64 as i64);
     let mixed = _mm256_aesenc_epi128(_mm256_aesenc_epi128(mixed, key), mixed);
-    let [a, b, c, d]: [u64; 4] = std::mem::transmute(mixed);
-    (a ^ b ^ c ^ d) | 1 << ID_BITS
+    let [a, b]: [u64; 2] = std::mem::transmute(_mm_xor_si128(
+        _mm256_castsi256_si128(mixed),
+        _mm256_extracti128_si256::<1>(mixed),
+    ));
+    (a ^ b) | 1 << ID_BITS
 }
 
 struct Run {
@@ -434,7 +437,7 @@ impl Run {
         // Out of claims: what is left is hours that wait for the last claims in flight.
         while self.next_hour.load(Relaxed) < HOURS {
             self.advance();
-            std::hint::spin_loop();
+            thread::yield_now();
         }
     }
 }
@@ -514,14 +517,11 @@ fn solve(early: bool) -> bool {
         output: File::create("/out/summary.txt").unwrap(),
         placed: Mutex::new(([None; HOURS], 0, 0)),
     };
-    fn spawn_tree<'a>(scope: &'a thread::Scope<'a, '_>, run: &'a Run, mut n: usize) {
-        while n > 0 {
-            let half = n.div_ceil(2);
-            scope.spawn(move || spawn_tree(scope, run, half - 1));
-            n -= half;
+    thread::scope(|s| {
+        for _ in 1..threads {
+            s.spawn(|| run.work());
         }
         run.work();
-    }
-    thread::scope(|s| spawn_tree(s, &run, threads - 1));
+    });
     run.dirty.load(Relaxed)
 }

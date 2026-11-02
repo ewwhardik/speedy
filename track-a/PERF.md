@@ -23,7 +23,8 @@ Every step from the reference to the final version, each with the live-board run
 | 16 | Reverted step 15 to step 14's hash (commit `6760c28`) | run-f63917923ca9 | 0.0193 | 16.8 | 85.82 |
 | 17 | 128-byte unrolled newline scan (commit `0cbdbb0`) | not recorded | 0.0211 | 18.0 | 84.53 |
 | 18 | Reverted to 32-byte SIMD newline scan (commit `c874389`) | not recorded | 0.0188 | 16.0 | 86.25 |
-| 19 | Binary-tree thread spawn O(log N), spin_loop advance, relaxed slot load | pending | | | |
+| 19 | Binary-tree spawn and spin_loop advance | run-6f0dd2d67c59 | 0.0202 | 16.0 | 85.56 |
+| 20 | Clean thread scope, vector XOR name hash fold, and relaxed slot lookup | pending | | | |
 
 ## How we measure
 
