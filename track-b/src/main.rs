@@ -618,12 +618,15 @@ impl Run {
             let mut m: [u64; 64] =
                 std::array::from_fn(|j| std::mem::take(&mut group[j * words + k]));
             for width in [32usize, 16, 8, 4, 2, 1] {
-                // The bits of a word that sit in the low half of each block of `2 * width`.
                 let mask = u64::MAX / ((1 << width) + 1);
-                for r in (0..64).filter(|r| r & width == 0) {
-                    let t = ((m[r] >> width) ^ m[r + width]) & mask;
-                    m[r + width] ^= t;
-                    m[r] ^= t << width;
+                let mut r = 0;
+                while r < 64 {
+                    for i in 0..width {
+                        let t = ((m[r + i] >> width) ^ m[r + i + width]) & mask;
+                        m[r + i + width] ^= t;
+                        m[r + i] ^= t << width;
+                    }
+                    r += 2 * width;
                 }
             }
             for (t, &bits) in m.iter().enumerate().take(heavy - k * 64) {
@@ -1064,6 +1067,18 @@ fn union(a: &[u16], b: &[u16], out: &mut Vec<u16>) {
 
 /// One step of a BOOL query. The result goes in the scratch list the current set is not in.
 unsafe fn apply(op: Op, current: Set, term: Set, scratch: &mut Scratch) -> Set {
+    if op == Op::And && (matches!(current, Set::List([])) || matches!(term, Set::List([]))) {
+        return Set::List(&[]);
+    }
+    if op == Op::Not && matches!(current, Set::List([])) {
+        return Set::List(&[]);
+    }
+    if op == Op::Or && matches!(term, Set::List([])) {
+        return current;
+    }
+    if op == Op::Or && matches!(current, Set::List([])) {
+        return term;
+    }
     // AND is symmetric: test a list against whatever it is combined with, the shorter list
     // when both are lists.
     let swap = match (op, current, term) {

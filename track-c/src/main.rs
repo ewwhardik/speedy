@@ -37,6 +37,7 @@ extern "C" {
 }
 // MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE
 const MAP_ANON: i32 = 0x4022;
+const HUGE_PAGE: usize = 1 << 21;
 
 // Structural bytes per record: four commas and an LF.
 const FIELDS: usize = 5;
@@ -211,6 +212,10 @@ impl Run {
             let share = descendants.div_ceil(2);
             scope.spawn(move || unsafe { self.start(scope, share - 1) });
             descendants -= share;
+        }
+        let page = NEXT[2].fetch_add(1, Relaxed) * HUGE_PAGE;
+        if page < size_of::<Tables>() {
+            (*(self.2 as *const Tables as *const AtomicU8).add(page)).store(0, Relaxed);
         }
         // Region claims are 64 KiB. Each starts after the first LF at or past its start, so the
         // header goes to nobody and a line belongs to the claim holding the LF before it.
@@ -414,12 +419,13 @@ unsafe fn map(name: &str) -> &'static [u8] {
 }
 
 unsafe fn zeroed<T>() -> &'static T {
-    let region = mmap(null_mut(), size_of::<T>(), 3, MAP_ANON, -1, 0);
-    &*region.cast()
+    let region = mmap(null_mut(), size_of::<T>() + HUGE_PAGE, 3, MAP_ANON, -1, 0);
+    let aligned = region.add(region.align_offset(HUGE_PAGE));
+    madvise(aligned, size_of::<T>(), 14); // MADV_HUGEPAGE
+    &*aligned.cast()
 }
 
 fn main() {
-    unsafe { prctl(41, 1usize, 0usize, 0usize, 0usize) };
     let n = thread::available_parallelism().map_or(12, |n| n.get());
     COUNTRIES.lock().unwrap().push("_UNMATCHED".into());
     let run = unsafe { Run(map("records"), map("regions"), zeroed(), Barrier::new(n)) };
