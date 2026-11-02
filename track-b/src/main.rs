@@ -1067,18 +1067,6 @@ fn union(a: &[u16], b: &[u16], out: &mut Vec<u16>) {
 
 /// One step of a BOOL query. The result goes in the scratch list the current set is not in.
 unsafe fn apply(op: Op, current: Set, term: Set, scratch: &mut Scratch) -> Set {
-    if op == Op::And && (matches!(current, Set::List([])) || matches!(term, Set::List([]))) {
-        return Set::List(&[]);
-    }
-    if op == Op::Not && matches!(current, Set::List([])) {
-        return Set::List(&[]);
-    }
-    if op == Op::Or && matches!(term, Set::List([])) {
-        return current;
-    }
-    if op == Op::Or && matches!(current, Set::List([])) {
-        return term;
-    }
     // AND is symmetric: test a list against whatever it is combined with, the shorter list
     // when both are lists.
     let swap = match (op, current, term) {
