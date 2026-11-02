@@ -53,7 +53,7 @@ const HEADER: usize = 1;
 // Slices each of the phrase plan and the bucket plan is cut into.
 const JOBS: usize = 16;
 const TALLY_IDS: usize = 10;
-const BATCH: usize = 1 << 14; // bytes of text between the token pass and the term pass
+const BATCH: usize = 1 << 15; // bytes of text between the token pass and the term pass
 const BUCKETS: usize = 1 << 15;
 const BUCKET_SLOTS: usize = 7;
 const ID_BLOCK: usize = 32; // term ids a thread takes at once while parsing queries
@@ -442,21 +442,21 @@ impl Run {
                     line_count += 1;
                     breaks &= breaks - 1;
                 }
-                // Unconditional stores, so a varying token count needs no loop to predict. Eleven
+                // Unconditional stores, so a varying token count needs no loop to predict. Twelve
                 // cover almost every 64-byte step; the loops after take the rare rest.
                 let (found, ended) = (opened.count_ones() as usize, closed.count_ones() as usize);
                 let first_in = |bits: u64| (at + bits.trailing_zeros() as usize) as u32;
-                for extra in 0..11 {
+                for extra in 0..12 {
                     *b.starts.get_unchecked_mut(token_count + extra) = first_in(opened);
                     *b.ends.get_unchecked_mut(end_count + extra) = first_in(closed);
                     opened &= opened.wrapping_sub(1);
                     closed &= closed.wrapping_sub(1);
                 }
-                for extra in 11..found {
+                for extra in 12..found {
                     b.starts[token_count + extra] = first_in(opened);
                     opened &= opened - 1;
                 }
-                for extra in 11..ended {
+                for extra in 12..ended {
                     b.ends[end_count + extra] = first_in(closed);
                     closed &= closed - 1;
                 }
