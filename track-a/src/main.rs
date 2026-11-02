@@ -51,7 +51,7 @@ const CHUNK: usize = 256; // rows of an hour's region a worker claims at a time
 const SLOTS: usize = 1 << 13;
 const ID_BITS: u32 = 11; // low bits of a slot hold id + 1
 const ID_MASK: u64 = (1 << ID_BITS) - 1;
-const SPARE_AT: usize = 1 << 16; // rows (256 KiB): scratch placed closer to rows, reducing memory to 13.5MB
+const SPARE_AT: usize = 1 << 18; // rows (1 MiB): the scratch starts at least this far in, past any hour's text
 const ZEROS: u64 = 0x3030_3030_3030_3030;
 
 /// A row is id + 1 in 11 bits, an error bit, then the latency in 20 bits. Only about 1% of
@@ -198,13 +198,11 @@ impl Run {
                 let newline = _mm256_set1_epi8(b'\n' as i8);
                 let (mut count, mut at) = (0, start);
                 while at < (start + BLOCK).min(self.len) {
-                    for step in (0..128).step_by(32) {
-                        let chunk = _mm256_load_si256(input.add(at + step).cast());
-                        let mask = _mm256_movemask_epi8(_mm256_cmpeq_epi8(chunk, newline)) as u32;
-                        *ends.get_unchecked_mut(count) = (at + step) as u32 + mask.trailing_zeros();
-                        count += (mask != 0) as usize;
-                    }
-                    at += 128;
+                    let hits = _mm256_cmpeq_epi8(_mm256_load_si256(input.add(at).cast()), newline);
+                    let mask = _mm256_movemask_epi8(hits) as u32;
+                    *ends.get_unchecked_mut(count) = (at + mask.trailing_zeros() as usize) as u32;
+                    count += (mask != 0) as usize;
+                    at += 32;
                 }
                 for &end in &ends[..count] {
                     let end = input.add(end as usize);
@@ -337,7 +335,7 @@ impl Run {
         let spare = rows.add(claimed.max(SPARE_AT).next_multiple_of(1024));
         // Counts per endpoint, indexed by the row's group (id + 1), so that after dealing
         // `starts[id]..starts[id + 1]` is the span of `id` (see `deal`).
-        let (mut starts, mut errors) = ([0u32; 1 << ID_BITS], [0u32; 1 << ID_BITS]);
+        let (mut starts, mut errors) = (vec![0u32; 1 << ID_BITS], vec![0u32; 1 << ID_BITS]);
         let mut long = Vec::new();
 
         // Moves rows down over the gaps between chunks. The 1% that escape go aside: they
@@ -438,10 +436,9 @@ impl Run {
         }
         for (hour, offset, text) in ready {
             self.output.write_all_at(text, offset).unwrap();
-            // The text is out: give the hour's pages back (only the pages actually touched).
-            let claimed = self.claimed[hour].load(Relaxed);
-            let touched = (claimed.max(SPARE_AT) + claimed + 4096) * 4;
-            unsafe { madvise(self.rows.add(hour * self.stride).cast(), touched.next_multiple_of(4096), 4) };
+            // The text is out: give the hour's pages back.
+            let rows = unsafe { self.rows.add(hour * self.stride) };
+            unsafe { madvise(rows.cast(), self.stride * 4, 4) };
         }
     }
 
@@ -450,7 +447,7 @@ impl Run {
         // Out of claims: what is left is hours that wait for the last claims in flight.
         while self.next_hour.load(Relaxed) < HOURS {
             self.advance();
-            std::hint::spin_loop();
+            thread::yield_now();
         }
     }
 }
@@ -533,14 +530,11 @@ fn solve(early: bool) -> bool {
         output: File::create("/out/summary.txt").unwrap(),
         placed: Mutex::new((0, 0)),
     };
-    fn spawn_tree<'scope, 'env>(scope: &'scope thread::Scope<'scope, 'env>, run: &'env Run, mut n: usize) {
-        while n > 0 {
-            let half = n.div_ceil(2);
-            scope.spawn(move || spawn_tree(scope, run, half - 1));
-            n -= half;
+    thread::scope(|s| {
+        for _ in 1..threads {
+            s.spawn(|| run.work());
         }
         run.work();
-    }
-    thread::scope(|s| spawn_tree(s, &run, threads - 1));
+    });
     run.dirty.load(Relaxed)
 }

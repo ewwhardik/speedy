@@ -144,9 +144,7 @@ struct Tally {
 
 impl Tally {
     /// Adds a phase's result as a list of ids relative to the phase's first document.
-    #[inline(always)]
     fn add_list(&mut self, base: u32, list: &[u16]) {
-        if list.is_empty() { return; }
         let sum = list.iter().map(|&doc| doc as u64).sum();
         let ids = list.iter().map(|&doc| doc as u32);
         self.add(base, list.len() as u64, sum, ids);
@@ -355,29 +353,6 @@ unsafe fn action_in(buckets: *const Bucket, hash: u64) -> u32 {
 }
 
 #[inline(always)]
-unsafe fn action_pair(buckets: *const Bucket, h0: u64, h1: u64) -> (u32, u32) {
-    let b0 = buckets.add(bucket_of(h0));
-    let b1 = buckets.add(bucket_of(h1));
-    let w0 = _mm256_set1_epi32(h0 as i32);
-    let w1 = _mm256_set1_epi32(h1 as i32);
-    let l0 = _mm256_load_si256(b0.cast());
-    let l1 = _mm256_load_si256(b1.cast());
-    let s0 = _mm256_cmpeq_epi32(l0, w0);
-    let s1 = _mm256_cmpeq_epi32(l1, w1);
-    let f0 = _mm256_movemask_ps(_mm256_castsi256_ps(s0)) as u32 | 1 << BUCKET_SLOTS;
-    let f1 = _mm256_movemask_ps(_mm256_castsi256_ps(s1)) as u32 | 1 << BUCKET_SLOTS;
-    let mut a0 = (*b0).actions[f0.trailing_zeros() as usize];
-    let mut a1 = (*b1).actions[f1.trailing_zeros() as usize];
-    if a0 == OVERFLOW {
-        a0 = Run::action_past(buckets, h0);
-    }
-    if a1 == OVERFLOW {
-        a1 = Run::action_past(buckets, h1);
-    }
-    (a0, a1)
-}
-
-#[inline(always)]
 fn bucket_of(hash: u64) -> usize {
     (hash >> (64 - BUCKETS.ilog2())) as usize
 }
@@ -502,33 +477,6 @@ impl Run {
                 (b.starts.as_ptr(), b.ends.as_ptr(), b.hashes.as_mut_ptr());
             let span = |i: usize| (*starts.add(i) as usize, *ends.add(i) as usize);
             let mut i = token;
-            while i + 3 < ready {
-                let (from_a, to_a) = span(i);
-                let (from_b, to_b) = span(i + 1);
-                let (from_c, to_c) = span(i + 2);
-                let (from_d, to_d) = span(i + 3);
-                let (len_a, len_b, len_c, len_d) =
-                    (to_a - from_a, to_b - from_b, to_c - from_c, to_d - from_d);
-                if (len_a | len_b | len_c | len_d) <= 16 {
-                    let (a, b) = (text.add(from_a), text.add(from_b));
-                    let (c, d) = (text.add(from_c), text.add(from_d));
-                    let (h0, h1) = hash_pair(a, len_a, b, len_b);
-                    let (h2, h3) = hash_pair(c, len_c, d, len_d);
-                    *hashes.add(i) = h0;
-                    *hashes.add(i + 1) = h1;
-                    *hashes.add(i + 2) = h2;
-                    *hashes.add(i + 3) = h3;
-                    i += 4;
-                    continue;
-                }
-                let (a, b) = (text.add(from_a), text.add(from_b));
-                (*hashes.add(i), *hashes.add(i + 1)) = if (len_a | len_b) > 16 {
-                    (hash_of(a, len_a), hash_of(b, len_b))
-                } else {
-                    hash_pair(a, len_a, b, len_b)
-                };
-                i += 2;
-            }
             while i + 1 < ready {
                 let (from_a, to_a) = span(i);
                 let (from_b, to_b) = span(i + 1);
@@ -553,41 +501,17 @@ impl Run {
             let (heavy_hits, list_hits) = (b.heavy_hits.as_mut_ptr(), b.list_hits.as_mut_ptr());
             for line in 0..line_count {
                 let to = b.lines[line] as usize;
-                while token + 1 < to {
-                    let ahead0 = bucket_of(*hashes.add(token + AHEAD));
-                    let ahead1 = bucket_of(*hashes.add(token + AHEAD + 1));
-                    _mm_prefetch::<_MM_HINT_T0>(buckets.add(ahead0).cast());
-                    _mm_prefetch::<_MM_HINT_T0>(buckets.add(ahead1).cast());
-                    let (act0, act1) =
-                        action_pair(buckets, *hashes.add(token), *hashes.add(token + 1));
-                    *heavy_hits.add(heavy_count) = act0;
-                    heavy_count += (act0 >> 31) as usize;
-                    *list_hits.add(list_count) = (act0 as u64) << 32 | doc as u64;
-                    list_count += (act0.wrapping_sub(1) < HEAVY - 1) as usize;
-                    if act0 & ANCHOR != 0 {
-                        *b.anchor_hits.get_unchecked_mut(anchor_count) =
-                            (act0 as u64) << 40 | (doc as u64) << 20 | token as u64;
-                        anchor_count += 1;
-                    }
-                    *heavy_hits.add(heavy_count) = act1;
-                    heavy_count += (act1 >> 31) as usize;
-                    *list_hits.add(list_count) = (act1 as u64) << 32 | doc as u64;
-                    list_count += (act1.wrapping_sub(1) < HEAVY - 1) as usize;
-                    if act1 & ANCHOR != 0 {
-                        *b.anchor_hits.get_unchecked_mut(anchor_count) =
-                            (act1 as u64) << 40 | (doc as u64) << 20 | (token + 1) as u64;
-                        anchor_count += 1;
-                    }
-                    token += 2;
-                }
                 while token < to {
                     let ahead = bucket_of(*hashes.add(token + AHEAD));
                     _mm_prefetch::<_MM_HINT_T0>(buckets.add(ahead).cast());
                     let action = action_in(buckets, *hashes.add(token));
+                    // All three stores happen, and only the right counts move.
                     *heavy_hits.add(heavy_count) = action;
                     heavy_count += (action >> 31) as usize;
                     *list_hits.add(list_count) = (action as u64) << 32 | doc as u64;
+                    // A term id + 1, with or without ANCHOR: not 0 and not HEAVY.
                     list_count += (action.wrapping_sub(1) < HEAVY - 1) as usize;
+                    // Rare enough to predict: about 1 token in 150 starts a phrase check.
                     if action & ANCHOR != 0 {
                         *b.anchor_hits.get_unchecked_mut(anchor_count) =
                             (action as u64) << 40 | (doc as u64) << 20 | token as u64;
@@ -806,21 +730,23 @@ impl Run {
         for id in (shard..term_count).step_by(SHARDS) {
             (*self.terms.add(id)).count = 0;
         }
-        let mut cursors = [0u32; 4096];
+        let mut cursors = vec![0u32; terms];
         for_rows(region, &chunks, |low, _| {
             *cursors.get_unchecked_mut(low) += 1
         });
-        let lists = cursors[..terms].iter().filter(|&&size| size > 0).count();
-        let total = cursors[..terms].iter().sum::<u32>() as usize + lists * HEADER;
+        // Until a list is complete its sentinel slot holds u16::MAX, so a document can always
+        // be compared with the one before it. A term repeats within a document, but a
+        // document's rows are adjacent.
+        let lists = cursors.iter().filter(|&&size| size > 0).count();
+        let total = cursors.iter().sum::<u32>() as usize + lists * HEADER;
         let mut at = self.phase[phase][3].fetch_add(total, Relaxed) as u32;
-        for cursor in cursors[..terms].iter_mut().filter(|cursor| **cursor > 0) {
+        for cursor in cursors.iter_mut().filter(|cursor| **cursor > 0) {
             let size = *cursor;
             *cursor = at + HEADER as u32;
             *self.postings.add(*cursor as usize - 1) = u16::MAX;
             at += size + HEADER as u32;
         }
-        let mut firsts = [0u32; 4096];
-        firsts[..terms].copy_from_slice(&cursors[..terms]);
+        let firsts = cursors.clone();
         for_rows(region, &chunks, |low, doc| {
             let cursor = cursors.get_unchecked_mut(low);
             let slot = self.postings.add(*cursor as usize);
@@ -901,12 +827,6 @@ impl Run {
             prefetch(index + 1, true);
             let steps = steps_of(index);
             let tally = &mut *tallies.add(index);
-            if steps.len() == 1 {
-                let info = &*self.terms.add(steps[0].1 as usize);
-                if !info.heavy && info.count == 0 {
-                    continue;
-                }
-            }
             match self.answer_bool(steps, phase, scratch) {
                 Set::List(list) => tally.add_list(base, list),
                 Set::Bits(bits) => tally.add_bits(base, bits),
@@ -1104,56 +1024,29 @@ unsafe fn aligned_line(text: &[u8], docs: usize, at: usize) -> (usize, usize) {
 /// which is all zeros between calls, and the other is tested against the marks and the marks
 /// cleared again. Both write every value and move the count only for a kept one, so neither
 /// branches on the data.
-unsafe fn filter_by(a: &[u16], b: &[u16], keep: bool, out: &mut Vec<u16>, _marks: &mut [u64]) {
+unsafe fn filter_by(a: &[u16], b: &[u16], keep: bool, out: &mut Vec<u16>, marks: &mut [u64]) {
     out.reserve(a.len().max(b.len()));
     let target = out.as_mut_ptr();
     let mut found = 0;
+    // A list 16 times shorter is searched for, not marked.
     if a.len() * 16 <= b.len() {
         for &doc in a {
             let present = b.binary_search(&doc).is_ok();
             *target.add(found) = doc;
             found += (present == keep) as usize;
         }
-    } else if b.len() * 16 <= a.len() && keep {
-        for &doc in b {
-            let present = a.binary_search(&doc).is_ok();
-            *target.add(found) = doc;
-            found += present as usize;
-        }
-    } else if keep {
-        let (mut ia, mut ib) = (0, 0);
-        while ia < a.len() && ib < b.len() {
-            let (da, db) = (*a.get_unchecked(ia), *b.get_unchecked(ib));
-            if da == db {
-                *target.add(found) = da;
-                found += 1;
-                ia += 1;
-                ib += 1;
-            } else if da < db {
-                ia += 1;
-            } else {
-                ib += 1;
-            }
-        }
     } else {
-        let (mut ia, mut ib) = (0, 0);
-        while ia < a.len() && ib < b.len() {
-            let (da, db) = (*a.get_unchecked(ia), *b.get_unchecked(ib));
-            if da == db {
-                ia += 1;
-                ib += 1;
-            } else if da < db {
-                *target.add(found) = da;
-                found += 1;
-                ia += 1;
-            } else {
-                ib += 1;
-            }
+        let (marked, tested) = if keep { (a, b) } else { (b, a) };
+        for &doc in marked {
+            *marks.get_unchecked_mut(doc as usize / 64) |= 1 << (doc % 64);
         }
-        while ia < a.len() {
-            *target.add(found) = *a.get_unchecked(ia);
-            found += 1;
-            ia += 1;
+        for &doc in tested {
+            let present = *marks.get_unchecked(doc as usize / 64) >> (doc % 64) & 1;
+            *target.add(found) = doc;
+            found += (present == keep as u64) as usize;
+        }
+        for &doc in marked {
+            *marks.get_unchecked_mut(doc as usize / 64) = 0;
         }
     }
     out.set_len(found);
