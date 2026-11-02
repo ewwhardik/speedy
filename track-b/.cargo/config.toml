@@ -1,8 +1,2 @@
-# alderlake = Raptor Lake's feature set (AVX2, BMI2, PCLMULQDQ). Never `native`: the board builds
-# on a different host (Depot, AVX-512) and `native` reroutes builds to the box's E-cores.
-# Every loop starts on a 64-byte boundary, so the pass's hot loops keep their speed when a change
-# elsewhere moves their function (PERF.md, step 21).
-# crt-static and relocation-model=static: a plain static executable at a fixed address, with no
-# dynamic loader and no position-independent code (PERF.md, step 30).
 [build]
-rustflags = ["-C", "target-cpu=alderlake", "-C", "llvm-args=-align-loops=64", "-C", "target-feature=+crt-static", "-C", "relocation-model=static"]
+rustflags = ["-C", "target-cpu=x86-64-v3", "-C", "target-feature=+aes,+vaes,+crt-static", "-C", "relocation-model=static"]
