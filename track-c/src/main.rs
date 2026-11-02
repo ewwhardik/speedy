@@ -38,7 +38,6 @@ extern "C" {
 // MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE
 const MAP_ANON: i32 = 0x4022;
 
-const HUGE_PAGE: usize = 1 << 21;
 // Structural bytes per record: four commas and an LF.
 const FIELDS: usize = 5;
 // A batch is 32 steps of 64 bytes of the file. Records that fit in one (the shortest is
@@ -179,7 +178,7 @@ impl Run {
     /// no lock is needed. A worker that loses a race to the same name wastes one number.
     #[cold]
     unsafe fn insert(&self, index: usize, tag: u64, spare: &mut Range<usize>) -> usize {
-        if spare.is_empty() {
+        if spare.start >= spare.end {
             // Name numbers are reserved 32 at a time.
             let first = NEXT[3].fetch_add(32, Relaxed);
             *spare = first..first + 32;
@@ -212,12 +211,6 @@ impl Run {
             let share = descendants.div_ceil(2);
             scope.spawn(move || unsafe { self.start(scope, share - 1) });
             descendants -= share;
-        }
-        // Zeroing a huge page takes a few hundred microseconds, so the workers share it and do
-        // it while the regions load. It must end before huge pages are disabled.
-        let page = NEXT[2].fetch_add(1, Relaxed) * HUGE_PAGE;
-        if page < size_of::<Tables>() {
-            (*(self.2 as *const Tables as *const AtomicU8).add(page)).store(0, Relaxed);
         }
         // Region claims are 64 KiB. Each starts after the first LF at or past its start, so the
         // header goes to nobody and a line belongs to the claim holding the LF before it.
@@ -288,9 +281,26 @@ impl Run {
                     // Unconditional stores, so that a varying count needs no loop exit to
                     // predict. Eight cover almost every step.
                     let found = bits.count_ones() as usize;
-                    let mut extra = 0;
-                    while extra < 8 || bits != 0 {
-                        *pos.get_unchecked_mut(filled + extra) = at as u32 + bits.trailing_zeros();
+                    let p = pos.as_mut_ptr().add(filled);
+                    *p.add(0) = at as u32 + bits.trailing_zeros();
+                    bits &= bits.wrapping_sub(1);
+                    *p.add(1) = at as u32 + bits.trailing_zeros();
+                    bits &= bits.wrapping_sub(1);
+                    *p.add(2) = at as u32 + bits.trailing_zeros();
+                    bits &= bits.wrapping_sub(1);
+                    *p.add(3) = at as u32 + bits.trailing_zeros();
+                    bits &= bits.wrapping_sub(1);
+                    *p.add(4) = at as u32 + bits.trailing_zeros();
+                    bits &= bits.wrapping_sub(1);
+                    *p.add(5) = at as u32 + bits.trailing_zeros();
+                    bits &= bits.wrapping_sub(1);
+                    *p.add(6) = at as u32 + bits.trailing_zeros();
+                    bits &= bits.wrapping_sub(1);
+                    *p.add(7) = at as u32 + bits.trailing_zeros();
+                    bits &= bits.wrapping_sub(1);
+                    let mut extra = 8;
+                    while bits != 0 {
+                        *p.add(extra) = at as u32 + bits.trailing_zeros();
                         bits &= bits.wrapping_sub(1);
                         extra += 1;
                     }
@@ -366,14 +376,12 @@ impl Run {
                     s[4] = s[4].max(BIAS + amount);
                     s[5] = s[5].max(BIAS - amount);
                     let name = self.intern(hashes[at], &mut spare);
-                    let word = group * SEEN_WORDS + name / 64;
-                    _mm_prefetch::<_MM_HINT_ET0>(self.2 .1.as_ptr().add(word).cast());
-                    // The hash is done with, so its slot carries the bit's address to the next pass.
-                    hashes[at] = (word << 6 | name % 64) as u64;
-                }
-                for &bit in &hashes[..count] {
-                    let word = self.2 .1.get_unchecked((bit >> 6) as usize);
-                    word.fetch_or(1 << (bit & 63), Relaxed);
+                    let word_idx = group * SEEN_WORDS + name / 64;
+                    let mask = 1u64 << (name % 64);
+                    let word = self.2 .1.get_unchecked(word_idx);
+                    if word.load(Relaxed) & mask == 0 {
+                        word.fetch_or(mask, Relaxed);
+                    }
                 }
 
                 pos.copy_within(count * FIELDS..filled, 0);
@@ -405,17 +413,13 @@ unsafe fn map(name: &str) -> &'static [u8] {
     slice::from_raw_parts(base, len)
 }
 
-/// A zeroed table of whole huge pages, which must start on a huge page boundary to get any. Its
-/// pages are touched later by the workers, because huge pages are disabled for everything else
-/// before the records start.
 unsafe fn zeroed<T>() -> &'static T {
-    let region = mmap(null_mut(), size_of::<T>() + HUGE_PAGE, 3, MAP_ANON, -1, 0); // read, write
-    let aligned = region.add(region.align_offset(HUGE_PAGE));
-    madvise(aligned, size_of::<T>(), 14); // MADV_HUGEPAGE
-    &*aligned.cast()
+    let region = mmap(null_mut(), size_of::<T>(), 3, MAP_ANON, -1, 0);
+    &*region.cast()
 }
 
 fn main() {
+    unsafe { prctl(41, 1usize, 0usize, 0usize, 0usize) };
     let n = thread::available_parallelism().map_or(12, |n| n.get());
     COUNTRIES.lock().unwrap().push("_UNMATCHED".into());
     let run = unsafe { Run(map("records"), map("regions"), zeroed(), Barrier::new(n)) };

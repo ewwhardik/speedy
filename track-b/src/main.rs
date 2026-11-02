@@ -200,16 +200,24 @@ impl Tally {
             };
             (total(counts), total(sums) + total(starts) + total(offsets))
         };
-        let ids = bits
-            .iter()
-            .enumerate()
-            .filter(|(_, &word)| word != 0)
-            .flat_map(|(index, &word)| {
-                (0..64)
-                    .filter(move |bit| word >> bit & 1 == 1)
-                    .map(move |bit| index as u32 * 64 + bit)
-            });
-        self.add(base, count, sum, ids);
+        let needed = TALLY_IDS.saturating_sub(self.count as usize);
+        if needed > 0 {
+            let mut extracted = 0;
+            'outer: for (idx, &w) in bits.iter().enumerate() {
+                let mut word = w;
+                while word != 0 {
+                    let bit = word.trailing_zeros();
+                    self.first[self.count as usize + extracted] = base + idx as u32 * 64 + bit;
+                    extracted += 1;
+                    if extracted >= needed {
+                        break 'outer;
+                    }
+                    word &= word - 1;
+                }
+            }
+        }
+        self.count += count as u32;
+        self.sum += sum + base as u64 * count;
     }
 
     fn write(&self, out: &mut Vec<u8>) {
@@ -1105,15 +1113,23 @@ unsafe fn apply(op: Op, current: Set, term: Set, scratch: &mut Scratch) -> Set {
             }
             match b {
                 Set::List(docs) => mark(bits, docs, op == Op::Not),
-                Set::Bits(other) => {
-                    for (word, &other) in bits.iter_mut().zip(other) {
-                        *word = match op {
-                            Op::And => *word & other,
-                            Op::Or => *word | other,
-                            Op::Not => *word & !other,
-                        };
+                Set::Bits(other) => match op {
+                    Op::And => {
+                        for (word, &other) in bits.iter_mut().zip(other) {
+                            *word &= other;
+                        }
                     }
-                }
+                    Op::Or => {
+                        for (word, &other) in bits.iter_mut().zip(other) {
+                            *word |= other;
+                        }
+                    }
+                    Op::Not => {
+                        for (word, &other) in bits.iter_mut().zip(other) {
+                            *word &= !other;
+                        }
+                    }
+                },
             }
             return Set::Bits(std::slice::from_raw_parts(bits.as_ptr(), words));
         }
