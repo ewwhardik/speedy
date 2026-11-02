@@ -22,7 +22,8 @@ Every step from the reference to the final version, each with the live-board run
 | 15 | `add_bits` zero-block skip, `MAX_HEAVY` 4096 → 1024, postings and bitmaps on 4 KiB pages (commit `ad8a1c5`) | not recorded | 0.0970 | 42.3 | 78.15 |
 | 16 | Reverted step 15 to step 14's code (commit `6760c28`) | run-e1e0015ad1e9 | 0.0922 | 42.8 | 78.73 |
 | 17 | Unchanged code, re-run by a push to other tracks (commit `0cbdbb0`) | run-d558ec5e6137 | 0.0954 | 42.1 | 78.37 |
-| 18 | `MAX_HEAVY` 4096 → 1024 keeping huge-page postings; drops bitmap footprint by 39MB | pending | | | |
+| 18 | `MAX_HEAVY` 4096 → 1024 keeping huge-page postings (commit `595ab02`) | not recorded | 0.0923 | 40.3 | 78.72 |
+| 19 | 4-token pipelined VAES hashing and dual-token `action_pair` SIMD bucket lookup | pending | | | |
 
 ## How we measure
 

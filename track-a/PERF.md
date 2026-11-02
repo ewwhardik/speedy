@@ -21,7 +21,9 @@ Every step from the reference to the final version, each with the live-board run
 | 14 | Streaming hour sealer: summarise and write hours while the file is still being parsed (commit `10d0d7f`) | run-4c3240252365 | 0.0190 | 16.0 | 86.21 |
 | 15 | CRC32 endpoint hash instead of two `vaesenc` rounds (commits `b70bc0b`, `cd511e1`; measured at `ad8a1c5`) | not recorded | 0.0220 | 15.8 | 84.67 |
 | 16 | Reverted step 15 to step 14's hash (commit `6760c28`) | run-f63917923ca9 | 0.0193 | 16.8 | 85.82 |
-| 17 | 128-byte unrolled newline scan (lab: -1.1% to -2.9%), see the board A/B below | | | | |
+| 17 | 128-byte unrolled newline scan (commit `0cbdbb0`) | not recorded | 0.0211 | 18.0 | 84.53 |
+| 18 | Reverted to 32-byte SIMD newline scan (commit `c874389`) | not recorded | 0.0188 | 16.0 | 86.25 |
+| 19 | Binary-tree thread spawn O(log N), spin_loop advance, relaxed slot load | pending | | | |
 
 ## How we measure
 

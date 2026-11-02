@@ -140,7 +140,7 @@ impl Run {
         let hash = name_hash(name, len);
         let mut i = (hash >> (64 - SLOTS.trailing_zeros())) as usize;
         loop {
-            let slot = self.slots[i].load(Acquire);
+            let slot = self.slots[i].load(Relaxed);
             if slot >> ID_BITS == hash >> ID_BITS {
                 return (slot & ID_MASK) as u32;
             } else if slot == 0 {
@@ -434,7 +434,7 @@ impl Run {
         // Out of claims: what is left is hours that wait for the last claims in flight.
         while self.next_hour.load(Relaxed) < HOURS {
             self.advance();
-            thread::yield_now();
+            std::hint::spin_loop();
         }
     }
 }
@@ -514,11 +514,14 @@ fn solve(early: bool) -> bool {
         output: File::create("/out/summary.txt").unwrap(),
         placed: Mutex::new(([None; HOURS], 0, 0)),
     };
-    thread::scope(|s| {
-        for _ in 1..threads {
-            s.spawn(|| run.work());
+    fn spawn_tree<'a>(scope: &'a thread::Scope<'a, '_>, run: &'a Run, mut n: usize) {
+        while n > 0 {
+            let half = n.div_ceil(2);
+            scope.spawn(move || spawn_tree(scope, run, half - 1));
+            n -= half;
         }
         run.work();
-    });
+    }
+    thread::scope(|s| spawn_tree(s, &run, threads - 1));
     run.dirty.load(Relaxed)
 }

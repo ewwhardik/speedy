@@ -353,6 +353,29 @@ unsafe fn action_in(buckets: *const Bucket, hash: u64) -> u32 {
 }
 
 #[inline(always)]
+unsafe fn action_pair(buckets: *const Bucket, h0: u64, h1: u64) -> (u32, u32) {
+    let b0 = buckets.add(bucket_of(h0));
+    let b1 = buckets.add(bucket_of(h1));
+    let w0 = _mm256_set1_epi32(h0 as i32);
+    let w1 = _mm256_set1_epi32(h1 as i32);
+    let l0 = _mm256_load_si256(b0.cast());
+    let l1 = _mm256_load_si256(b1.cast());
+    let s0 = _mm256_cmpeq_epi32(l0, w0);
+    let s1 = _mm256_cmpeq_epi32(l1, w1);
+    let f0 = _mm256_movemask_ps(_mm256_castsi256_ps(s0)) as u32 | 1 << BUCKET_SLOTS;
+    let f1 = _mm256_movemask_ps(_mm256_castsi256_ps(s1)) as u32 | 1 << BUCKET_SLOTS;
+    let mut a0 = (*b0).actions[f0.trailing_zeros() as usize];
+    let mut a1 = (*b1).actions[f1.trailing_zeros() as usize];
+    if a0 == OVERFLOW {
+        a0 = Run::action_past(buckets, h0);
+    }
+    if a1 == OVERFLOW {
+        a1 = Run::action_past(buckets, h1);
+    }
+    (a0, a1)
+}
+
+#[inline(always)]
 fn bucket_of(hash: u64) -> usize {
     (hash >> (64 - BUCKETS.ilog2())) as usize
 }
@@ -477,6 +500,33 @@ impl Run {
                 (b.starts.as_ptr(), b.ends.as_ptr(), b.hashes.as_mut_ptr());
             let span = |i: usize| (*starts.add(i) as usize, *ends.add(i) as usize);
             let mut i = token;
+            while i + 3 < ready {
+                let (from_a, to_a) = span(i);
+                let (from_b, to_b) = span(i + 1);
+                let (from_c, to_c) = span(i + 2);
+                let (from_d, to_d) = span(i + 3);
+                let (len_a, len_b, len_c, len_d) =
+                    (to_a - from_a, to_b - from_b, to_c - from_c, to_d - from_d);
+                if (len_a | len_b | len_c | len_d) <= 16 {
+                    let (a, b) = (text.add(from_a), text.add(from_b));
+                    let (c, d) = (text.add(from_c), text.add(from_d));
+                    let (h0, h1) = hash_pair(a, len_a, b, len_b);
+                    let (h2, h3) = hash_pair(c, len_c, d, len_d);
+                    *hashes.add(i) = h0;
+                    *hashes.add(i + 1) = h1;
+                    *hashes.add(i + 2) = h2;
+                    *hashes.add(i + 3) = h3;
+                    i += 4;
+                    continue;
+                }
+                let (a, b) = (text.add(from_a), text.add(from_b));
+                (*hashes.add(i), *hashes.add(i + 1)) = if (len_a | len_b) > 16 {
+                    (hash_of(a, len_a), hash_of(b, len_b))
+                } else {
+                    hash_pair(a, len_a, b, len_b)
+                };
+                i += 2;
+            }
             while i + 1 < ready {
                 let (from_a, to_a) = span(i);
                 let (from_b, to_b) = span(i + 1);
@@ -501,17 +551,41 @@ impl Run {
             let (heavy_hits, list_hits) = (b.heavy_hits.as_mut_ptr(), b.list_hits.as_mut_ptr());
             for line in 0..line_count {
                 let to = b.lines[line] as usize;
+                while token + 1 < to {
+                    let ahead0 = bucket_of(*hashes.add(token + AHEAD));
+                    let ahead1 = bucket_of(*hashes.add(token + AHEAD + 1));
+                    _mm_prefetch::<_MM_HINT_T0>(buckets.add(ahead0).cast());
+                    _mm_prefetch::<_MM_HINT_T0>(buckets.add(ahead1).cast());
+                    let (act0, act1) =
+                        action_pair(buckets, *hashes.add(token), *hashes.add(token + 1));
+                    *heavy_hits.add(heavy_count) = act0;
+                    heavy_count += (act0 >> 31) as usize;
+                    *list_hits.add(list_count) = (act0 as u64) << 32 | doc as u64;
+                    list_count += (act0.wrapping_sub(1) < HEAVY - 1) as usize;
+                    if act0 & ANCHOR != 0 {
+                        *b.anchor_hits.get_unchecked_mut(anchor_count) =
+                            (act0 as u64) << 40 | (doc as u64) << 20 | token as u64;
+                        anchor_count += 1;
+                    }
+                    *heavy_hits.add(heavy_count) = act1;
+                    heavy_count += (act1 >> 31) as usize;
+                    *list_hits.add(list_count) = (act1 as u64) << 32 | doc as u64;
+                    list_count += (act1.wrapping_sub(1) < HEAVY - 1) as usize;
+                    if act1 & ANCHOR != 0 {
+                        *b.anchor_hits.get_unchecked_mut(anchor_count) =
+                            (act1 as u64) << 40 | (doc as u64) << 20 | (token + 1) as u64;
+                        anchor_count += 1;
+                    }
+                    token += 2;
+                }
                 while token < to {
                     let ahead = bucket_of(*hashes.add(token + AHEAD));
                     _mm_prefetch::<_MM_HINT_T0>(buckets.add(ahead).cast());
                     let action = action_in(buckets, *hashes.add(token));
-                    // All three stores happen, and only the right counts move.
                     *heavy_hits.add(heavy_count) = action;
                     heavy_count += (action >> 31) as usize;
                     *list_hits.add(list_count) = (action as u64) << 32 | doc as u64;
-                    // A term id + 1, with or without ANCHOR: not 0 and not HEAVY.
                     list_count += (action.wrapping_sub(1) < HEAVY - 1) as usize;
-                    // Rare enough to predict: about 1 token in 150 starts a phrase check.
                     if action & ANCHOR != 0 {
                         *b.anchor_hits.get_unchecked_mut(anchor_count) =
                             (action as u64) << 40 | (doc as u64) << 20 | token as u64;
