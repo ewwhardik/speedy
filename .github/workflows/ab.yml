@@ -45,15 +45,15 @@ jobs:
           for v in base cand; do
             d=$([ $v = base ] && echo /tmp/base/track-$t || echo $PWD/track-$t)
             docker build -q -t $v $d >/dev/null
-            id=$(docker create $v); docker cp $id:/app/solution /tmp/$v; docker rm -f $id >/dev/null
+            id=$(docker create $v); docker cp $id:/app/solution /tmp/bin-$v; docker rm -f $id >/dev/null
           done
-          ls -la /tmp/base /tmp/cand
+          ls -la /tmp/bin-base /tmp/bin-cand
       - name: correctness
         if: env.SKIP != '1'
         run: |
           ok=1
           for s in s1 s7; do sudo ln -sfn /tmp/$s /data; for i in 1 2 3; do
-            rm -f /out/*; /tmp/cand; got=$(sha256sum /out/$OUTFILE | cut -c1-64)
+            rm -f /out/*; /tmp/bin-cand; got=$(sha256sum /out/$OUTFILE | cut -c1-64)
             if [ "$got" = "$(cat /tmp/$s.sha)" ]; then echo "cand $s PASS"; else echo "cand $s FAIL"; ok=0; fi
           done; done
           [ $ok = 1 ]
@@ -61,9 +61,9 @@ jobs:
         if: env.SKIP != '1'
         run: |
           sudo ln -sfn /tmp/s1 /data
-          for v in base cand base cand; do /tmp/$v; done
+          for v in base cand base cand; do /tmp/bin-$v; done
           for round in $(seq 1 25); do for v in base cand; do
-            s=$(date +%s%N); /tmp/$v; e=$(date +%s%N); echo "$v $(( (e - s) / 1000 ))" >> /tmp/times
+            s=$(date +%s%N); /tmp/bin-$v; e=$(date +%s%N); echo "$v $(( (e - s) / 1000 ))" >> /tmp/times
           done; done
           python3 -c "
           import statistics as st
@@ -73,3 +73,12 @@ jobs:
           for v,x in (('base',b),('cand',c)): print('TIME',v,'median_us',st.median(x),'trim_mean',round(st.mean(x[5:-5])),'min',x[0])
           print('TIME delta_median_pct', round(100*(st.median(c)/st.median(b)-1),2), 'delta_trim_pct', round(100*(st.mean(c[5:-5])/st.mean(b[5:-5])-1),2))
           "
+      - name: memory
+        if: env.SKIP != '1'
+        run: |
+          sudo ln -sfn /tmp/s1 /data; cat /tmp/s1/* > /dev/null
+          for v in base cand base cand base cand; do
+            sudo bash -c "mkdir -p /sys/fs/cgroup/m$v; echo +memory > /sys/fs/cgroup/cgroup.subtree_control 2>/dev/null; echo \$\$ > /sys/fs/cgroup/m$v/cgroup.procs; /tmp/bin-$v; cat /sys/fs/cgroup/m$v/memory.peak > /tmp/peak; echo \$\$ > /sys/fs/cgroup/cgroup.procs"
+            echo "MEM $v $(( $(cat /tmp/peak) / 1024 )) KB"
+            sudo rmdir /sys/fs/cgroup/m$v
+          done
