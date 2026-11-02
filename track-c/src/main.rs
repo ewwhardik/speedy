@@ -259,9 +259,9 @@ impl Run {
         let mut spare = 0..0; // name numbers this worker reserved
         let mut digits = [[0u64; MAX_RECORDS]; 3];
         let mut numbers = [[0u32; MAX_RECORDS]; 3];
-        while let Some(claim) = take_block(&NEXT[1], 1 << 20, len) {
-            // Claims are 1 MiB.
-            let end = (claim + (1 << 20)).min(len);
+        while let Some(claim) = take_block(&NEXT[1], 1 << 18, len) {
+            // Claims are 256 KiB: fewer file pages resident at once.
+            let end = (claim + (1 << 18)).min(len);
             // The first record at or after `claim`.
             let from = claim.saturating_sub(1);
             let begins = |pair: &[u8]| pair[0] == b'\n' && matches!(pair[1], b'0'..=b'9' | 0xEF);
