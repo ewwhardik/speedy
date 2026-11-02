@@ -36,7 +36,7 @@ jobs:
           prof=$(docker run --rm $TOOLS sh -c 'ls /usr/local/rustup/toolchains/*/lib/rustlib/*/bin/llvm-profdata | head -1')
           docker run --rm -u $(id -u):$(id -g) -v /tmp/pgo:/tmp/pgo -v $PWD:/src $TOOLS $prof merge -o /src/pgo.profdata /tmp/pgo
           ls -la pgo.profdata
-          b $SLIM "$flags -Cprofile-use=/src/pgo.profdata -Cllvm-args=-pgo-warn-mismatch" t-pgo 2>&1 | tail -5
+          b $SLIM "$flags -Cprofile-use=/src/pgo.profdata" t-pgo 2>&1 | tail -15
       - name: compare
         run: |
           cd track-${{ matrix.track }}
