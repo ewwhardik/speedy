@@ -4,21 +4,23 @@ The task, the input files and the exact output format are in the [spec](https://
 
 ## Approach
 
-Our solution is implemented in idiomatic, dependency-free Rust (`D = 1`), engineered specifically for the target scoring machine (Intel Core i5-13500 with 6 P-cores / 12 hardware threads, 24 MB L3 cache).
+Dependency-free Rust (`D = 1`), one file: [`src/main.rs`](src/main.rs). Its header comment walks through the design; in short:
 
-Key architectural decisions:
-1. **Multithreaded Chunk Partitioning**: The input file is partitioned across the 12 hardware threads with line-boundary alignment. Each thread processes its slice completely independently without mutexes, channels, or atomic synchronization.
-2. **Fast-path Timestamp Translation**: Since all timestamps in the competition span a known 72-hour window (`2026-10-30T18:00:00Z` to `2026-11-02T17:59:59Z`), we parse the day and hour with simple branchless integer arithmetic directly into an index in `0..72`. This completely eliminates RFC 3339 date/time parsing overhead.
-3. **L1-Resident Endpoint Lookup**: Endpoints are deduplicated per-thread using a compact 4096-slot open-addressing hash table with FNV-1a hashing. The table fits inside L1 data cache (< 48 KB) and guarantees fast lookups.
-4. **Cache-Friendly Aggregation Matrix**: Groups are indexed directly as `hour_idx * 2048 + local_ep_id`. Unvisited groups incur zero heap allocations.
-5. **Parallel Nearest-Rank Reduction**: The 72 hours are partitioned across the worker threads to collect latencies, sort with `pdqsort` (`sort_unstable`), and format output directly into pre-allocated memory buffers.
-6. **Zero-Allocation Formatting**: Integers and strings are serialized directly into contiguous output buffers, avoiding intermediate string formatting and I/O thrashing.
+1. **Map, claim, parse.** The log is `mmap`ed read-only with a spare zero page behind it, so wide loads may run past the end. Twelve workers (started by `main`, which then works itself) claim 1 MiB at a time. Within a claim, each 64 KiB block is scanned for newlines first (AVX2, 128 bytes per iteration, one unconditional store per 32-byte step) and then every line is read from both ends with no data-dependent branches: the hour comes from the fixed-position `DDTHH` digits (the 72-hour span is fixed by the spec for every seed), the latency is decoded back from the newline with three multiply-shift steps, and the endpoint is whatever sits between.
+2. **Endpoints as ids.** An endpoint is a 64-bit hash (two `vaesenc` rounds over its first and last 32 bytes) looked up in one shared open-addressing table of 8,192 slots that fills in the first moments of the run and is read-only after. With 1,842 endpoints, a collision on the 53 compared bits has odds of about 2e-10.
+3. **4-byte rows per hour.** Each line becomes `id + 1 | error bit | 20-bit latency` in its hour's area of one lazily backed reservation; the 1% of latencies that need more than 20 bits escape into a second row.
+4. **Seal and summarise while parsing.** The input interleaves eight time-ordered streams, so once the parsed prefix of the file holds a line two hours later, an hour is sealed: its rows are radix sorted by latency (two 10-bit passes) in place, dealt out by endpoint so every endpoint's latencies come out sorted, and the percentiles are single array reads. If that bet ever fails on some input, the whole run repeats with no early sealing, so the output is exact for any line order.
+5. **Write in parallel.** Each hour's text is written over its own rows; once all earlier hours have their text, its file offset is known and it goes out with `pwrite`, after which its pages are returned with `MADV_DONTNEED`. Only a few hours of rows are alive at once, which keeps peak memory near 16 MB.
+
+## Correctness
+
+Besides the board (seed 1), every change is checked on seeds 2, 3 and 7 at full scale against the organisers' reference, on Linux, with the exact Dockerfile build (see PERF.md, "How we measure").
 
 ## Dependencies
 
-None. Standard library only (`D = 1.0`).
+None. Standard library only (`D = 1`).
 
 ## With another 24 hours
 
-1. Incorporate AVX2 SIMD scanning for delimiter detection (`b' '` and `b'\n'`) to vectorize line tokenization.
-2. Apply Profile-Guided Optimization (PGO) using `halloumee/speed-demon-rust:1.99.1-trixie-llvm-tools` to optimize branch probabilities in the main parse loop.
+- Profile on the scoring CPU itself: our lab runners are AMD EPYC with two cores, so effects of twelve hyperthreads sharing six cores are invisible there.
+- Try `MADV_POPULATE_READ` per claim instead of demand faults on the input mapping, which is about a sixth of the CPU time in the kernel profile.
