@@ -73,3 +73,12 @@ jobs:
           for v,x in (('base',b),('cand',c)): print('TIME',v,'median_us',st.median(x),'trim_mean',round(st.mean(x[5:-5])),'min',x[0])
           print('TIME delta_median_pct', round(100*(st.median(c)/st.median(b)-1),2), 'delta_trim_pct', round(100*(st.mean(c[5:-5])/st.mean(b[5:-5])-1),2))
           "
+      - name: memory
+        if: env.SKIP != '1'
+        run: |
+          sudo ln -sfn /tmp/s1 /data; cat /tmp/s1/* > /dev/null
+          for v in base cand base cand base cand; do
+            sudo bash -c "mkdir -p /sys/fs/cgroup/m$v; echo +memory > /sys/fs/cgroup/cgroup.subtree_control 2>/dev/null; echo \$\$ > /sys/fs/cgroup/m$v/cgroup.procs; /tmp/$v; cat /sys/fs/cgroup/m$v/memory.peak > /tmp/peak; echo \$\$ > /sys/fs/cgroup/cgroup.procs"
+            echo "MEM $v $(( $(cat /tmp/peak) / 1024 )) KB"
+            sudo rmdir /sys/fs/cgroup/m$v
+          done
