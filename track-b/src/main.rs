@@ -31,7 +31,7 @@
 //! set a bit in a bitmap, write a row for a list, or also start a phrase check.
 use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering::*};
 use std::sync::{Mutex, OnceLock};
-use std::{arch::x86_64::*, fs::File, io::Write, os::fd::AsRawFd, ptr::null_mut, thread};
+use std::{arch::x86_64::*, fs::File, os::fd::AsRawFd, ptr::null_mut, thread};
 
 extern "C" {
     fn mmap(addr: *mut u8, len: usize, prot: i32, flags: i32, fd: i32, offset: i64) -> *mut u8;
@@ -1279,9 +1279,8 @@ fn main() {
 
         thread::scope(|s| spawn_tree(s, &run, 0));
 
-        let mut out = File::create("/out/results.txt").unwrap();
-        for part in &run.parts {
-            out.write_all(&part.lock().unwrap()).unwrap();
-        }
+        // One write, not one per batch of queries: 782 small syscalls cost more than a 2 MB copy.
+        let parts: Vec<_> = run.parts.iter().map(|p| std::mem::take(&mut *p.lock().unwrap())).collect();
+        std::fs::write("/out/results.txt", parts.concat()).unwrap();
     }
 }
