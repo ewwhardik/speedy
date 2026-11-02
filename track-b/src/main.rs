@@ -200,24 +200,16 @@ impl Tally {
             };
             (total(counts), total(sums) + total(starts) + total(offsets))
         };
-        let needed = TALLY_IDS.saturating_sub(self.count as usize);
-        if needed > 0 {
-            let mut extracted = 0;
-            'outer: for (idx, &w) in bits.iter().enumerate() {
-                let mut word = w;
-                while word != 0 {
-                    let bit = word.trailing_zeros();
-                    self.first[self.count as usize + extracted] = base + idx as u32 * 64 + bit;
-                    extracted += 1;
-                    if extracted >= needed {
-                        break 'outer;
-                    }
-                    word &= word - 1;
-                }
-            }
-        }
-        self.count += count as u32;
-        self.sum += sum + base as u64 * count;
+        let ids = bits
+            .iter()
+            .enumerate()
+            .filter(|(_, &word)| word != 0)
+            .flat_map(|(index, &word)| {
+                (0..64)
+                    .filter(move |bit| word >> bit & 1 == 1)
+                    .map(move |bit| index as u32 * 64 + bit)
+            });
+        self.add(base, count, sum, ids);
     }
 
     fn write(&self, out: &mut Vec<u8>) {
@@ -618,15 +610,12 @@ impl Run {
             let mut m: [u64; 64] =
                 std::array::from_fn(|j| std::mem::take(&mut group[j * words + k]));
             for width in [32usize, 16, 8, 4, 2, 1] {
+                // The bits of a word that sit in the low half of each block of `2 * width`.
                 let mask = u64::MAX / ((1 << width) + 1);
-                let mut r = 0;
-                while r < 64 {
-                    for i in 0..width {
-                        let t = ((m[r + i] >> width) ^ m[r + i + width]) & mask;
-                        m[r + i + width] ^= t;
-                        m[r + i] ^= t << width;
-                    }
-                    r += 2 * width;
+                for r in (0..64).filter(|r| r & width == 0) {
+                    let t = ((m[r] >> width) ^ m[r + width]) & mask;
+                    m[r + width] ^= t;
+                    m[r] ^= t << width;
                 }
             }
             for (t, &bits) in m.iter().enumerate().take(heavy - k * 64) {
@@ -1053,7 +1042,6 @@ unsafe fn filter_by(a: &[u16], b: &[u16], keep: bool, out: &mut Vec<u16>, marks:
 }
 
 fn union(a: &[u16], b: &[u16], out: &mut Vec<u16>) {
-    out.reserve(a.len() + b.len());
     let (mut i, mut j) = (0, 0);
     while i < a.len() && j < b.len() {
         let (x, y) = (a[i], b[j]);
@@ -1083,15 +1071,9 @@ unsafe fn apply(op: Op, current: Set, term: Set, scratch: &mut Scratch) -> Set {
     match (op, a, b) {
         (Op::And | Op::Not, Set::List(a), Set::List(b)) => filter_by(a, b, keep, out, marks),
         (Op::And | Op::Not, Set::List(a), Set::Bits(b)) => {
-            out.reserve(a.len());
-            let target = out.as_mut_ptr();
-            let mut found = 0;
-            for &doc in a {
-                let held = (*b.get_unchecked(doc as usize / 64) >> (doc % 64) & 1) as u8;
-                *target.add(found) = doc;
-                found += (held == keep as u8) as usize;
-            }
-            out.set_len(found);
+            // Keep what the bitmap holds for AND, and what it lacks for NOT.
+            let held = |doc: u16| *b.get_unchecked(doc as usize / 64) >> (doc % 64) & 1 == 1;
+            out.extend(a.iter().filter(|&&doc| held(doc) == keep));
         }
         // A merged list is cheaper than a bitmap while it is shorter than one.
         (Op::Or, Set::List(a), Set::List(b)) if a.len() + b.len() < words => union(a, b, out),
@@ -1116,23 +1098,15 @@ unsafe fn apply(op: Op, current: Set, term: Set, scratch: &mut Scratch) -> Set {
             }
             match b {
                 Set::List(docs) => mark(bits, docs, op == Op::Not),
-                Set::Bits(other) => match op {
-                    Op::And => {
-                        for (word, &other) in bits.iter_mut().zip(other) {
-                            *word &= other;
-                        }
+                Set::Bits(other) => {
+                    for (word, &other) in bits.iter_mut().zip(other) {
+                        *word = match op {
+                            Op::And => *word & other,
+                            Op::Or => *word | other,
+                            Op::Not => *word & !other,
+                        };
                     }
-                    Op::Or => {
-                        for (word, &other) in bits.iter_mut().zip(other) {
-                            *word |= other;
-                        }
-                    }
-                    Op::Not => {
-                        for (word, &other) in bits.iter_mut().zip(other) {
-                            *word &= !other;
-                        }
-                    }
-                },
+                }
             }
             return Set::Bits(std::slice::from_raw_parts(bits.as_ptr(), words));
         }
