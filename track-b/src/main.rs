@@ -177,20 +177,23 @@ impl Tally {
             let mut first = _mm256_setr_epi64x(0, 64, 128, 192); // the ids of each word's first bit
             for block in bits.chunks_exact(4) {
                 let word = _mm256_loadu_si256(block.as_ptr().cast());
-                let lo = _mm256_and_si256(word, low);
-                let hi = _mm256_and_si256(_mm256_srli_epi16::<4>(word), low);
-                let high_ones = pick(ones, hi);
-                let per_byte = _mm256_add_epi8(pick(ones, lo), high_ones);
-                let low_places = _mm256_add_epi8(pick(places, lo), pick(places, hi));
-                // The high nibble's positions are 4 more than in the table.
-                let positions = _mm256_add_epi8(low_places, _mm256_slli_epi16::<2>(high_ones));
-                let per_word = _mm256_sad_epu8(per_byte, zero);
-                counts = _mm256_add_epi64(counts, per_word);
-                sums = _mm256_add_epi64(sums, _mm256_sad_epu8(positions, zero));
-                starts = _mm256_add_epi64(starts, _mm256_mul_epu32(per_word, first));
-                let weighted = _mm256_maddubs_epi16(per_byte, weights);
-                offsets =
-                    _mm256_add_epi32(offsets, _mm256_madd_epi16(weighted, _mm256_set1_epi16(1)));
+                // Results are mostly sparse: an all-zero block adds nothing.
+                if _mm256_testz_si256(word, word) == 0 {
+                    let lo = _mm256_and_si256(word, low);
+                    let hi = _mm256_and_si256(_mm256_srli_epi16::<4>(word), low);
+                    let high_ones = pick(ones, hi);
+                    let per_byte = _mm256_add_epi8(pick(ones, lo), high_ones);
+                    let low_places = _mm256_add_epi8(pick(places, lo), pick(places, hi));
+                    // The high nibble's positions are 4 more than in the table.
+                    let positions = _mm256_add_epi8(low_places, _mm256_slli_epi16::<2>(high_ones));
+                    let per_word = _mm256_sad_epu8(per_byte, zero);
+                    counts = _mm256_add_epi64(counts, per_word);
+                    sums = _mm256_add_epi64(sums, _mm256_sad_epu8(positions, zero));
+                    starts = _mm256_add_epi64(starts, _mm256_mul_epu32(per_word, first));
+                    let weighted = _mm256_maddubs_epi16(per_byte, weights);
+                    offsets =
+                        _mm256_add_epi32(offsets, _mm256_madd_epi16(weighted, _mm256_set1_epi16(1)));
+                }
                 first = _mm256_add_epi64(first, _mm256_set1_epi64x(256));
             }
             // Every lane is below 2^32, so the halves of the 64-bit ones can be added as 32-bit.
