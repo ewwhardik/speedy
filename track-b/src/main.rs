@@ -63,13 +63,12 @@ const HEAVY: u32 = 1 << 31; // an action: 0 for no term, a bitmap index here, or
 const OVERFLOW: u32 = 1 << 30; // in place of 0: the bucket is full, so look further
 const ANCHOR: u32 = 1 << 29; // added to a term's action: some phrase starts its check here
 const MAX_HEAVY: usize = 1024;
-const MAX_PHRASES: usize = 24576;
 const SHARDS: usize = 64;
 const DOC_BITS: u32 = 18;
 const CHUNK: usize = 64; // rows; the first of each chunk names the claim that wrote it
 const QUERY_BATCH: usize = 64;
 // A worker's share of the one reservation for batch space.
-const WORKSPACE: usize = 4 << 20;
+const WORKSPACE: usize = 32 << 20;
 // Words in a phrase, at most (the grammar allows 2 to 8).
 const MAX_WORDS: usize = 8;
 
@@ -932,7 +931,6 @@ impl Run {
         self.each_job(&self.setup[1], JOBS, |slice| self.plan_phrases(slice));
         self.barrier();
         self.each_job(&self.setup[2], JOBS, |part| self.plan_buckets(part));
-        discard(self.sample.as_ptr().cast(), MAX_TERMS * 4);
         self.barrier();
 
         // The batches of queries, in file order.
@@ -1278,7 +1276,7 @@ fn main() {
             term_count: AtomicUsize::new(0),
             queries,
             shares: (0..threads).map(|_| OnceLock::new()).collect(),
-            phrases: reserve(MAX_PHRASES, false),
+            phrases: reserve(MAX_TERMS, false),
             sample: space(MAX_TERMS),
             setup: [0; 6].map(AtomicUsize::new),
             phase: (0..phases).map(|_| Default::default()).collect(),

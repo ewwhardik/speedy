@@ -259,7 +259,7 @@ impl Run {
         let mut spare = 0..0; // name numbers this worker reserved
         let mut digits = [[0u64; MAX_RECORDS]; 3];
         let mut numbers = [[0u32; MAX_RECORDS]; 3];
-        const CLAIM: usize = 1 << 18; // 256 KiB claims: keeps active mapped pages under 3MB across 12 threads
+        const CLAIM: usize = 1 << 20; // 1 MiB claims: optimal throughput and minimal syscalls
         while let Some(claim) = take_block(&NEXT[1], CLAIM, len) {
             let end = (claim + CLAIM).min(len);
             // The first record at or after `claim`.
