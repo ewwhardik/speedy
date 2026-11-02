@@ -47,7 +47,7 @@ const ANONYMOUS: i32 = 0x4022; // MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE
 const HUGE_PAGE: usize = 1 << 21;
 const CLAIM: usize = 1 << 18;
 // 50 MiB of text between turning rows into postings.
-const PHASE_CLAIMS: usize = 200;
+const PHASE_CLAIMS: usize = 100;
 // u16s before a list: a sentinel while it fills, so duplicates drop with no branch.
 const HEADER: usize = 1;
 // Slices each of the phrase plan and the bucket plan is cut into.
@@ -62,13 +62,14 @@ const AHEAD: usize = 20; // tokens between a bucket's prefetch and its lookup
 const HEAVY: u32 = 1 << 31; // an action: 0 for no term, a bitmap index here, or a term id + 1
 const OVERFLOW: u32 = 1 << 30; // in place of 0: the bucket is full, so look further
 const ANCHOR: u32 = 1 << 29; // added to a term's action: some phrase starts its check here
-const MAX_HEAVY: usize = 4096;
+const MAX_HEAVY: usize = 1024;
+const MAX_PHRASES: usize = 24576;
 const SHARDS: usize = 64;
 const DOC_BITS: u32 = 18;
 const CHUNK: usize = 64; // rows; the first of each chunk names the claim that wrote it
 const QUERY_BATCH: usize = 64;
 // A worker's share of the one reservation for batch space.
-const WORKSPACE: usize = 32 << 20;
+const WORKSPACE: usize = 4 << 20;
 // Words in a phrase, at most (the grammar allows 2 to 8).
 const MAX_WORDS: usize = 8;
 
@@ -144,7 +145,9 @@ struct Tally {
 
 impl Tally {
     /// Adds a phase's result as a list of ids relative to the phase's first document.
+    #[inline(always)]
     fn add_list(&mut self, base: u32, list: &[u16]) {
+        if list.is_empty() { return; }
         let sum = list.iter().map(|&doc| doc as u64).sum();
         let ids = list.iter().map(|&doc| doc as u32);
         self.add(base, list.len() as u64, sum, ids);
@@ -730,23 +733,21 @@ impl Run {
         for id in (shard..term_count).step_by(SHARDS) {
             (*self.terms.add(id)).count = 0;
         }
-        let mut cursors = vec![0u32; terms];
+        let mut cursors = [0u32; 4096];
         for_rows(region, &chunks, |low, _| {
             *cursors.get_unchecked_mut(low) += 1
         });
-        // Until a list is complete its sentinel slot holds u16::MAX, so a document can always
-        // be compared with the one before it. A term repeats within a document, but a
-        // document's rows are adjacent.
-        let lists = cursors.iter().filter(|&&size| size > 0).count();
-        let total = cursors.iter().sum::<u32>() as usize + lists * HEADER;
+        let lists = cursors[..terms].iter().filter(|&&size| size > 0).count();
+        let total = cursors[..terms].iter().sum::<u32>() as usize + lists * HEADER;
         let mut at = self.phase[phase][3].fetch_add(total, Relaxed) as u32;
-        for cursor in cursors.iter_mut().filter(|cursor| **cursor > 0) {
+        for cursor in cursors[..terms].iter_mut().filter(|cursor| **cursor > 0) {
             let size = *cursor;
             *cursor = at + HEADER as u32;
             *self.postings.add(*cursor as usize - 1) = u16::MAX;
             at += size + HEADER as u32;
         }
-        let firsts = cursors.clone();
+        let mut firsts = [0u32; 4096];
+        firsts[..terms].copy_from_slice(&cursors[..terms]);
         for_rows(region, &chunks, |low, doc| {
             let cursor = cursors.get_unchecked_mut(low);
             let slot = self.postings.add(*cursor as usize);
@@ -827,6 +828,12 @@ impl Run {
             prefetch(index + 1, true);
             let steps = steps_of(index);
             let tally = &mut *tallies.add(index);
+            if steps.len() == 1 {
+                let info = &*self.terms.add(steps[0].1 as usize);
+                if !info.heavy && info.count == 0 {
+                    continue;
+                }
+            }
             match self.answer_bool(steps, phase, scratch) {
                 Set::List(list) => tally.add_list(base, list),
                 Set::Bits(bits) => tally.add_bits(base, bits),
@@ -925,6 +932,7 @@ impl Run {
         self.each_job(&self.setup[1], JOBS, |slice| self.plan_phrases(slice));
         self.barrier();
         self.each_job(&self.setup[2], JOBS, |part| self.plan_buckets(part));
+        discard(self.sample.as_ptr().cast(), MAX_TERMS * 4);
         self.barrier();
 
         // The batches of queries, in file order.
@@ -1024,29 +1032,56 @@ unsafe fn aligned_line(text: &[u8], docs: usize, at: usize) -> (usize, usize) {
 /// which is all zeros between calls, and the other is tested against the marks and the marks
 /// cleared again. Both write every value and move the count only for a kept one, so neither
 /// branches on the data.
-unsafe fn filter_by(a: &[u16], b: &[u16], keep: bool, out: &mut Vec<u16>, marks: &mut [u64]) {
+unsafe fn filter_by(a: &[u16], b: &[u16], keep: bool, out: &mut Vec<u16>, _marks: &mut [u64]) {
     out.reserve(a.len().max(b.len()));
     let target = out.as_mut_ptr();
     let mut found = 0;
-    // A list 16 times shorter is searched for, not marked.
     if a.len() * 16 <= b.len() {
         for &doc in a {
             let present = b.binary_search(&doc).is_ok();
             *target.add(found) = doc;
             found += (present == keep) as usize;
         }
-    } else {
-        let (marked, tested) = if keep { (a, b) } else { (b, a) };
-        for &doc in marked {
-            *marks.get_unchecked_mut(doc as usize / 64) |= 1 << (doc % 64);
-        }
-        for &doc in tested {
-            let present = *marks.get_unchecked(doc as usize / 64) >> (doc % 64) & 1;
+    } else if b.len() * 16 <= a.len() && keep {
+        for &doc in b {
+            let present = a.binary_search(&doc).is_ok();
             *target.add(found) = doc;
-            found += (present == keep as u64) as usize;
+            found += present as usize;
         }
-        for &doc in marked {
-            *marks.get_unchecked_mut(doc as usize / 64) = 0;
+    } else if keep {
+        let (mut ia, mut ib) = (0, 0);
+        while ia < a.len() && ib < b.len() {
+            let (da, db) = (*a.get_unchecked(ia), *b.get_unchecked(ib));
+            if da == db {
+                *target.add(found) = da;
+                found += 1;
+                ia += 1;
+                ib += 1;
+            } else if da < db {
+                ia += 1;
+            } else {
+                ib += 1;
+            }
+        }
+    } else {
+        let (mut ia, mut ib) = (0, 0);
+        while ia < a.len() && ib < b.len() {
+            let (da, db) = (*a.get_unchecked(ia), *b.get_unchecked(ib));
+            if da == db {
+                ia += 1;
+                ib += 1;
+            } else if da < db {
+                *target.add(found) = da;
+                found += 1;
+                ia += 1;
+            } else {
+                ib += 1;
+            }
+        }
+        while ia < a.len() {
+            *target.add(found) = *a.get_unchecked(ia);
+            found += 1;
+            ia += 1;
         }
     }
     out.set_len(found);
@@ -1243,7 +1278,7 @@ fn main() {
             term_count: AtomicUsize::new(0),
             queries,
             shares: (0..threads).map(|_| OnceLock::new()).collect(),
-            phrases: reserve(MAX_TERMS, false),
+            phrases: reserve(MAX_PHRASES, false),
             sample: space(MAX_TERMS),
             setup: [0; 6].map(AtomicUsize::new),
             phase: (0..phases).map(|_| Default::default()).collect(),

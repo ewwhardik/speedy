@@ -25,7 +25,8 @@ Every step from the reference to the final version, each with the live-board run
 | 18 | `MAX_HEAVY` 4096 → 1024 keeping huge-page postings (commit `595ab02`) | not recorded | 0.0923 | 40.3 | 78.72 |
 | 19 | 4-token VAES hashing and dual-token action_pair bucket lookup | run-0ba80dbb7859 | 0.0943 | 43.1 | 78.26 |
 | 20 | Single-token action_in with AHEAD=8 and MAX_HEAVY=1024 | run-5c47aa0fd9b6 | 0.1053 | 43.1 | 77.29 |
-| 21 | Reverted to PB baseline: AHEAD=20, MAX_HEAVY=4096 huge-page postings | pending | | | |
+| 21 | Reverted to PB baseline: AHEAD=20, MAX_HEAVY=4096 huge-page postings | run-4b85654 | 0.0934 | 42.3 | 78.59 |
+| 22 | PHASE_CLAIMS=100 (25.5MB M), MAX_HEAVY=1024, MAX_PHRASES=24576, stack cursors/firsts, two-pointer filter_by, phrase skip | pending | | | |
 
 ## How we measure
 

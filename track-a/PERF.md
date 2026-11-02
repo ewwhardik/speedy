@@ -26,7 +26,8 @@ Every step from the reference to the final version, each with the live-board run
 | 19 | Binary-tree spawn and spin_loop advance | run-6f0dd2d67c59 | 0.0202 | 16.0 | 85.56 |
 | 20 | Vector XOR name hash fold and relaxed slot lookup on fast path | run-067ae7cd1895 | 0.0193 | 15.9 | 86.05 |
 | 21 | madvise MADV_WILLNEED on input mapping to pre-fault pages | run-5c47aa0fd9b6 | 0.0189 | 16.3 | 86.18 |
-| 22 | madvise only touched pages in write_ready (~1.5MB vs 50MB), eliminate spare madvise | pending | | | |
+| 22 | madvise only touched pages in write_ready (~1.5MB vs 50MB) | run-4b85654 | 0.0217 | 17.9 | 84.21 |
+| 23 | SPARE_AT=256KB (13.1MB RSS), stack starts/errors, cached order, immediate scratch release | pending | | | |
 
 ## How we measure
 

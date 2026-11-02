@@ -259,9 +259,9 @@ impl Run {
         let mut spare = 0..0; // name numbers this worker reserved
         let mut digits = [[0u64; MAX_RECORDS]; 3];
         let mut numbers = [[0u32; MAX_RECORDS]; 3];
-        while let Some(claim) = take_block(&NEXT[1], 1 << 20, len) {
-            // Claims are 1 MiB.
-            let end = (claim + (1 << 20)).min(len);
+        const CLAIM: usize = 1 << 18; // 256 KiB claims: keeps active mapped pages under 3MB across 12 threads
+        while let Some(claim) = take_block(&NEXT[1], CLAIM, len) {
+            let end = (claim + CLAIM).min(len);
             // The first record at or after `claim`.
             let from = claim.saturating_sub(1);
             let begins = |pair: &[u8]| pair[0] == b'\n' && matches!(pair[1], b'0'..=b'9' | 0xEF);
@@ -378,7 +378,8 @@ impl Run {
                 pos.copy_within(count * FIELDS..filled, 0);
                 filled -= count * FIELDS;
             }
-            // /data is host-mapped and excluded from M; skip runtime unmapping to avoid mmap_lock and TLB shootdowns.
+            // Unmap this claim's pages in parallel to eliminate exit_mmap sequential teardown at exit.
+            madvise(input.add(claim), end - claim, 4); // MADV_DONTNEED
         }
         let mut totals = TOTALS.lock().unwrap();
         for (total, part) in totals.iter_mut().zip(&stats) {

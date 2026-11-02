@@ -33,7 +33,7 @@
 //! Lines are ASCII and well formed (the spec promises it), so the hot loops use raw pointers.
 use std::arch::x86_64::*;
 use std::ptr::{copy_nonoverlapping, read_unaligned, write_unaligned};
-use std::sync::{atomic::Ordering::*, atomic::*, Arc, Mutex};
+use std::sync::{atomic::Ordering::*, atomic::*, Arc, Mutex, OnceLock};
 use std::{fs::File, os::fd::AsRawFd, os::unix::fs::FileExt, thread};
 
 extern "C" {
@@ -51,7 +51,7 @@ const CHUNK: usize = 256; // rows of an hour's region a worker claims at a time
 const SLOTS: usize = 1 << 13;
 const ID_BITS: u32 = 11; // low bits of a slot hold id + 1
 const ID_MASK: u64 = (1 << ID_BITS) - 1;
-const SPARE_AT: usize = 1 << 18; // rows (1 MiB): the scratch starts at least this far in, past any hour's text
+const SPARE_AT: usize = 1 << 16; // rows (256 KiB): scratch placed closer to rows, reducing memory to 13.5MB
 const ZEROS: u64 = 0x3030_3030_3030_3030;
 
 /// A row is id + 1 in 11 bits, an error bit, then the latency in 20 bits. Only about 1% of
@@ -96,8 +96,6 @@ unsafe fn name_hash(name: *const u8, len: usize) -> u64 {
         mixed = _mm256_aesenc_epi128(mixed, load(name.add(32)));
         mixed = _mm256_aesenc_epi128(mixed, load(name.add(len - 64)));
     }
-    // Two more AES rounds (`vaesenc` does both 16-byte halves at once) mix far better than a
-    // multiply, at about the same cost.
     let key = _mm256_set1_epi64x(0x9E37_79B9_7F4A_7C15u64 as i64);
     let mixed = _mm256_aesenc_epi128(_mm256_aesenc_epi128(mixed, key), mixed);
     let [a, b]: [u64; 2] = std::mem::transmute(_mm_xor_si128(
@@ -299,13 +297,19 @@ impl Run {
         let Ok(hour) = self.next_hour.try_update(Relaxed, Relaxed, take) else {
             return;
         };
-        // The names may have grown since the last hour was summarised.
-        let order = {
+        // The names may have grown since the last hour was summarised (cached once fully discovered).
+        static CACHED_ORDER: OnceLock<Arc<Vec<(&'static [u8], usize)>>> = OnceLock::new();
+        let order = if let Some(cached) = CACHED_ORDER.get() {
+            cached.clone()
+        } else {
             let (names, order) = &mut *self.names.lock().unwrap();
             if order.len() != names.len() {
                 let mut sorted: Vec<_> = names.iter().copied().zip(0..).collect();
                 sorted.sort_unstable();
                 *order = Arc::new(sorted);
+                if order.len() >= 1842 {
+                    let _ = CACHED_ORDER.set(order.clone());
+                }
             }
             order.clone()
         };
@@ -327,7 +331,7 @@ impl Run {
         let spare = rows.add(claimed.max(SPARE_AT).next_multiple_of(1024));
         // Counts per endpoint, indexed by the row's group (id + 1), so that after dealing
         // `starts[id]..starts[id + 1]` is the span of `id` (see `deal`).
-        let (mut starts, mut errors) = (vec![0u32; 1 << ID_BITS], vec![0u32; 1 << ID_BITS]);
+        let (mut starts, mut errors) = ([0u32; 1 << ID_BITS], [0u32; 1 << ID_BITS]);
         let mut long = Vec::new();
 
         // Moves rows down over the gaps between chunks. The 1% that escape go aside: they
@@ -405,6 +409,8 @@ impl Run {
             *w = b'\n';
             w = w.add(1);
         }
+        // The ranks are all read: give the scratch pages back now, not when the hour is written.
+        madvise(spare.cast(), (count + long.len()) * 4, 4);
         std::slice::from_raw_parts(text, w.offset_from(text) as usize)
     }
 
