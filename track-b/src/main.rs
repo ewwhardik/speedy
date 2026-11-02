@@ -966,6 +966,8 @@ impl Run {
                 });
             }
             if stage == phases {
+                // Done with the batch buffers: free them on this thread, not all at exit on one.
+                discard(self.workspace.add(id * WORKSPACE), WORKSPACE);
                 break;
             }
             self.barrier();
