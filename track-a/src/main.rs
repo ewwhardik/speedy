@@ -189,16 +189,12 @@ impl Run {
                 // file, into the spare zero page.
                 let newline = _mm256_set1_epi8(b'\n' as i8);
                 let (mut count, mut at) = (0, start);
-                // Four steps per iteration: blocks are multiples of 128 bytes, and past the
-                // file's end the steps read the zero page, which holds no newline.
                 while at < (start + BLOCK).min(self.len) {
-                    for step in (0..128).step_by(32) {
-                        let chunk = _mm256_load_si256(input.add(at + step).cast());
-                        let mask = _mm256_movemask_epi8(_mm256_cmpeq_epi8(chunk, newline)) as u32;
-                        *ends.get_unchecked_mut(count) = (at + step) as u32 + mask.trailing_zeros();
-                        count += (mask != 0) as usize;
-                    }
-                    at += 128;
+                    let hits = _mm256_cmpeq_epi8(_mm256_load_si256(input.add(at).cast()), newline);
+                    let mask = _mm256_movemask_epi8(hits) as u32;
+                    *ends.get_unchecked_mut(count) = (at + mask.trailing_zeros() as usize) as u32;
+                    count += (mask != 0) as usize;
+                    at += 32;
                 }
                 for &end in &ends[..count] {
                     let end = input.add(end as usize);

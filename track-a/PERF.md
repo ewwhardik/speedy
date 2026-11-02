@@ -1,6 +1,6 @@
 # Track A: performance log
 
-Every step from the reference to your final version, each with the live-board run ID that measured it. Judges check that the run IDs exist and that each change moved the way you say it did.
+Every step from the reference to the final version, each with the live-board run ID that measured it. A board run is a single run, and near-identical code has scored from 19.2 to 22.6 ms (steps 8 to 13), so a change smaller than about 5% cannot be read from one board run. From step 16 on, every change was first measured in our lab (below) and only then pushed.
 
 | Step | Change | Run ID | T (s) | M (MB) | Points |
 |---|---|---|---|---|---|
@@ -18,4 +18,24 @@ Every step from the reference to your final version, each with the live-board ru
 | 11 | Restored proven 64KB BLOCK stream prefetching with 391 lines | run-3e3b72a26487 | 0.0200 | 16.4 | 85.23 |
 | 12 | Streamlined main/write_ready, zero-alloc in-place emission | run-e612e5a7b055 | 0.0226 | 15.6 | 83.75 |
 | 13 | Lockless write_ready batching, relaxed lookup probe | run-b9c88ad67f89 | 0.0194 | 16.1 | 85.62 |
-| 14 | Binary-tree thread spawn (O(log N)), spin_loop work completion | pending | - | - | - |
+| 14 | Streaming hour sealer: summarise and write hours while the file is still being parsed (commit `10d0d7f`) | run-4c3240252365 | 0.0190 | 16.0 | 86.21 |
+| 15 | CRC32 endpoint hash instead of two `vaesenc` rounds (commits `b70bc0b`, `cd511e1`; measured at `ad8a1c5`) | not recorded | 0.0220 | 15.8 | 84.67 |
+| 16 | Reverted step 15 to step 14's hash (commit `6760c28`) | run-f63917923ca9 | 0.0193 | 16.8 | 85.82 |
+| 17 | 128-byte unrolled newline scan (lab: -1.1% to -2.9%), see the board A/B below | | | | |
+
+## How we measure
+
+- **Board:** one run per push on the scoring box, seed 1. Used for the absolute numbers above.
+- **Lab:** a GitHub Actions workflow on a separate branch builds the base (`speed-demon`) and the candidate with `docker build` of the real Dockerfile, checks the candidate's output against the organisers' reference on seed 1 and on a freshly generated seed 7 (full scale), then times base and candidate alternately for 25 rounds on the same machine and compares medians and trimmed means. It also reads the cgroup's `memory.peak`, the counter the board uses. The runners are two-core AMD EPYC and Intel Xeon machines, so absolute times are not the box's, but A/B differences of 1% are visible.
+- **Holdout check:** the final code also matches the reference on seeds 2 and 3 at full scale, 7 runs each. The 72-hour span the hour arithmetic relies on is fixed by the spec for every seed, and an input that breaks the early-sealing bet makes the program rerun without it, so line order cannot make the output wrong.
+
+## Where the time goes
+
+`perf record` on the lab runner (seed 1, ten runs): parsing is about 50% of samples (the newline pass, the line pass, and the endpoint hash and lookup at about 11%), summarising hours (radix sort, dealing, formatting) about 25%, and the kernel about 20%, mostly page faults on the input mapping and on the hours' row pages and their release. The run averages 10,700 page faults.
+
+## What did not work
+
+| Experiment | Measured | Why |
+|---|---|---|
+| CRC32 endpoint hash (step 15) | board 19.0 → 22.0 ms | The hash was never the bottleneck: the `vaesenc` version is under 5% of samples in the profile, so a faster hash cannot buy 3 ms, and the measured loss is within the board's noise or worse. CRC32 also has only 32 bits of entropy, which raises the odds of two of 1,842 endpoints colliding from about 2e-10 to about 4e-4 on an unseen seed. Reverted. |
+| Profile-guided build | lab +0.5% (noise) | The parser is branch-free by design, so a profile has little to reorder. |
