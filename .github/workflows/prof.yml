@@ -33,5 +33,6 @@ jobs:
           for i in 1 2 3 4 5; do /usr/bin/time -f "wall %e s maxrss %M KB minflt %R majflt %F vctx %w ictx %c" $bin; done
           perf stat -e task-clock,page-faults,context-switches,cpu-migrations -r 10 $bin 2>&1 | tail -15
           perf record -q -F 20000 -g -o /tmp/p.data -- bash -c "for i in 1 2 3 4 5 6 7 8 9 10; do $bin; done" 2>/dev/null
-          perf report -i /tmp/p.data --no-children --percent-limit 0.7 --stdio -g none --sort sym 2>/dev/null | grep -v '^#' | grep -v '^$' | head -60
-          perf report -i /tmp/p.data --no-children --percent-limit 2 --stdio -g caller,0.5,callee --sort sym 2>/dev/null | grep -v '^$' | head -150
+          perf report -i /tmp/p.data --no-children --percent-limit 0.4 --stdio -g none --sort dso,sym 2>/dev/null | grep -v '^#' | grep -v '^$' | head -40
+          echo SRCLINES
+          perf report -i /tmp/p.data --no-children --percent-limit 0.3 --stdio -g none --sort srcline 2>/dev/null | grep -v '^#' | grep -v '^$' | head -120
