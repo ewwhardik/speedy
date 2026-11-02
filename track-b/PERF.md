@@ -24,7 +24,8 @@ Every step from the reference to the final version, each with the live-board run
 | 17 | Unchanged code, re-run by a push to other tracks (commit `0cbdbb0`) | run-d558ec5e6137 | 0.0954 | 42.1 | 78.37 |
 | 18 | `MAX_HEAVY` 4096 → 1024 keeping huge-page postings (commit `595ab02`) | not recorded | 0.0923 | 40.3 | 78.72 |
 | 19 | 4-token VAES hashing and dual-token action_pair bucket lookup | run-0ba80dbb7859 | 0.0943 | 43.1 | 78.26 |
-| 20 | Single-token action_in with AHEAD=8 and MAX_HEAVY=1024 huge-page postings | pending | | | |
+| 20 | Single-token action_in with AHEAD=8 and MAX_HEAVY=1024 | run-5c47aa0fd9b6 | 0.1053 | 43.1 | 77.29 |
+| 21 | Reverted to PB baseline: AHEAD=20, MAX_HEAVY=4096 huge-page postings | pending | | | |
 
 ## How we measure
 

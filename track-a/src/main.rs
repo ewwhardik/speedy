@@ -489,6 +489,7 @@ fn solve(early: bool) -> bool {
         let input = map(null, len.div_ceil(4096) * 4096 + 4096, 1, 0x4022, -1);
         // For an empty file this fails, and the zero page stays.
         map(input, len, 1, 0x12, file.as_raw_fd());
+        madvise(input, len, 3);
         // An hour has room for its rows (two per line, if every line escaped), then for the
         // scratch (one value per line) after them, or after SPARE_AT rows if that is further,
         // plus the unused ends of one partly filled chunk per thread.
