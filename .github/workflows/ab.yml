@@ -44,8 +44,10 @@ jobs:
           git worktree add -q /tmp/base origin/speed-demon
           for v in base cand; do
             d=$([ $v = base ] && echo /tmp/base/track-$t || echo $PWD/track-$t)
-            (cd $d && bash -c "$(sed -n 's/^RUN //p' Dockerfile | head -1)" 2>&1 | grep -E "^error|warning: unused" | head; cp target/release/solution /tmp/$v)
+            docker build -q -t $v $d >/dev/null
+            id=$(docker create $v); docker cp $id:/app/solution /tmp/$v; docker rm -f $id >/dev/null
           done
+          ls -la /tmp/base /tmp/cand
       - name: correctness
         if: env.SKIP != '1'
         run: |
