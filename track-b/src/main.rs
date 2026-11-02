@@ -47,7 +47,7 @@ const ANONYMOUS: i32 = 0x4022; // MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE
 const HUGE_PAGE: usize = 1 << 21;
 const CLAIM: usize = 1 << 18;
 // 50 MiB of text between turning rows into postings.
-const PHASE_CLAIMS: usize = 248;
+const PHASE_CLAIMS: usize = 200;
 // u16s before a list: a sentinel while it fills, so duplicates drop with no branch.
 const HEADER: usize = 1;
 // Slices each of the phrase plan and the bucket plan is cut into.
@@ -1042,6 +1042,7 @@ unsafe fn filter_by(a: &[u16], b: &[u16], keep: bool, out: &mut Vec<u16>, marks:
 }
 
 fn union(a: &[u16], b: &[u16], out: &mut Vec<u16>) {
+    out.reserve(a.len() + b.len());
     let (mut i, mut j) = (0, 0);
     while i < a.len() && j < b.len() {
         let (x, y) = (a[i], b[j]);
@@ -1071,9 +1072,15 @@ unsafe fn apply(op: Op, current: Set, term: Set, scratch: &mut Scratch) -> Set {
     match (op, a, b) {
         (Op::And | Op::Not, Set::List(a), Set::List(b)) => filter_by(a, b, keep, out, marks),
         (Op::And | Op::Not, Set::List(a), Set::Bits(b)) => {
-            // Keep what the bitmap holds for AND, and what it lacks for NOT.
-            let held = |doc: u16| *b.get_unchecked(doc as usize / 64) >> (doc % 64) & 1 == 1;
-            out.extend(a.iter().filter(|&&doc| held(doc) == keep));
+            out.reserve(a.len());
+            let target = out.as_mut_ptr();
+            let mut found = 0;
+            for &doc in a {
+                let held = (*b.get_unchecked(doc as usize / 64) >> (doc % 64) & 1) as u8;
+                *target.add(found) = doc;
+                found += (held == keep as u8) as usize;
+            }
+            out.set_len(found);
         }
         // A merged list is cheaper than a bitmap while it is shorter than one.
         (Op::Or, Set::List(a), Set::List(b)) if a.len() + b.len() < words => union(a, b, out),
