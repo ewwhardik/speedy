@@ -40,9 +40,9 @@ jobs:
       - name: compare
         run: |
           cd track-${{ matrix.track }}
-          for v in plain pgo; do rm -f /out/*; ./t-$v/release/solution; echo "$v $(sha256sum /out/$OUTFILE | cut -c1-64 | sed "s/$EXPECTED/PASS/")"; done
-          for v in plain pgo; do for i in 1 2 3; do ./t-$v/release/solution; done; done
-          for round in $(seq 1 20); do for v in plain pgo; do
+          for v in native plain pgo; do rm -f /out/*; ./t-$v/release/solution; echo "$v $(sha256sum /out/$OUTFILE | cut -c1-64 | sed "s/$EXPECTED/PASS/")"; done
+          for v in native plain pgo; do for i in 1 2 3; do ./t-$v/release/solution; done; done
+          for round in $(seq 1 20); do for v in native plain pgo; do
             s=$(date +%s%N); ./t-$v/release/solution; e=$(date +%s%N); echo "$v $(( (e - s) / 1000 ))" >> /tmp/times
           done; done
           python3 -c "
