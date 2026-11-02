@@ -191,11 +191,13 @@ impl Run {
                 let newline = _mm256_set1_epi8(b'\n' as i8);
                 let (mut count, mut at) = (0, start);
                 while at < (start + BLOCK).min(self.len) {
-                    let hits = _mm256_cmpeq_epi8(_mm256_load_si256(input.add(at).cast()), newline);
-                    let mask = _mm256_movemask_epi8(hits) as u32;
-                    *ends.get_unchecked_mut(count) = (at + mask.trailing_zeros() as usize) as u32;
-                    count += (mask != 0) as usize;
-                    at += 32;
+                    for step in (0..128).step_by(32) {
+                        let chunk = _mm256_load_si256(input.add(at + step).cast());
+                        let mask = _mm256_movemask_epi8(_mm256_cmpeq_epi8(chunk, newline)) as u32;
+                        *ends.get_unchecked_mut(count) = (at + step) as u32 + mask.trailing_zeros();
+                        count += (mask != 0) as usize;
+                    }
+                    at += 128;
                 }
                 for &end in &ends[..count] {
                     let end = input.add(end as usize);
@@ -409,8 +411,6 @@ impl Run {
             *w = b'\n';
             w = w.add(1);
         }
-        // The ranks are all read: give the scratch pages back now, not when the hour is written.
-        madvise(spare.cast(), (count + long.len()) * 4, 4);
         std::slice::from_raw_parts(text, w.offset_from(text) as usize)
     }
 
@@ -432,9 +432,7 @@ impl Run {
         for (hour, offset, text) in ready {
             self.output.write_all_at(text, offset).unwrap();
             // The text is out: give the hour's pages back (only the pages actually touched).
-            let claimed = self.claimed[hour].load(Relaxed);
-            let touched = (claimed.max(SPARE_AT) + claimed + 4096) * 4;
-            unsafe { madvise(self.rows.add(hour * self.stride).cast(), touched.next_multiple_of(4096), 4) };
+            unsafe { madvise(self.rows.add(hour * self.stride).cast(), self.stride * 4, 4) };
         }
     }
 

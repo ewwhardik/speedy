@@ -47,7 +47,7 @@ const ANONYMOUS: i32 = 0x4022; // MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE
 const HUGE_PAGE: usize = 1 << 21;
 const CLAIM: usize = 1 << 18;
 // 50 MiB of text between turning rows into postings.
-const PHASE_CLAIMS: usize = 100;
+const PHASE_CLAIMS: usize = 200;
 // u16s before a list: a sentinel while it fills, so duplicates drop with no branch.
 const HEADER: usize = 1;
 // Slices each of the phrase plan and the bucket plan is cut into.
