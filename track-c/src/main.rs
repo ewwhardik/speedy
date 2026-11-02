@@ -127,18 +127,14 @@ unsafe fn decode_digits(words: &[u64], numbers: &mut [u32], count: usize) {
 /// it. Names are compared by their raw bytes: every non-empty name is quoted, so equal raw
 /// bytes mean equal values and nothing needs unescaping. Names of 32 bytes and more do not
 /// occur at seed 1 (the longest is 27), so they cost one predicted branch here.
-#[cold]
-unsafe fn long_name_hash(name: *const u8, len: usize) -> (u64, usize) {
-    let (a, b) = (name_hash(name, 31), name_hash(name.add(31), len - 31));
-    let hash = (a.0.rotate_left(23) ^ b.0).wrapping_mul(0xE703_7ED1_A0B4_28DB);
-    (hash | 1, a.1 + b.1)
-}
-
-#[inline(always)]
 unsafe fn name_hash(name: *const u8, len: usize) -> (u64, usize) {
+    // 32 bytes of ones then 32 of zeros: loading at 32 - len keeps the first `len` bytes.
     static MASKS: [[u8; 32]; 2] = [[0xFF; 32], [0; 32]];
     if len >= 32 {
-        return long_name_hash(name, len);
+        // Cold: hash the first 31 bytes and the rest apart, and combine them.
+        let (a, b) = (name_hash(name, 31), name_hash(name.add(31), len - 31));
+        let hash = (a.0.rotate_left(23) ^ b.0).wrapping_mul(0xE703_7ED1_A0B4_28DB);
+        return (hash | 1, a.1 + b.1);
     }
     let bytes = _mm256_and_si256(load(name), load(MASKS.as_ptr().cast::<u8>().add(32 - len)));
     let quotes = equal_mask(bytes, b'"').count_ones() as usize;
@@ -179,7 +175,7 @@ impl Run {
     /// no lock is needed. A worker that loses a race to the same name wastes one number.
     #[cold]
     unsafe fn insert(&self, index: usize, tag: u64, spare: &mut Range<usize>) -> usize {
-        if spare.start == spare.end {
+        if spare.is_empty() {
             // Name numbers are reserved 32 at a time.
             let first = NEXT[3].fetch_add(32, Relaxed);
             *spare = first..first + 32;
@@ -259,9 +255,9 @@ impl Run {
         let mut spare = 0..0; // name numbers this worker reserved
         let mut digits = [[0u64; MAX_RECORDS]; 3];
         let mut numbers = [[0u32; MAX_RECORDS]; 3];
-        const CLAIM: usize = 1 << 20; // 1 MiB claims: optimal throughput and minimal syscalls
-        while let Some(claim) = take_block(&NEXT[1], CLAIM, len) {
-            let end = (claim + CLAIM).min(len);
+        while let Some(claim) = take_block(&NEXT[1], 1 << 20, len) {
+            // Claims are 1 MiB.
+            let end = (claim + (1 << 20)).min(len);
             // The first record at or after `claim`.
             let from = claim.saturating_sub(1);
             let begins = |pair: &[u8]| pair[0] == b'\n' && matches!(pair[1], b'0'..=b'9' | 0xEF);
@@ -325,7 +321,7 @@ impl Run {
                     start = newline + 1;
                     count += 1;
                 }
-                let _ = [0, 1, 2].map(|kind| decode_digits(&digits[kind], &mut numbers[kind], count));
+                [0, 1, 2].map(|kind| decode_digits(&digits[kind], &mut numbers[kind], count));
                 // Pass B: names and notes.
                 let mut rank = quotes_up_to(record);
                 for at in 0..count {
@@ -378,7 +374,11 @@ impl Run {
                 pos.copy_within(count * FIELDS..filled, 0);
                 filled -= count * FIELDS;
             }
-            // Unmap this claim's pages in parallel to eliminate exit_mmap sequential teardown at exit.
+            // Unmap this claim's pages now, in parallel. Otherwise the kernel frees all
+            // ~50,000 page-table entries on one thread at exit, which the timer includes. A
+            // record running into the next claim just faults its few pages back in.
+            // The length stops at the file's end (the kernel rounds it up to a page): madvise goes on
+            // into whatever is mapped after the range, and would wipe it.
             madvise(input.add(claim), end - claim, 4); // MADV_DONTNEED
         }
         let mut totals = TOTALS.lock().unwrap();
@@ -410,33 +410,6 @@ unsafe fn zeroed<T>() -> &'static T {
     &*aligned.cast()
 }
 
-#[inline(always)]
-fn put_u64(out: &mut Vec<u8>, mut v: u64) {
-    let start = out.len();
-    if v == 0 {
-        out.push(b'0');
-        return;
-    }
-    while v > 0 {
-        out.push(b'0' + (v % 10) as u8);
-        v /= 10;
-    }
-    out[start..].reverse();
-}
-
-#[inline(always)]
-fn put_cents(out: &mut Vec<u8>, cents: i64) {
-    if cents < 0 {
-        out.push(b'-');
-    }
-    let abs = cents.unsigned_abs();
-    put_u64(out, abs / 100);
-    out.push(b'.');
-    let frac = (abs % 100) as u8;
-    out.push(b'0' + frac / 10);
-    out.push(b'0' + frac % 10);
-}
-
 fn main() {
     let n = thread::available_parallelism().map_or(12, |n| n.get());
     COUNTRIES.lock().unwrap().push("_UNMATCHED".into());
@@ -444,34 +417,21 @@ fn main() {
     thread::scope(|s| unsafe { run.start(s, n - 1) });
 
     let totals = TOTALS.lock().unwrap();
+    // `_UNMATCHED` sorts after every country code.
     let mut keys: Vec<_> = COUNTRIES.lock().unwrap().iter().cloned().zip(0..).collect();
     keys.sort_unstable();
-    let mut out = Vec::with_capacity(32768);
+    let mut out = String::new();
     for (key, group) in keys {
         let [count, id_sum, amount, lengths, hi, lo, ..] = totals[group];
-        if count == 0 {
-            continue;
-        }
         let row = &run.2 .1[group * SEEN_WORDS..][..SEEN_WORDS];
         let distinct: u32 = row.iter().map(|w| w.load(Relaxed).count_ones()).sum();
-        out.extend_from_slice(key.as_bytes());
-        out.push(b' ');
-        put_u64(&mut out, count as u64);
-        out.push(b' ');
-        put_u64(&mut out, id_sum as u64);
-        out.push(b' ');
-        put_cents(&mut out, amount);
-        out.push(b' ');
-        put_cents(&mut out, BIAS - lo);
-        out.push(b' ');
-        put_cents(&mut out, hi - BIAS);
-        out.push(b' ');
-        put_u64(&mut out, distinct as u64);
-        out.push(b' ');
-        put_u64(&mut out, (lengths & 0xFFFF_FFFF) as u64);
-        out.push(b' ');
-        put_u64(&mut out, (lengths >> 32) as u64);
-        out.push(b'\n');
+        // Cents as text. A double holds any total of cents to well within half a cent.
+        let [sum, min, max] =
+            [amount, BIAS - lo, hi - BIAS].map(|c| format!("{:.2}", c as f64 / 100.0));
+        let [name, note] = [lengths & 0xFFFF_FFFF, lengths >> 32];
+        if count > 0 {
+            out += &format!("{key} {count} {id_sum} {sum} {min} {max} {distinct} {name} {note}\n");
+        }
     }
     std::fs::write("/out/aggregates.txt", out).unwrap();
 }
