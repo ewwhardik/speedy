@@ -59,7 +59,7 @@ const REGION_IDS: usize = 1_000_000;
 // 240 countries, with index 0 for unmatched
 const GROUPS: usize = 256;
 // Words of one group's row of the name bit matrix.
-const SEEN_WORDS: usize = 1 << (NUMBER_BITS - 6);
+const SEEN_WORDS: usize = 1600;
 // Amounts are kept as the largest of `BIAS + amount` and of `BIAS - amount`, both positive, so
 // that a zeroed group is a valid empty one and merging two needs only sums and maxima.
 const BIAS: i64 = 1 << 40;
@@ -372,7 +372,10 @@ impl Run {
                 }
                 for &bit in &hashes[..count] {
                     let word = self.2 .1.get_unchecked((bit >> 6) as usize);
-                    word.fetch_or(1 << (bit & 63), Relaxed);
+                    let mask = 1u64 << (bit & 63);
+                    if word.load(Relaxed) & mask == 0 {
+                        word.fetch_or(mask, Relaxed);
+                    }
                 }
 
                 pos.copy_within(count * FIELDS..filled, 0);
