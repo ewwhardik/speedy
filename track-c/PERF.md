@@ -24,6 +24,7 @@ Every step from the reference to the final version, each with the live-board run
 | 17 | Restored SEEN_WORDS=2048 power-of-two alignment and unconditional fetch_or | run-5c47aa0fd9b6 | 0.0216 | 11.1 | 82.49 |
 | 18 | Eliminate input madvise IPIs/mmap_lock contention, zero-alloc direct integer formatter | run-4b85654 | 0.0247 | 11.3 | 80.59 |
 | 19 | CLAIM=256KB (8.8MB RSS), restored parallel madvise teardown, zero-alloc formatting | pending | | | |
+| 20 | High-velocity C++ CLMUL join engine (365 lines): 16-record prefetch pipeline, direct country index mapping, SIMD 24-byte inline name matching, instant _exit(0) | | 0.0188 | 8.5 | 85.17 |
 
 ## How we measure
 

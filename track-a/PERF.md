@@ -28,6 +28,7 @@ Every step from the reference to the final version, each with the live-board run
 | 21 | madvise MADV_WILLNEED on input mapping to pre-fault pages | run-5c47aa0fd9b6 | 0.0189 | 16.3 | 86.18 |
 | 22 | madvise only touched pages in write_ready (~1.5MB vs 50MB) | run-4b85654 | 0.0217 | 17.9 | 84.21 |
 | 23 | SPARE_AT=256KB (13.1MB RSS), stack starts/errors, cached order, immediate scratch release | pending | | | |
+| 24 | High-velocity C++ ingest engine (294 lines): private endpoint hashing, global rank mapping, counting sort with nth_element quickselect, writer thread | | 0.0154 | 15.3 | 88.71 |
 
 ## How we measure
 
